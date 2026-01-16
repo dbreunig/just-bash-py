@@ -1,5 +1,9 @@
 # just-bash-py
 
+[![PyPI version](https://badge.fury.io/py/just-bash.svg)](https://pypi.org/project/just-bash/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+
 A pure Python bash interpreter with an in-memory virtual filesystem, designed for AI agents needing a secure, sandboxed bash environment.
 
 This is a Python port of [just-bash](https://github.com/vercel-labs/just-bash), the emulated bash interpreter for TypeScript, from Vercel.
@@ -23,34 +27,32 @@ pip install just-bash
 ## Quick Start
 
 ```python
-import asyncio
 from just_bash import Bash
 
-async def main():
-    bash = Bash()
+bash = Bash()
 
-    # Simple command
-    result = await bash.exec('echo "Hello, World!"')
-    print(result.stdout)  # Hello, World!
+# Simple command
+result = bash.run('echo "Hello, World!"')
+print(result.stdout)  # Hello, World!
 
-    # Pipes and text processing
-    result = await bash.exec('echo "banana apple cherry" | tr " " "\\n" | sort')
-    print(result.stdout)  # apple\nbanana\ncherry\n
+# Pipes and text processing
+result = bash.run('echo "banana apple cherry" | tr " " "\\n" | sort')
+print(result.stdout)  # apple\nbanana\ncherry\n
 
-    # Variables and arithmetic
-    result = await bash.exec('x=5; echo $((x * 2))')
-    print(result.stdout)  # 10
+# Variables and arithmetic
+result = bash.run('x=5; echo $((x * 2))')
+print(result.stdout)  # 10
 
-    # Arrays
-    result = await bash.exec('arr=(a b c); echo "${arr[@]}"')
-    print(result.stdout)  # a b c
+# Arrays
+result = bash.run('arr=(a b c); echo "${arr[@]}"')
+print(result.stdout)  # a b c
 
-    # In-memory files
-    result = await bash.exec('echo "test" > /tmp/file.txt; cat /tmp/file.txt')
-    print(result.stdout)  # test
-
-asyncio.run(main())
+# In-memory files
+result = bash.run('echo "test" > /tmp/file.txt; cat /tmp/file.txt')
+print(result.stdout)  # test
 ```
+
+For async contexts, use `await bash.exec()` instead of `bash.run()`.
 
 ## Demo
 

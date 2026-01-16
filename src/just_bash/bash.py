@@ -3,19 +3,25 @@
 Example usage:
     from just_bash import Bash
 
-    # Simple usage with default in-memory filesystem
+    # Synchronous usage (for REPL, scripts)
+    bash = Bash()
+    result = bash.run("echo hello world")
+    print(result.stdout)  # "hello world\n"
+
+    # Async usage (for async applications)
     bash = Bash()
     result = await bash.exec("echo hello world")
     print(result.stdout)  # "hello world\n"
 
     # With initial files
     bash = Bash(files={"/data.txt": "hello\\n"})
-    result = await bash.exec("cat /data.txt")
+    result = bash.run("cat /data.txt")
 
     # With execution limits
     bash = Bash(limits=ExecutionLimits(max_command_count=1000))
 """
 
+import asyncio
 from typing import Optional
 
 from .commands import create_command_registry
@@ -156,6 +162,34 @@ class Bash:
 
         # Execute
         return await self._interpreter.execute_script(ast)
+
+    def run(
+        self,
+        script: str,
+        *,
+        env: Optional[dict[str, str]] = None,
+        cwd: Optional[str] = None,
+    ) -> ExecResult:
+        """Execute a bash script synchronously.
+
+        This is a convenience wrapper around exec() for use in the REPL
+        or other synchronous contexts.
+
+        Args:
+            script: The bash script to execute.
+            env: Additional environment variables for this execution.
+            cwd: Working directory for this execution.
+
+        Returns:
+            ExecResult with stdout, stderr, exit_code, and final env.
+
+        Example:
+            >>> bash = Bash()
+            >>> result = bash.run('echo "Hello, World!"')
+            >>> print(result.stdout)
+            Hello, World!
+        """
+        return asyncio.run(self.exec(script, env=env, cwd=cwd))
 
     def reset(self) -> None:
         """Reset the interpreter state to initial values."""

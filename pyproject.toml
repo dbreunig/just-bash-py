@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "just-bash"
-version = "0.1.0"
+version = "0.1.1"
 description = "A pure Python bash interpreter with in-memory virtual filesystem"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.11"
 authors = [
-    { name = "Your Name", email = "you@example.com" }
+    { name = "Drew Breunig" }
 ]
 keywords = ["bash", "shell", "interpreter", "sandbox", "virtual-filesystem"]
 classifiers = [
@@ -39,8 +39,8 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/just-bash-py"
-Repository = "https://github.com/yourusername/just-bash-py"
+Homepage = "https://github.com/dbreunig/just-bash-py"
+Repository = "https://github.com/dbreunig/just-bash-py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/just_bash"]
