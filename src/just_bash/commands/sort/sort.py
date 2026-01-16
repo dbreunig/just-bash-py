@@ -1,0 +1,328 @@
+"""Sort command implementation.
+
+Usage: sort [OPTION]... [FILE]...
+
+Write sorted concatenation of all FILE(s) to standard output.
+
+Options:
+  -b, --ignore-leading-blanks  ignore leading blanks
+  -f, --ignore-case            fold lower case to upper case characters
+  -n, --numeric-sort           compare according to string numerical value
+  -r, --reverse                reverse the result of comparisons
+  -u, --unique                 output only the first of an equal run
+  -t, --field-separator=SEP    use SEP instead of non-blank to blank transition
+  -k, --key=KEYDEF             sort via a key; KEYDEF gives location and type
+  -o, --output=FILE            write result to FILE instead of standard output
+  -s, --stable                 stabilize sort by disabling last-resort comparison
+
+KEYDEF is F[.C][OPTS][,F[.C][OPTS]] for start and stop position.
+F is field number, C is character position (both 1-indexed).
+OPTS is one or more single-letter ordering options [bfnr].
+"""
+
+import re
+from ...types import CommandContext, ExecResult
+
+
+class SortCommand:
+    """The sort command."""
+
+    name = "sort"
+
+    async def execute(self, args: list[str], ctx: CommandContext) -> ExecResult:
+        """Execute the sort command."""
+        ignore_blanks = False
+        ignore_case = False
+        numeric = False
+        reverse = False
+        unique = False
+        separator = None
+        keys: list[dict] = []
+        output_file = None
+        stable = False
+        files: list[str] = []
+
+        # Parse arguments
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg == "--":
+                files.extend(args[i + 1:])
+                break
+            elif arg.startswith("--"):
+                if arg == "--ignore-leading-blanks":
+                    ignore_blanks = True
+                elif arg == "--ignore-case":
+                    ignore_case = True
+                elif arg == "--numeric-sort":
+                    numeric = True
+                elif arg == "--reverse":
+                    reverse = True
+                elif arg == "--unique":
+                    unique = True
+                elif arg == "--stable":
+                    stable = True
+                elif arg.startswith("--field-separator="):
+                    separator = arg[18:]
+                elif arg.startswith("--key="):
+                    key = self._parse_key(arg[6:])
+                    if key is None:
+                        return ExecResult(
+                            stdout="",
+                            stderr=f"sort: invalid key specification: '{arg[6:]}'\n",
+                            exit_code=1,
+                        )
+                    keys.append(key)
+                elif arg.startswith("--output="):
+                    output_file = arg[9:]
+                else:
+                    return ExecResult(
+                        stdout="",
+                        stderr=f"sort: unrecognized option '{arg}'\n",
+                        exit_code=1,
+                    )
+            elif arg.startswith("-") and arg != "-":
+                j = 1
+                while j < len(arg):
+                    c = arg[j]
+                    if c == "b":
+                        ignore_blanks = True
+                    elif c == "f":
+                        ignore_case = True
+                    elif c == "n":
+                        numeric = True
+                    elif c == "r":
+                        reverse = True
+                    elif c == "u":
+                        unique = True
+                    elif c == "s":
+                        stable = True
+                    elif c == "t":
+                        # -t requires a value
+                        if j + 1 < len(arg):
+                            separator = arg[j + 1:]
+                            break
+                        elif i + 1 < len(args):
+                            i += 1
+                            separator = args[i]
+                            break
+                        else:
+                            return ExecResult(
+                                stdout="",
+                                stderr="sort: option requires an argument -- 't'\n",
+                                exit_code=1,
+                            )
+                    elif c == "k":
+                        # -k requires a value
+                        if j + 1 < len(arg):
+                            key_spec = arg[j + 1:]
+                        elif i + 1 < len(args):
+                            i += 1
+                            key_spec = args[i]
+                        else:
+                            return ExecResult(
+                                stdout="",
+                                stderr="sort: option requires an argument -- 'k'\n",
+                                exit_code=1,
+                            )
+                        key = self._parse_key(key_spec)
+                        if key is None:
+                            return ExecResult(
+                                stdout="",
+                                stderr=f"sort: invalid key specification: '{key_spec}'\n",
+                                exit_code=1,
+                            )
+                        keys.append(key)
+                        break
+                    elif c == "o":
+                        # -o requires a value
+                        if j + 1 < len(arg):
+                            output_file = arg[j + 1:]
+                            break
+                        elif i + 1 < len(args):
+                            i += 1
+                            output_file = args[i]
+                            break
+                        else:
+                            return ExecResult(
+                                stdout="",
+                                stderr="sort: option requires an argument -- 'o'\n",
+                                exit_code=1,
+                            )
+                    else:
+                        return ExecResult(
+                            stdout="",
+                            stderr=f"sort: invalid option -- '{c}'\n",
+                            exit_code=1,
+                        )
+                    j += 1
+            else:
+                files.append(arg)
+            i += 1
+
+        # Default to stdin
+        if not files:
+            files = ["-"]
+
+        # Read all lines from all files
+        all_lines: list[str] = []
+        stderr = ""
+        exit_code = 0
+
+        for f in files:
+            try:
+                if f == "-":
+                    content = ctx.stdin
+                else:
+                    path = ctx.fs.resolve_path(ctx.cwd, f)
+                    content = await ctx.fs.read_file(path)
+
+                lines = content.split("\n")
+                # Remove trailing empty line if present
+                if lines and lines[-1] == "":
+                    lines = lines[:-1]
+                all_lines.extend(lines)
+
+            except FileNotFoundError:
+                stderr += f"sort: {f}: No such file or directory\n"
+                exit_code = 1
+
+        if exit_code != 0:
+            return ExecResult(stdout="", stderr=stderr, exit_code=exit_code)
+
+        # Create sort key function
+        def make_key(line: str):
+            if keys:
+                key_values = []
+                for key in keys:
+                    val = self._extract_key(line, key, separator)
+                    key_values.append(self._make_comparable(val, key))
+                return tuple(key_values)
+            else:
+                return self._make_comparable(
+                    line,
+                    {
+                        "ignore_blanks": ignore_blanks,
+                        "ignore_case": ignore_case,
+                        "numeric": numeric,
+                    },
+                )
+
+        # Sort
+        try:
+            sorted_lines = sorted(all_lines, key=make_key, reverse=reverse)
+        except Exception:
+            # Fallback to string sort
+            sorted_lines = sorted(all_lines, reverse=reverse)
+
+        # Apply unique
+        if unique:
+            unique_lines = []
+            seen_keys = set()
+            for line in sorted_lines:
+                key = make_key(line)
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    unique_lines.append(line)
+            sorted_lines = unique_lines
+
+        # Generate output
+        stdout = "\n".join(sorted_lines)
+        if sorted_lines:
+            stdout += "\n"
+
+        # Write to output file if specified
+        if output_file:
+            try:
+                path = ctx.fs.resolve_path(ctx.cwd, output_file)
+                await ctx.fs.write_file(path, stdout)
+                return ExecResult(stdout="", stderr=stderr, exit_code=exit_code)
+            except Exception as e:
+                return ExecResult(
+                    stdout="",
+                    stderr=f"sort: {output_file}: {e}\n",
+                    exit_code=1,
+                )
+
+        return ExecResult(stdout=stdout, stderr=stderr, exit_code=exit_code)
+
+    def _parse_key(self, spec: str) -> dict | None:
+        """Parse a key specification like '2,2' or '1.3,1.5n'."""
+        # Pattern: F[.C][OPTS][,F[.C][OPTS]]
+        pattern = r"^(\d+)(?:\.(\d+))?([bfnr]*)?(?:,(\d+)(?:\.(\d+))?([bfnr]*)?)?$"
+        match = re.match(pattern, spec)
+        if not match:
+            return None
+
+        key = {
+            "start_field": int(match.group(1)),
+            "start_char": int(match.group(2)) if match.group(2) else 1,
+            "end_field": int(match.group(4)) if match.group(4) else None,
+            "end_char": int(match.group(5)) if match.group(5) else None,
+            "ignore_blanks": "b" in (match.group(3) or "") or "b" in (match.group(6) or ""),
+            "ignore_case": "f" in (match.group(3) or "") or "f" in (match.group(6) or ""),
+            "numeric": "n" in (match.group(3) or "") or "n" in (match.group(6) or ""),
+            "reverse": "r" in (match.group(3) or "") or "r" in (match.group(6) or ""),
+        }
+        return key
+
+    def _extract_key(self, line: str, key: dict, separator: str | None) -> str:
+        """Extract the key portion from a line."""
+        if separator:
+            fields = line.split(separator)
+        else:
+            # Split on whitespace runs
+            fields = line.split()
+
+        start_field = key["start_field"] - 1  # 0-indexed
+        start_char = key["start_char"] - 1  # 0-indexed
+        end_field = key.get("end_field")
+        end_char = key.get("end_char")
+
+        if start_field >= len(fields):
+            return ""
+
+        if end_field is None:
+            # Just the start field from start_char
+            field_content = fields[start_field] if start_field < len(fields) else ""
+            return field_content[start_char:]
+        else:
+            end_field -= 1  # 0-indexed
+            if end_field >= len(fields):
+                end_field = len(fields) - 1
+
+            # Extract from start to end field
+            parts = []
+            for i in range(start_field, end_field + 1):
+                if i >= len(fields):
+                    break
+                if i == start_field:
+                    parts.append(fields[i][start_char:])
+                elif i == end_field and end_char:
+                    parts.append(fields[i][:end_char])
+                else:
+                    parts.append(fields[i])
+
+            return (separator or " ").join(parts)
+
+    def _make_comparable(self, val: str, opts: dict) -> tuple:
+        """Make a value comparable based on options."""
+        if opts.get("ignore_blanks"):
+            val = val.lstrip()
+
+        if opts.get("ignore_case"):
+            val = val.lower()
+
+        if opts.get("numeric"):
+            # Try to extract leading number
+            match = re.match(r"^\s*(-?\d+(?:\.\d+)?)", val)
+            if match:
+                try:
+                    num = float(match.group(1))
+                    return (0, num, val)
+                except ValueError:
+                    pass
+            # Non-numeric sorts before any number
+            return (1, 0, val)
+
+        return (0, val)

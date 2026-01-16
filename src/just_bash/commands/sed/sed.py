@@ -1,0 +1,541 @@
+"""Sed command implementation.
+
+Usage: sed [OPTION]... {script} [input-file]...
+
+Stream editor for filtering and transforming text.
+
+Options:
+  -n, --quiet, --silent  suppress automatic printing of pattern space
+  -e script              add the script to commands to be executed
+  -i, --in-place         edit files in place
+  -E, -r                 use extended regular expressions
+
+Commands:
+  s/regexp/replacement/[flags]  substitute
+  d                             delete pattern space
+  p                             print pattern space
+  a\\ text                       append text after line
+  i\\ text                       insert text before line
+  y/source/dest/                transliterate characters
+  q                             quit
+
+Addresses:
+  N                line number
+  $                last line
+  /regexp/         lines matching regexp
+  N,M              range from line N to M
+"""
+
+import re
+from dataclasses import dataclass
+from ...types import CommandContext, ExecResult
+
+
+@dataclass
+class SedAddress:
+    """Represents a sed address."""
+
+    type: str  # "line", "last", "regex", "range"
+    value: int | str | None = None
+    end_value: int | str | None = None
+    regex: re.Pattern | None = None
+    end_regex: re.Pattern | None = None
+
+
+@dataclass
+class SedCommand_:
+    """A parsed sed command."""
+
+    cmd: str  # s, d, p, a, i, y, q, etc.
+    address: SedAddress | None = None
+    pattern: re.Pattern | None = None
+    replacement: str | None = None
+    flags: str = ""
+    text: str = ""  # For a, i commands
+    source: str = ""  # For y command
+    dest: str = ""  # For y command
+
+
+class SedCommand:
+    """The sed command."""
+
+    name = "sed"
+
+    async def execute(self, args: list[str], ctx: CommandContext) -> ExecResult:
+        """Execute the sed command."""
+        scripts: list[str] = []
+        silent = False
+        in_place = False
+        extended_regex = False
+        files: list[str] = []
+
+        # Parse arguments
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg == "--":
+                files.extend(args[i + 1:])
+                break
+            elif arg in ("-n", "--quiet", "--silent"):
+                silent = True
+            elif arg in ("-i", "--in-place"):
+                in_place = True
+            elif arg.startswith("-i"):
+                in_place = True
+            elif arg in ("-E", "-r", "--regexp-extended"):
+                extended_regex = True
+            elif arg == "-e":
+                if i + 1 < len(args):
+                    i += 1
+                    scripts.append(args[i])
+                else:
+                    return ExecResult(
+                        stdout="",
+                        stderr="sed: option requires an argument -- 'e'\n",
+                        exit_code=1,
+                    )
+            elif arg == "-f":
+                if i + 1 < len(args):
+                    i += 1
+                    try:
+                        path = ctx.fs.resolve_path(ctx.cwd, args[i])
+                        content = await ctx.fs.read_file(path)
+                        for line in content.split("\n"):
+                            line = line.strip()
+                            if line and not line.startswith("#"):
+                                scripts.append(line)
+                    except FileNotFoundError:
+                        return ExecResult(
+                            stdout="",
+                            stderr=f"sed: couldn't open file {args[i]}: No such file or directory\n",
+                            exit_code=1,
+                        )
+                else:
+                    return ExecResult(
+                        stdout="",
+                        stderr="sed: option requires an argument -- 'f'\n",
+                        exit_code=1,
+                    )
+            elif arg.startswith("-") and len(arg) > 1 and not arg.startswith("--"):
+                # Combined short options
+                for j, c in enumerate(arg[1:], 1):
+                    if c == "n":
+                        silent = True
+                    elif c == "i":
+                        in_place = True
+                    elif c == "E" or c == "r":
+                        extended_regex = True
+                    elif c == "e":
+                        if j < len(arg) - 1:
+                            scripts.append(arg[j + 1:])
+                            break
+                        elif i + 1 < len(args):
+                            i += 1
+                            scripts.append(args[i])
+                            break
+                    else:
+                        return ExecResult(
+                            stdout="",
+                            stderr=f"sed: invalid option -- '{c}'\n",
+                            exit_code=1,
+                        )
+            elif not scripts:
+                # First non-option is the script
+                scripts.append(arg)
+            else:
+                files.append(arg)
+            i += 1
+
+        if not scripts:
+            return ExecResult(
+                stdout="",
+                stderr="sed: no script specified\n",
+                exit_code=1,
+            )
+
+        # Parse scripts into commands
+        try:
+            commands = self._parse_scripts(scripts, extended_regex)
+        except ValueError as e:
+            return ExecResult(
+                stdout="",
+                stderr=f"sed: {e}\n",
+                exit_code=1,
+            )
+
+        # Default to stdin
+        if not files:
+            files = ["-"]
+
+        # Process files
+        all_output = ""
+        stderr = ""
+
+        for f in files:
+            try:
+                if f == "-":
+                    content = ctx.stdin
+                else:
+                    path = ctx.fs.resolve_path(ctx.cwd, f)
+                    content = await ctx.fs.read_file(path)
+
+                output = self._process_content(content, commands, silent)
+
+                if in_place and f != "-":
+                    path = ctx.fs.resolve_path(ctx.cwd, f)
+                    await ctx.fs.write_file(path, output)
+                else:
+                    all_output += output
+
+            except FileNotFoundError:
+                stderr += f"sed: {f}: No such file or directory\n"
+                continue
+
+        if stderr:
+            return ExecResult(stdout=all_output, stderr=stderr, exit_code=1)
+
+        return ExecResult(stdout=all_output, stderr="", exit_code=0)
+
+    def _parse_scripts(self, scripts: list[str], extended_regex: bool) -> list[SedCommand_]:
+        """Parse sed scripts into commands."""
+        commands: list[SedCommand_] = []
+
+        for script in scripts:
+            # Handle multiple commands separated by semicolons or newlines
+            for cmd_str in re.split(r"[;\n]", script):
+                cmd_str = cmd_str.strip()
+                if not cmd_str:
+                    continue
+
+                cmd = self._parse_command(cmd_str, extended_regex)
+                if cmd:
+                    commands.append(cmd)
+
+        return commands
+
+    def _parse_command(self, cmd_str: str, extended_regex: bool) -> SedCommand_ | None:
+        """Parse a single sed command."""
+        pos = 0
+        address = None
+
+        # Parse address if present
+        if cmd_str and cmd_str[0].isdigit():
+            # Line number address
+            match = re.match(r"(\d+)(?:,(\d+|\$))?", cmd_str)
+            if match:
+                start = int(match.group(1))
+                if match.group(2):
+                    if match.group(2) == "$":
+                        address = SedAddress(type="range", value=start, end_value="$")
+                    else:
+                        address = SedAddress(type="range", value=start, end_value=int(match.group(2)))
+                else:
+                    address = SedAddress(type="line", value=start)
+                pos = match.end()
+        elif cmd_str and cmd_str[0] == "$":
+            address = SedAddress(type="last")
+            pos = 1
+        elif cmd_str and cmd_str[0] == "/":
+            # Regex address
+            end = self._find_delimiter(cmd_str, 1, "/")
+            if end != -1:
+                pattern = cmd_str[1:end]
+                flags = re.IGNORECASE if extended_regex else 0
+                try:
+                    address = SedAddress(type="regex", regex=re.compile(pattern, flags))
+                except re.error as e:
+                    raise ValueError(f"invalid regex: {e}")
+                pos = end + 1
+
+                # Check for range
+                if pos < len(cmd_str) and cmd_str[pos] == ",":
+                    pos += 1
+                    if pos < len(cmd_str):
+                        if cmd_str[pos] == "$":
+                            address = SedAddress(type="range", regex=address.regex, end_value="$")
+                            pos += 1
+                        elif cmd_str[pos].isdigit():
+                            match = re.match(r"(\d+)", cmd_str[pos:])
+                            if match:
+                                address = SedAddress(type="range", regex=address.regex, end_value=int(match.group(1)))
+                                pos += match.end()
+                        elif cmd_str[pos] == "/":
+                            end2 = self._find_delimiter(cmd_str, pos + 1, "/")
+                            if end2 != -1:
+                                pattern2 = cmd_str[pos + 1:end2]
+                                try:
+                                    address = SedAddress(
+                                        type="range",
+                                        regex=address.regex,
+                                        end_regex=re.compile(pattern2, flags),
+                                    )
+                                except re.error as e:
+                                    raise ValueError(f"invalid regex: {e}")
+                                pos = end2 + 1
+
+        # Skip whitespace
+        while pos < len(cmd_str) and cmd_str[pos] in " \t":
+            pos += 1
+
+        if pos >= len(cmd_str):
+            return None
+
+        cmd_char = cmd_str[pos]
+        pos += 1
+
+        if cmd_char == "s":
+            # Substitution
+            if pos >= len(cmd_str):
+                raise ValueError("unterminated s command")
+
+            delim = cmd_str[pos]
+            pos += 1
+
+            # Find pattern
+            end = self._find_delimiter(cmd_str, pos, delim)
+            if end == -1:
+                raise ValueError("unterminated s command")
+            pattern = cmd_str[pos:end]
+            pos = end + 1
+
+            # Find replacement
+            end = self._find_delimiter(cmd_str, pos, delim)
+            if end == -1:
+                raise ValueError("unterminated s command")
+            replacement = cmd_str[pos:end]
+            pos = end + 1
+
+            # Parse flags
+            flags = cmd_str[pos:] if pos < len(cmd_str) else ""
+
+            regex_flags = 0
+            if "i" in flags or extended_regex:
+                regex_flags |= re.IGNORECASE
+
+            try:
+                compiled = re.compile(pattern, regex_flags)
+            except re.error as e:
+                raise ValueError(f"invalid regex: {e}")
+
+            return SedCommand_(
+                cmd="s",
+                address=address,
+                pattern=compiled,
+                replacement=replacement,
+                flags=flags,
+            )
+
+        elif cmd_char == "y":
+            # Transliterate
+            if pos >= len(cmd_str):
+                raise ValueError("unterminated y command")
+
+            delim = cmd_str[pos]
+            pos += 1
+
+            end = self._find_delimiter(cmd_str, pos, delim)
+            if end == -1:
+                raise ValueError("unterminated y command")
+            source = cmd_str[pos:end]
+            pos = end + 1
+
+            end = self._find_delimiter(cmd_str, pos, delim)
+            if end == -1:
+                raise ValueError("unterminated y command")
+            dest = cmd_str[pos:end]
+
+            if len(source) != len(dest):
+                raise ValueError("y command requires equal length strings")
+
+            return SedCommand_(
+                cmd="y",
+                address=address,
+                source=source,
+                dest=dest,
+            )
+
+        elif cmd_char == "d":
+            return SedCommand_(cmd="d", address=address)
+
+        elif cmd_char == "p":
+            return SedCommand_(cmd="p", address=address)
+
+        elif cmd_char == "q":
+            return SedCommand_(cmd="q", address=address)
+
+        elif cmd_char == "a" or cmd_char == "i":
+            # Append or insert
+            text = cmd_str[pos:].lstrip()
+            if text.startswith("\\"):
+                text = text[1:].lstrip()
+            return SedCommand_(cmd=cmd_char, address=address, text=text)
+
+        else:
+            raise ValueError(f"unknown command: {cmd_char}")
+
+    def _find_delimiter(self, s: str, start: int, delim: str) -> int:
+        """Find the next unescaped delimiter."""
+        i = start
+        while i < len(s):
+            if s[i] == "\\" and i + 1 < len(s):
+                i += 2
+            elif s[i] == delim:
+                return i
+            else:
+                i += 1
+        return -1
+
+    def _process_content(
+        self, content: str, commands: list[SedCommand_], silent: bool
+    ) -> str:
+        """Process content through sed commands."""
+        lines = content.split("\n")
+        # Remove trailing empty line if present
+        if lines and lines[-1] == "":
+            lines = lines[:-1]
+
+        output = ""
+        total_lines = len(lines)
+
+        # Track range state for each command
+        in_range: dict[int, bool] = {}
+
+        for line_num, line in enumerate(lines, 1):
+            pattern_space = line
+            deleted = False
+            printed = False
+            insert_text = ""
+            append_text = ""
+            should_quit = False
+
+            for cmd_idx, cmd in enumerate(commands):
+                if deleted or should_quit:
+                    break
+
+                # Check if address matches
+                if not self._address_matches(cmd.address, line_num, total_lines, pattern_space, in_range, cmd_idx):
+                    continue
+
+                if cmd.cmd == "s":
+                    # Substitution
+                    if cmd.pattern and cmd.replacement is not None:
+                        if "g" in cmd.flags:
+                            new_pattern = cmd.pattern.sub(
+                                self._expand_replacement(cmd.replacement), pattern_space
+                            )
+                        else:
+                            new_pattern = cmd.pattern.sub(
+                                self._expand_replacement(cmd.replacement), pattern_space, count=1
+                            )
+
+                        if new_pattern != pattern_space:
+                            pattern_space = new_pattern
+                            if "p" in cmd.flags:
+                                output += pattern_space + "\n"
+
+                elif cmd.cmd == "y":
+                    # Transliterate
+                    trans = str.maketrans(cmd.source, cmd.dest)
+                    pattern_space = pattern_space.translate(trans)
+
+                elif cmd.cmd == "d":
+                    deleted = True
+
+                elif cmd.cmd == "p":
+                    output += pattern_space + "\n"
+                    printed = True
+
+                elif cmd.cmd == "a":
+                    append_text += cmd.text + "\n"
+
+                elif cmd.cmd == "i":
+                    insert_text += cmd.text + "\n"
+
+                elif cmd.cmd == "q":
+                    should_quit = True
+
+            # Output insert text before line
+            if insert_text:
+                output += insert_text
+
+            # Output line unless deleted or silent mode
+            if not deleted:
+                if not silent:
+                    output += pattern_space + "\n"
+
+            # Output append text after line
+            if append_text:
+                output += append_text
+
+            if should_quit:
+                break
+
+        return output
+
+    def _address_matches(
+        self,
+        address: SedAddress | None,
+        line_num: int,
+        total_lines: int,
+        pattern_space: str,
+        in_range: dict[int, bool],
+        cmd_idx: int,
+    ) -> bool:
+        """Check if an address matches the current line."""
+        if address is None:
+            return True
+
+        if address.type == "line":
+            return line_num == address.value
+
+        elif address.type == "last":
+            return line_num == total_lines
+
+        elif address.type == "regex":
+            if address.regex:
+                return bool(address.regex.search(pattern_space))
+            return False
+
+        elif address.type == "range":
+            # Check if we're entering or in a range
+            if cmd_idx not in in_range:
+                in_range[cmd_idx] = False
+
+            if not in_range[cmd_idx]:
+                # Check start condition
+                start_match = False
+                if address.value is not None:
+                    start_match = line_num == address.value
+                elif address.regex:
+                    start_match = bool(address.regex.search(pattern_space))
+
+                if start_match:
+                    in_range[cmd_idx] = True
+
+            if in_range[cmd_idx]:
+                # Check end condition
+                end_match = False
+                if address.end_value == "$":
+                    end_match = line_num == total_lines
+                elif isinstance(address.end_value, int):
+                    end_match = line_num >= address.end_value
+                elif address.end_regex:
+                    end_match = bool(address.end_regex.search(pattern_space))
+
+                if end_match:
+                    in_range[cmd_idx] = False
+
+                return True
+
+            return False
+
+        return False
+
+    def _expand_replacement(self, replacement: str) -> str:
+        """Expand replacement string, handling backreferences."""
+        # Convert \1, \2, etc. to Python's \g<1>, \g<2>
+        result = replacement
+        result = re.sub(r"\\(\d)", r"\\g<\1>", result)
+        # Handle & for entire match
+        result = result.replace("&", r"\g<0>")
+        return result
