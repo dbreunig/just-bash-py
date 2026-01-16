@@ -8,6 +8,8 @@ A pure Python bash interpreter with an in-memory virtual filesystem, designed fo
 
 This is a Python port of [just-bash](https://github.com/vercel-labs/just-bash), the emulated bash interpreter for TypeScript, from Vercel.
 
+**This is a pre-release at the moment.** 
+
 ## Features
 
 - **Pure Python** - No external binaries, no WASM dependencies
