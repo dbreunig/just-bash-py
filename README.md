@@ -1,4 +1,4 @@
-# just-bash-py
+# just-bash-py (pre-release)
 
 [![PyPI version](https://badge.fury.io/py/just-bash.svg)](https://pypi.org/project/just-bash/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
@@ -8,7 +8,7 @@ A pure Python bash interpreter with an in-memory virtual filesystem, designed fo
 
 This is a Python port of [just-bash](https://github.com/vercel-labs/just-bash), the emulated bash interpreter for TypeScript, from Vercel.
 
-**This is a pre-release at the moment.** 
+**This is a pre-release.** This as much a demonstration of coding agents' ability to implement software given a tight spec and high test coverage, as [discussed here](https://www.dbreunig.com/2026/01/08/a-software-library-with-no-code.html) and [here](https://github.com/dbreunig/whenwords).
 
 ## Features
 
