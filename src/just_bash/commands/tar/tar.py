@@ -43,6 +43,8 @@ class TarCommand:
         use_gzip = False
         verbose = False
         directory = ""
+        exclude_patterns: list[str] = []
+        strip_components = 0
         files: list[str] = []
 
         i = 0
@@ -134,6 +136,42 @@ class TarCommand:
                 directory = args[i]
             elif arg.startswith("--directory="):
                 directory = arg[12:]
+            elif arg.startswith("--exclude="):
+                exclude_patterns.append(arg[10:])
+            elif arg == "--exclude":
+                i += 1
+                if i >= len(args):
+                    return ExecResult(
+                        stdout="",
+                        stderr="tar: option requires an argument -- 'exclude'\n",
+                        exit_code=2,
+                    )
+                exclude_patterns.append(args[i])
+            elif arg.startswith("--strip-components="):
+                try:
+                    strip_components = int(arg[19:])
+                except ValueError:
+                    return ExecResult(
+                        stdout="",
+                        stderr=f"tar: {arg}: invalid argument\n",
+                        exit_code=2,
+                    )
+            elif arg == "--strip-components":
+                i += 1
+                if i >= len(args):
+                    return ExecResult(
+                        stdout="",
+                        stderr="tar: option requires an argument -- 'strip-components'\n",
+                        exit_code=2,
+                    )
+                try:
+                    strip_components = int(args[i])
+                except ValueError:
+                    return ExecResult(
+                        stdout="",
+                        stderr=f"tar: {args[i]}: invalid argument\n",
+                        exit_code=2,
+                    )
             elif arg == "--":
                 files.extend(args[i + 1:])
                 break
@@ -167,11 +205,11 @@ class TarCommand:
 
         if create:
             return await self._create_archive(
-                ctx, archive_file, files, work_dir, use_gzip, verbose
+                ctx, archive_file, files, work_dir, use_gzip, verbose, exclude_patterns
             )
         elif extract:
             return await self._extract_archive(
-                ctx, archive_file, files, work_dir, use_gzip, verbose
+                ctx, archive_file, files, work_dir, use_gzip, verbose, strip_components
             )
         else:  # list_mode
             return await self._list_archive(
@@ -186,6 +224,7 @@ class TarCommand:
         work_dir: str,
         use_gzip: bool,
         verbose: bool,
+        exclude_patterns: list[str],
     ) -> ExecResult:
         """Create a tar archive."""
         if not files:
@@ -213,11 +252,11 @@ class TarCommand:
 
         for file_path in files:
             try:
-                await self._add_to_archive(
-                    ctx, tar, work_dir, file_path, verbose, errors
+                added = await self._add_to_archive(
+                    ctx, tar, work_dir, file_path, verbose, errors, exclude_patterns
                 )
                 if verbose:
-                    verbose_output += f"{file_path}\n"
+                    verbose_output += added
             except Exception as e:
                 errors.append(f"tar: {file_path}: {e}")
 
@@ -240,9 +279,10 @@ class TarCommand:
             # Output binary to stdout
             stdout = archive_data.decode("latin-1")
 
+        # Verbose output always goes to stderr (matching real tar behavior)
         stderr = verbose_output
         if errors:
-            stderr += "\n".join(errors) + "\n"
+            stderr = "\n".join(errors) + "\n"
         return ExecResult(
             stdout=stdout,
             stderr=stderr,
@@ -257,15 +297,22 @@ class TarCommand:
         relative_path: str,
         verbose: bool,
         errors: list[str],
-    ) -> None:
-        """Add a file or directory to the archive."""
+        exclude_patterns: list[str],
+    ) -> str:
+        """Add a file or directory to the archive. Returns verbose output."""
         full_path = ctx.fs.resolve_path(base_path, relative_path)
+        verbose_output = ""
+
+        # Check exclusion patterns
+        for pattern in exclude_patterns:
+            if fnmatch(relative_path, pattern) or fnmatch(relative_path.split("/")[-1], pattern):
+                return ""
 
         try:
             stat = await ctx.fs.stat(full_path)
         except FileNotFoundError:
             errors.append(f"tar: {relative_path}: No such file or directory")
-            return
+            return ""
 
         # Get mtime - handle both float and datetime
         mtime = stat.mtime
@@ -283,12 +330,16 @@ class TarCommand:
             info.mode = stat.mode
             info.mtime = mtime
             tar.addfile(info)
+            if verbose:
+                verbose_output += f"{relative_path}\n"
 
             # Add contents recursively
             items = await ctx.fs.readdir(full_path)
             for item in items:
                 child_path = f"{relative_path}/{item}" if relative_path else item
-                await self._add_to_archive(ctx, tar, base_path, child_path, verbose, errors)
+                verbose_output += await self._add_to_archive(
+                    ctx, tar, base_path, child_path, verbose, errors, exclude_patterns
+                )
 
         elif stat.is_file:
             content = await ctx.fs.read_file_bytes(full_path)
@@ -297,6 +348,8 @@ class TarCommand:
             info.mode = stat.mode
             info.mtime = mtime
             tar.addfile(info, io.BytesIO(content))
+            if verbose:
+                verbose_output += f"{relative_path}\n"
 
         elif stat.is_symlink:
             target = await ctx.fs.readlink(full_path)
@@ -305,6 +358,10 @@ class TarCommand:
             info.linkname = target
             info.mode = stat.mode
             tar.addfile(info)
+            if verbose:
+                verbose_output += f"{relative_path}\n"
+
+        return verbose_output
 
     async def _extract_archive(
         self,
@@ -314,6 +371,7 @@ class TarCommand:
         work_dir: str,
         use_gzip: bool,
         verbose: bool,
+        strip_components: int = 0,
     ) -> ExecResult:
         """Extract a tar archive."""
         # Read archive
@@ -356,6 +414,15 @@ class TarCommand:
 
         for member in tar.getmembers():
             name = member.name
+
+            # Apply strip-components
+            if strip_components > 0:
+                parts = name.split("/")
+                if len(parts) <= strip_components:
+                    continue  # Skip if not enough components
+                name = "/".join(parts[strip_components:])
+                if not name:
+                    continue
 
             # Check if specific files requested
             if specific_files:

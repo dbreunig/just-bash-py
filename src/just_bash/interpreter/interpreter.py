@@ -53,6 +53,8 @@ from .control_flow import (
     execute_case,
 )
 from .builtins import BUILTINS
+from .builtins.alias import get_aliases
+from .builtins.shopt import DEFAULT_SHOPTS
 
 
 def _ok() -> ExecResult:
@@ -68,6 +70,14 @@ def _result(stdout: str, stderr: str, exit_code: int) -> ExecResult:
 def _failure(stderr: str) -> ExecResult:
     """Create a failed result with stderr."""
     return ExecResult(stdout="", stderr=stderr, exit_code=1)
+
+
+def _is_shopt_set(env: dict[str, str], name: str) -> bool:
+    """Check if a shopt option is set."""
+    key = f"__shopt_{name}__"
+    if key in env:
+        return env[key] == "1"
+    return DEFAULT_SHOPTS.get(name, False)
 
 
 class Interpreter:
@@ -552,16 +562,33 @@ class Interpreter:
             # Expand command name
             cmd_name = await expand_word_async(self._ctx, node.name)
 
+            # Alias expansion (before checking functions/builtins)
+            alias_args: list[str] = []
+            if _is_shopt_set(self._state.env, "expand_aliases"):
+                aliases = get_aliases(self._ctx)
+                if cmd_name in aliases:
+                    alias_value = aliases[cmd_name]
+                    # Simple word splitting for alias value
+                    import shlex
+                    try:
+                        alias_parts = shlex.split(alias_value)
+                    except ValueError:
+                        # Fall back to simple split if shlex fails
+                        alias_parts = alias_value.split()
+                    if alias_parts:
+                        cmd_name = alias_parts[0]
+                        alias_args = alias_parts[1:]
+
             # Check for function call first (functions override builtins)
             if cmd_name in self._state.functions:
-                return await self._call_function(cmd_name, node.args, stdin)
+                return await self._call_function(cmd_name, node.args, stdin, alias_args)
 
             # Check for builtins (which need InterpreterContext access)
             if cmd_name in BUILTINS:
-                return await self._execute_builtin(cmd_name, node, stdin)
+                return await self._execute_builtin(cmd_name, node, stdin, alias_args)
 
             # Expand arguments with glob support
-            args: list[str] = []
+            args: list[str] = list(alias_args)  # Start with alias args
             for arg in node.args:
                 expanded = await expand_word_with_glob(self._ctx, arg)
                 args.extend(expanded["values"])
@@ -695,7 +722,7 @@ class Interpreter:
         )
 
     async def _call_function(
-        self, name: str, args: list, stdin: str
+        self, name: str, args: list, stdin: str, alias_args: list[str] | None = None
     ) -> ExecResult:
         """Call a user-defined function."""
         func_def = self._state.functions[name]
@@ -718,8 +745,8 @@ class Interpreter:
             i += 1
         saved_count = self._state.env.get("#", "0")
 
-        # Set new positional parameters
-        expanded_args: list[str] = []
+        # Set new positional parameters (alias args first, then expanded args)
+        expanded_args: list[str] = list(alias_args) if alias_args else []
         for arg in args:
             expanded = await expand_word_with_glob(self._ctx, arg)
             expanded_args.extend(expanded["values"])
@@ -753,15 +780,16 @@ class Interpreter:
             self._state.call_depth -= 1
 
     async def _execute_builtin(
-        self, cmd_name: str, node: SimpleCommandNode, stdin: str
+        self, cmd_name: str, node: SimpleCommandNode, stdin: str,
+        alias_args: list[str] | None = None
     ) -> ExecResult:
         """Execute a shell builtin command.
 
         Builtins get direct access to InterpreterContext so they can
         modify interpreter state (env, cwd, options, etc.).
         """
-        # Expand arguments with glob support
-        args: list[str] = []
+        # Expand arguments with glob support (alias args first)
+        args: list[str] = list(alias_args) if alias_args else []
         for arg in node.args:
             expanded = await expand_word_with_glob(self._ctx, arg)
             args.extend(expanded["values"])

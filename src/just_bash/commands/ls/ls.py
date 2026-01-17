@@ -72,6 +72,7 @@ class LsCommand:
         human_readable = False
         dir_only = False
         classify = False
+        reverse = False
 
         paths: list[str] = []
 
@@ -93,6 +94,8 @@ class LsCommand:
                     dir_only = True
                 elif arg == "--classify":
                     classify = True
+                elif arg == "--reverse":
+                    reverse = True
                 else:
                     return ExecResult(
                         stdout="",
@@ -115,6 +118,8 @@ class LsCommand:
                         dir_only = True
                     elif c == 'F':
                         classify = True
+                    elif c == 'r':
+                        reverse = True
                     else:
                         return ExecResult(
                             stdout="",
@@ -162,7 +167,7 @@ class LsCommand:
                 if not show_all:
                     entries = [e for e in entries if not e.startswith('.')]
 
-                entries.sort()
+                entries.sort(reverse=reverse)
 
                 if long_format:
                     for entry in entries:

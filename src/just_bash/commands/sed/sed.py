@@ -46,14 +46,16 @@ class SedAddress:
 class SedCommand_:
     """A parsed sed command."""
 
-    cmd: str  # s, d, p, a, i, y, q, etc.
+    cmd: str  # s, d, p, a, i, y, q, h, H, g, G, x, n, N, etc.
     address: SedAddress | None = None
     pattern: re.Pattern | None = None
     replacement: str | None = None
     flags: str = ""
-    text: str = ""  # For a, i commands
+    text: str = ""  # For a, i, c commands
     source: str = ""  # For y command
     dest: str = ""  # For y command
+    label: str = ""  # For b, t, T commands
+    filename: str = ""  # For r, w commands
 
 
 class SedCommand:
@@ -179,7 +181,7 @@ class SedCommand:
                     path = ctx.fs.resolve_path(ctx.cwd, f)
                     content = await ctx.fs.read_file(path)
 
-                output = self._process_content(content, commands, silent)
+                output = self._process_content(content, commands, silent, ctx)
 
                 if in_place and f != "-":
                     path = ctx.fs.resolve_path(ctx.cwd, f)
@@ -363,12 +365,62 @@ class SedCommand:
         elif cmd_char == "q":
             return SedCommand_(cmd="q", address=address)
 
-        elif cmd_char == "a" or cmd_char == "i":
-            # Append or insert
+        elif cmd_char in ("a", "i", "c"):
+            # Append, insert, or change
             text = cmd_str[pos:].lstrip()
             if text.startswith("\\"):
                 text = text[1:].lstrip()
             return SedCommand_(cmd=cmd_char, address=address, text=text)
+
+        elif cmd_char in ("h", "H", "g", "G", "x"):
+            # Hold space commands
+            return SedCommand_(cmd=cmd_char, address=address)
+
+        elif cmd_char in ("n", "N"):
+            # Next line commands
+            return SedCommand_(cmd=cmd_char, address=address)
+
+        elif cmd_char in ("P", "D"):
+            # Print/delete first line of pattern space
+            return SedCommand_(cmd=cmd_char, address=address)
+
+        elif cmd_char == "b":
+            # Branch to label
+            label = cmd_str[pos:].strip()
+            return SedCommand_(cmd="b", address=address, label=label)
+
+        elif cmd_char == "t":
+            # Branch on successful substitute
+            label = cmd_str[pos:].strip()
+            return SedCommand_(cmd="t", address=address, label=label)
+
+        elif cmd_char == "T":
+            # Branch on failed substitute
+            label = cmd_str[pos:].strip()
+            return SedCommand_(cmd="T", address=address, label=label)
+
+        elif cmd_char == ":":
+            # Label definition
+            label = cmd_str[pos:].strip()
+            return SedCommand_(cmd=":", label=label)
+
+        elif cmd_char == "r":
+            # Read file
+            filename = cmd_str[pos:].strip()
+            return SedCommand_(cmd="r", address=address, filename=filename)
+
+        elif cmd_char == "w":
+            # Write to file
+            filename = cmd_str[pos:].strip()
+            return SedCommand_(cmd="w", address=address, filename=filename)
+
+        elif cmd_char == "{":
+            # Start of block (handled in parsing)
+            return None
+
+        elif cmd_char == "}":
+            # End of block (handled in parsing)
+            return None
 
         else:
             raise ValueError(f"unknown command: {cmd_char}")
@@ -386,7 +438,8 @@ class SedCommand:
         return -1
 
     def _process_content(
-        self, content: str, commands: list[SedCommand_], silent: bool
+        self, content: str, commands: list[SedCommand_], silent: bool,
+        ctx: "CommandContext | None" = None
     ) -> str:
         """Process content through sed commands."""
         lines = content.split("\n")
@@ -400,20 +453,48 @@ class SedCommand:
         # Track range state for each command
         in_range: dict[int, bool] = {}
 
-        for line_num, line in enumerate(lines, 1):
+        # Build label index
+        labels: dict[str, int] = {}
+        for cmd_idx, cmd in enumerate(commands):
+            if cmd.cmd == ":" and cmd.label:
+                labels[cmd.label] = cmd_idx
+
+        # Hold space
+        hold_space = ""
+
+        # Track if last substitute succeeded (for t/T branching)
+        sub_succeeded = False
+
+        # Write file buffers
+        write_buffers: dict[str, list[str]] = {}
+
+        line_idx = 0
+        while line_idx < len(lines):
+            line = lines[line_idx]
+            line_num = line_idx + 1
             pattern_space = line
             deleted = False
-            printed = False
             insert_text = ""
             append_text = ""
+            read_text = ""
             should_quit = False
+            restart_cycle = False
 
-            for cmd_idx, cmd in enumerate(commands):
+            cmd_idx = 0
+            while cmd_idx < len(commands):
+                cmd = commands[cmd_idx]
+
                 if deleted or should_quit:
                     break
 
+                # Skip label definitions
+                if cmd.cmd == ":":
+                    cmd_idx += 1
+                    continue
+
                 # Check if address matches
                 if not self._address_matches(cmd.address, line_num, total_lines, pattern_space, in_range, cmd_idx):
+                    cmd_idx += 1
                     continue
 
                 if cmd.cmd == "s":
@@ -430,8 +511,11 @@ class SedCommand:
 
                         if new_pattern != pattern_space:
                             pattern_space = new_pattern
+                            sub_succeeded = True
                             if "p" in cmd.flags:
                                 output += pattern_space + "\n"
+                        else:
+                            sub_succeeded = False
 
                 elif cmd.cmd == "y":
                     # Transliterate
@@ -441,9 +525,23 @@ class SedCommand:
                 elif cmd.cmd == "d":
                     deleted = True
 
+                elif cmd.cmd == "D":
+                    # Delete first line of pattern space
+                    if "\n" in pattern_space:
+                        pattern_space = pattern_space.split("\n", 1)[1]
+                        # Restart with remaining pattern space
+                        cmd_idx = 0
+                        continue
+                    else:
+                        deleted = True
+
                 elif cmd.cmd == "p":
                     output += pattern_space + "\n"
-                    printed = True
+
+                elif cmd.cmd == "P":
+                    # Print first line of pattern space
+                    first_line = pattern_space.split("\n", 1)[0]
+                    output += first_line + "\n"
 
                 elif cmd.cmd == "a":
                     append_text += cmd.text + "\n"
@@ -451,8 +549,104 @@ class SedCommand:
                 elif cmd.cmd == "i":
                     insert_text += cmd.text + "\n"
 
+                elif cmd.cmd == "c":
+                    # Change: replace pattern space and delete
+                    output += cmd.text + "\n"
+                    deleted = True
+
                 elif cmd.cmd == "q":
                     should_quit = True
+
+                elif cmd.cmd == "h":
+                    # Copy pattern space to hold space
+                    hold_space = pattern_space
+
+                elif cmd.cmd == "H":
+                    # Append pattern space to hold space
+                    if hold_space:
+                        hold_space += "\n" + pattern_space
+                    else:
+                        hold_space = pattern_space
+
+                elif cmd.cmd == "g":
+                    # Copy hold space to pattern space
+                    pattern_space = hold_space
+
+                elif cmd.cmd == "G":
+                    # Append hold space to pattern space
+                    pattern_space += "\n" + hold_space
+
+                elif cmd.cmd == "x":
+                    # Exchange pattern and hold space
+                    pattern_space, hold_space = hold_space, pattern_space
+
+                elif cmd.cmd == "n":
+                    # Print pattern space (unless silent), read next line
+                    if not silent:
+                        output += pattern_space + "\n"
+                    line_idx += 1
+                    if line_idx < len(lines):
+                        pattern_space = lines[line_idx]
+                        line_num = line_idx + 1
+                    else:
+                        deleted = True
+
+                elif cmd.cmd == "N":
+                    # Append next line to pattern space
+                    line_idx += 1
+                    if line_idx < len(lines):
+                        pattern_space += "\n" + lines[line_idx]
+                    else:
+                        # No more lines, end
+                        should_quit = True
+
+                elif cmd.cmd == "b":
+                    # Branch to label (or end if no label)
+                    if cmd.label and cmd.label in labels:
+                        cmd_idx = labels[cmd.label]
+                        continue
+                    else:
+                        # Branch to end of script
+                        break
+
+                elif cmd.cmd == "t":
+                    # Branch if last substitute succeeded
+                    if sub_succeeded:
+                        sub_succeeded = False
+                        if cmd.label and cmd.label in labels:
+                            cmd_idx = labels[cmd.label]
+                            continue
+                        else:
+                            break
+
+                elif cmd.cmd == "T":
+                    # Branch if last substitute failed
+                    if not sub_succeeded:
+                        if cmd.label and cmd.label in labels:
+                            cmd_idx = labels[cmd.label]
+                            continue
+                        else:
+                            break
+
+                elif cmd.cmd == "r":
+                    # Read file (content appended after current line)
+                    if ctx and cmd.filename:
+                        try:
+                            path = ctx.fs.resolve_path(ctx.cwd, cmd.filename)
+                            # We need async read, but we're in sync context
+                            # Store filename to read later
+                            read_text += f"__READ_FILE__{cmd.filename}__"
+                        except Exception:
+                            pass
+
+                elif cmd.cmd == "w":
+                    # Write pattern space to file
+                    if cmd.filename:
+                        if cmd.filename not in write_buffers:
+                            write_buffers[cmd.filename] = []
+                        write_buffers[cmd.filename].append(pattern_space)
+
+                cmd_idx += 1
 
             # Output insert text before line
             if insert_text:
@@ -469,6 +663,8 @@ class SedCommand:
 
             if should_quit:
                 break
+
+            line_idx += 1
 
         return output
 

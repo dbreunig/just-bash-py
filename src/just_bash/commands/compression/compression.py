@@ -77,22 +77,23 @@ class GzipCommand:
             )
 
         stdout_parts = []
-        stderr = ""
+        stderr_parts = []
         exit_code = 0
 
         for file in files:
             try:
                 path = ctx.fs.resolve_path(ctx.cwd, file)
                 content = await ctx.fs.read_file_bytes(path)
+                original_size = len(content)
 
                 if decompress:
                     if not file.endswith(".gz") and not force:
-                        stderr += f"gzip: {file}: unknown suffix -- ignored\n"
+                        stderr_parts.append(f"gzip: {file}: unknown suffix -- ignored\n")
                         continue
                     try:
                         result = gzip.decompress(content)
                     except Exception as e:
-                        stderr += f"gzip: {file}: {e}\n"
+                        stderr_parts.append(f"gzip: {file}: {e}\n")
                         exit_code = 1
                         continue
 
@@ -103,6 +104,10 @@ class GzipCommand:
                         await ctx.fs.write_file(new_path, result)
                         if not keep_original:
                             await ctx.fs.rm(path)
+
+                    if verbose:
+                        ratio = (1.0 - original_size / len(result)) * 100 if len(result) > 0 else 0
+                        stderr_parts.append(f"{file}:\t{ratio:.1f}% -- replaced with {new_path if not stdout_mode else 'stdout'}\n")
                 else:
                     result = gzip.compress(content, compresslevel=level)
 
@@ -115,14 +120,19 @@ class GzipCommand:
                         if not keep_original:
                             await ctx.fs.rm(path)
 
+                    if verbose:
+                        ratio = (1.0 - len(result) / original_size) * 100 if original_size > 0 else 0
+                        stderr_parts.append(f"{file}:\t{ratio:.1f}% -- replaced with {new_path if not stdout_mode else 'stdout'}\n")
+
             except FileNotFoundError:
-                stderr += f"gzip: {file}: No such file or directory\n"
+                stderr_parts.append(f"gzip: {file}: No such file or directory\n")
                 exit_code = 1
             except IsADirectoryError:
-                stderr += f"gzip: {file}: Is a directory\n"
+                stderr_parts.append(f"gzip: {file}: Is a directory\n")
                 exit_code = 1
 
         stdout = "".join(stdout_parts)
+        stderr = "".join(stderr_parts)
         return ExecResult(stdout=stdout, stderr=stderr, exit_code=exit_code)
 
     async def _process_stdin(

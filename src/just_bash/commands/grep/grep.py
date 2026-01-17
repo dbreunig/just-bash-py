@@ -21,8 +21,16 @@ Options:
   -F, --fixed-strings   PATTERN is a set of newline-separated strings
   -w, --word-regexp     match only whole words
   -x, --line-regexp     match only whole lines
+  -A NUM, --after-context=NUM   print NUM lines of trailing context
+  -B NUM, --before-context=NUM  print NUM lines of leading context
+  -C NUM, --context=NUM         print NUM lines of output context
+  -m NUM, --max-count=NUM       stop after NUM matches
+  -e PATTERN                    use PATTERN for matching
+  --include=GLOB                search only files matching GLOB
+  --exclude=GLOB                skip files matching GLOB
 """
 
+import fnmatch
 import re
 from ...types import CommandContext, ExecResult
 
@@ -48,6 +56,12 @@ class GrepCommand:
         fixed_strings = False
         word_regexp = False
         line_regexp = False
+        after_context = 0
+        before_context = 0
+        max_count = None
+        include_globs: list[str] = []
+        exclude_globs: list[str] = []
+        patterns: list[str] = []
 
         pattern = None
         files: list[str] = []
@@ -94,6 +108,19 @@ class GrepCommand:
                     word_regexp = True
                 elif arg == "--line-regexp":
                     line_regexp = True
+                elif arg.startswith("--after-context="):
+                    after_context = int(arg.split("=", 1)[1])
+                elif arg.startswith("--before-context="):
+                    before_context = int(arg.split("=", 1)[1])
+                elif arg.startswith("--context="):
+                    ctx_val = int(arg.split("=", 1)[1])
+                    before_context = after_context = ctx_val
+                elif arg.startswith("--max-count="):
+                    max_count = int(arg.split("=", 1)[1])
+                elif arg.startswith("--include="):
+                    include_globs.append(arg.split("=", 1)[1])
+                elif arg.startswith("--exclude="):
+                    exclude_globs.append(arg.split("=", 1)[1])
                 else:
                     return ExecResult(
                         stdout="",
@@ -101,50 +128,77 @@ class GrepCommand:
                         exit_code=2,
                     )
             elif arg.startswith("-") and arg != "-":
-                for c in arg[1:]:
-                    if c == 'i':
-                        ignore_case = True
-                    elif c == 'v':
-                        invert_match = True
-                    elif c == 'c':
-                        count_only = True
-                    elif c == 'l':
-                        files_with_matches = True
-                    elif c == 'L':
-                        files_without_match = True
-                    elif c == 'n':
-                        line_numbers = True
-                    elif c == 'H':
-                        with_filename = True
-                    elif c == 'h':
-                        with_filename = False
-                    elif c == 'o':
-                        only_matching = True
-                    elif c == 'q':
-                        quiet = True
-                    elif c == 'r' or c == 'R':
-                        recursive = True
-                    elif c == 'E':
-                        extended_regexp = True
-                    elif c == 'F':
-                        fixed_strings = True
-                    elif c == 'w':
-                        word_regexp = True
-                    elif c == 'x':
-                        line_regexp = True
-                    else:
+                # Handle options that take arguments
+                if arg in ("-A", "-B", "-C", "-m", "-e"):
+                    if i + 1 >= len(args):
                         return ExecResult(
                             stdout="",
-                            stderr=f"grep: invalid option -- '{c}'\n",
+                            stderr=f"grep: option requires an argument -- '{arg[-1]}'\n",
                             exit_code=2,
                         )
-            elif pattern is None:
+                    i += 1
+                    val = args[i]
+                    if arg == "-A":
+                        after_context = int(val)
+                    elif arg == "-B":
+                        before_context = int(val)
+                    elif arg == "-C":
+                        before_context = after_context = int(val)
+                    elif arg == "-m":
+                        max_count = int(val)
+                    elif arg == "-e":
+                        patterns.append(val)
+                else:
+                    for c in arg[1:]:
+                        if c == 'i':
+                            ignore_case = True
+                        elif c == 'v':
+                            invert_match = True
+                        elif c == 'c':
+                            count_only = True
+                        elif c == 'l':
+                            files_with_matches = True
+                        elif c == 'L':
+                            files_without_match = True
+                        elif c == 'n':
+                            line_numbers = True
+                        elif c == 'H':
+                            with_filename = True
+                        elif c == 'h':
+                            with_filename = False
+                        elif c == 'o':
+                            only_matching = True
+                        elif c == 'q':
+                            quiet = True
+                        elif c == 'r' or c == 'R':
+                            recursive = True
+                        elif c == 'E':
+                            extended_regexp = True
+                        elif c == 'F':
+                            fixed_strings = True
+                        elif c == 'w':
+                            word_regexp = True
+                        elif c == 'x':
+                            line_regexp = True
+                        else:
+                            return ExecResult(
+                                stdout="",
+                                stderr=f"grep: invalid option -- '{c}'\n",
+                                exit_code=2,
+                            )
+            elif pattern is None and not patterns:
                 pattern = arg
             else:
                 files.append(arg)
             i += 1
 
-        if pattern is None:
+        # Use -e patterns if provided, otherwise use positional pattern
+        if patterns:
+            if pattern:
+                # If pattern was set, it's actually a file
+                files.insert(0, pattern)
+            pattern = "|".join(f"({p})" for p in patterns)
+        elif pattern is None:
             return ExecResult(
                 stdout="",
                 stderr="grep: pattern not specified\n",
@@ -154,10 +208,6 @@ class GrepCommand:
         # Default to stdin
         if not files:
             files = ["-"]
-
-        # Auto-detect filename display
-        if with_filename is None:
-            with_filename = len(files) > 1
 
         # Build regex pattern
         try:
@@ -178,11 +228,58 @@ class GrepCommand:
                 exit_code=2,
             )
 
+        # Expand files for recursive search
+        expanded_files = []
+        for file in files:
+            if file == "-":
+                expanded_files.append(file)
+            else:
+                path = ctx.fs.resolve_path(ctx.cwd, file)
+                try:
+                    if await ctx.fs.is_directory(path):
+                        if recursive:
+                            # Get all files recursively
+                            all_files = await self._get_files_recursive(ctx, path)
+                            expanded_files.extend(all_files)
+                        else:
+                            expanded_files.append(file)  # Will error later
+                    else:
+                        expanded_files.append(file)
+                except FileNotFoundError:
+                    expanded_files.append(file)  # Will error later
+
+        # Filter by include/exclude globs
+        if include_globs or exclude_globs:
+            filtered_files = []
+            for file in expanded_files:
+                if file == "-":
+                    filtered_files.append(file)
+                    continue
+                filename = file.split("/")[-1]
+                # Check include
+                if include_globs:
+                    if not any(fnmatch.fnmatch(filename, g) for g in include_globs):
+                        continue
+                # Check exclude
+                if exclude_globs:
+                    if any(fnmatch.fnmatch(filename, g) for g in exclude_globs):
+                        continue
+                filtered_files.append(file)
+            expanded_files = filtered_files
+
+        # Auto-detect filename display
+        if with_filename is None:
+            with_filename = len(expanded_files) > 1
+
         stdout = ""
         stderr = ""
         found_match = False
+        total_matches = 0
 
-        for file in files:
+        for file in expanded_files:
+            if max_count is not None and total_matches >= max_count:
+                break
+
             try:
                 if file == "-":
                     content = ctx.stdin
@@ -197,8 +294,13 @@ class GrepCommand:
 
                 match_count = 0
                 file_has_match = False
+                matched_line_nums: list[int] = []
 
+                # First pass: find all matching lines
                 for line_num, line in enumerate(lines, 1):
+                    if max_count is not None and total_matches >= max_count:
+                        break
+
                     match = regex.search(line)
                     matches_pattern = bool(match)
 
@@ -207,28 +309,54 @@ class GrepCommand:
 
                     if matches_pattern:
                         match_count += 1
+                        total_matches += 1
                         file_has_match = True
                         found_match = True
+                        matched_line_nums.append(line_num)
 
                         if quiet:
                             return ExecResult(stdout="", stderr="", exit_code=0)
 
-                        if files_with_matches:
+                # Second pass: output with context
+                if not count_only and not files_with_matches and not files_without_match:
+                    output_lines: set[int] = set()
+                    for ln in matched_line_nums:
+                        # Add before context
+                        for b in range(max(1, ln - before_context), ln):
+                            output_lines.add(b)
+                        # Add match line
+                        output_lines.add(ln)
+                        # Add after context
+                        for a in range(ln + 1, min(len(lines) + 1, ln + after_context + 1)):
+                            output_lines.add(a)
+
+                    prev_line = 0
+                    for line_num in sorted(output_lines):
+                        if line_num < 1 or line_num > len(lines):
                             continue
+                        # Add separator for non-contiguous blocks
+                        if before_context or after_context:
+                            if prev_line > 0 and line_num > prev_line + 1:
+                                stdout += "--\n"
+                        prev_line = line_num
 
-                        if not count_only and not files_without_match:
-                            if only_matching and match and not invert_match:
-                                output = match.group(0)
-                            else:
-                                output = line
+                        line = lines[line_num - 1]
+                        is_match = line_num in matched_line_nums
+                        match = regex.search(line) if is_match else None
 
-                            parts = []
-                            if with_filename:
-                                parts.append(f"{file}:")
-                            if line_numbers:
-                                parts.append(f"{line_num}:")
-                            parts.append(output)
-                            stdout += "".join(parts) + "\n"
+                        if only_matching and match and not invert_match and is_match:
+                            output = match.group(0)
+                        else:
+                            output = line
+
+                        parts = []
+                        if with_filename:
+                            parts.append(f"{file}:")
+                        if line_numbers:
+                            sep = ":" if is_match else "-"
+                            parts.append(f"{line_num}{sep}")
+                        parts.append(output)
+                        stdout += "".join(parts) + "\n"
 
                 if count_only:
                     if with_filename:
@@ -243,14 +371,25 @@ class GrepCommand:
             except FileNotFoundError:
                 stderr += f"grep: {file}: No such file or directory\n"
             except IsADirectoryError:
-                if recursive:
-                    # TODO: Implement recursive search
-                    pass
-                else:
-                    stderr += f"grep: {file}: Is a directory\n"
+                stderr += f"grep: {file}: Is a directory\n"
 
         exit_code = 0 if found_match else 1
         return ExecResult(stdout=stdout, stderr=stderr, exit_code=exit_code)
+
+    async def _get_files_recursive(self, ctx: CommandContext, path: str) -> list[str]:
+        """Get all files in a directory recursively."""
+        files = []
+        try:
+            entries = await ctx.fs.readdir(path)
+            for entry in entries:
+                full_path = f"{path}/{entry}"
+                if await ctx.fs.is_directory(full_path):
+                    files.extend(await self._get_files_recursive(ctx, full_path))
+                else:
+                    files.append(full_path)
+        except Exception:
+            pass
+        return sorted(files)
 
 
 class FgrepCommand(GrepCommand):

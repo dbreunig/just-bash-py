@@ -47,13 +47,17 @@ if TYPE_CHECKING:
     from ...types import ExecResult
 
 
-async def handle_test(ctx: "InterpreterContext", args: list[str]) -> "ExecResult":
-    """Execute the test / [ builtin."""
-    from ...types import ExecResult
+# Known unary operators that require an operand
+_UNARY_OPS = {
+    "-f", "-d", "-e", "-s", "-r", "-w", "-x", "-h", "-L",
+    "-z", "-n", "-b", "-c", "-g", "-G", "-k", "-O", "-p",
+    "-S", "-t", "-u", "-N", "-v", "-o",
+}
 
-    # Remove trailing ] if called as [
-    if args and args[-1] == "]":
-        args = args[:-1]
+
+async def handle_test(ctx: "InterpreterContext", args: list[str]) -> "ExecResult":
+    """Execute the test builtin."""
+    from ...types import ExecResult
 
     # Empty test is false
     if not args:
@@ -64,6 +68,26 @@ async def handle_test(ctx: "InterpreterContext", args: list[str]) -> "ExecResult
         return ExecResult(stdout="", stderr="", exit_code=0 if result else 1)
     except ValueError as e:
         return ExecResult(stdout="", stderr=f"bash: test: {e}\n", exit_code=2)
+
+
+async def handle_bracket(ctx: "InterpreterContext", args: list[str]) -> "ExecResult":
+    """Execute the [ builtin (requires closing ])."""
+    from ...types import ExecResult
+
+    # [ requires closing ]
+    if not args or args[-1] != "]":
+        return ExecResult(stdout="", stderr="bash: [: missing `]'\n", exit_code=2)
+    args = args[:-1]
+
+    # Empty test is false
+    if not args:
+        return ExecResult(stdout="", stderr="", exit_code=1)
+
+    try:
+        result = await _evaluate(ctx, args)
+        return ExecResult(stdout="", stderr="", exit_code=0 if result else 1)
+    except ValueError as e:
+        return ExecResult(stdout="", stderr=f"bash: [: {e}\n", exit_code=2)
 
 
 async def _evaluate(ctx: "InterpreterContext", args: list[str]) -> bool:
@@ -109,9 +133,16 @@ async def _evaluate(ctx: "InterpreterContext", args: list[str]) -> bool:
             right = await _evaluate(ctx, args[i + 1:])
             return left or right
 
-    # Single argument: non-empty string is true
+    # Single argument: non-empty string is true, but check for misused operators
     if len(args) == 1:
-        return args[0] != ""
+        arg = args[0]
+        # If it looks like an operator (starts with -) but isn't followed by
+        # an operand, it could be a misused unary operator
+        if arg.startswith("-") and len(arg) > 1:
+            # Check if this looks like an operator that needs an operand
+            if arg in _UNARY_OPS:
+                raise ValueError(f"{arg}: unary operator expected")
+        return arg != ""
 
     # Two arguments: unary operators
     if len(args) == 2:
@@ -223,6 +254,14 @@ async def _file_test(ctx: "InterpreterContext", path: str, test_type: str) -> bo
     full_path = ctx.fs.resolve_path(ctx.state.cwd, path)
 
     try:
+        # For symlink test, use lstat (doesn't follow symlinks)
+        if test_type == "symlink":
+            try:
+                stat_info = await ctx.fs.lstat(full_path)
+                return stat_info.is_symbolic_link
+            except FileNotFoundError:
+                return False
+
         exists = await ctx.fs.exists(full_path)
 
         if test_type == "exists":
@@ -241,9 +280,9 @@ async def _file_test(ctx: "InterpreterContext", path: str, test_type: str) -> bo
             content = await ctx.fs.read_file(full_path)
             return len(content) > 0
 
-        # For readable/writable/executable/symlink, we assume true if exists
+        # For readable/writable/executable, we assume true if exists
         # (virtual filesystem doesn't track permissions)
-        if test_type in ("readable", "writable", "executable", "symlink"):
+        if test_type in ("readable", "writable", "executable"):
             return exists
 
         return False

@@ -40,6 +40,10 @@ class SortCommand:
         keys: list[dict] = []
         output_file = None
         stable = False
+        check_sorted = False
+        human_numeric = False
+        version_sort = False
+        month_sort = False
         files: list[str] = []
 
         # Parse arguments
@@ -97,6 +101,14 @@ class SortCommand:
                         unique = True
                     elif c == "s":
                         stable = True
+                    elif c == "c":
+                        check_sorted = True
+                    elif c == "h":
+                        human_numeric = True
+                    elif c == "V":
+                        version_sort = True
+                    elif c == "M":
+                        month_sort = True
                     elif c == "t":
                         # -t requires a value
                         if j + 1 < len(arg):
@@ -192,6 +204,12 @@ class SortCommand:
 
         # Create sort key function
         def make_key(line: str):
+            if version_sort:
+                return self._version_key(line)
+            if month_sort:
+                return self._month_key(line)
+            if human_numeric:
+                return self._human_numeric_key(line)
             if keys:
                 key_values = []
                 for key in keys:
@@ -207,6 +225,23 @@ class SortCommand:
                         "numeric": numeric,
                     },
                 )
+
+        # Check sorted mode
+        if check_sorted:
+            for i in range(1, len(all_lines)):
+                prev_key = make_key(all_lines[i - 1])
+                curr_key = make_key(all_lines[i])
+                if reverse:
+                    is_sorted = prev_key >= curr_key
+                else:
+                    is_sorted = prev_key <= curr_key
+                if not is_sorted:
+                    return ExecResult(
+                        stdout="",
+                        stderr=f"sort: {files[0]}:{i + 1}: disorder: {all_lines[i]}\n",
+                        exit_code=1,
+                    )
+            return ExecResult(stdout="", stderr="", exit_code=0)
 
         # Sort
         try:
@@ -326,3 +361,41 @@ class SortCommand:
             return (1, 0, val)
 
         return (0, val)
+
+    def _version_key(self, val: str) -> tuple:
+        """Create a sort key for version sorting (v1.2.10 style)."""
+        # Extract version components
+        parts = []
+        for part in re.split(r"(\d+)", val):
+            if part.isdigit():
+                parts.append((0, int(part)))
+            elif part:
+                parts.append((1, part))
+        return tuple(parts)
+
+    def _month_key(self, val: str) -> tuple:
+        """Create a sort key for month sorting."""
+        months = {
+            "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+            "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+            "january": 1, "february": 2, "march": 3, "april": 4,
+            "june": 6, "july": 7, "august": 8, "september": 9,
+            "october": 10, "november": 11, "december": 12,
+        }
+        val_lower = val.strip().lower()[:3]
+        month_num = months.get(val_lower, 0)
+        return (month_num, val)
+
+    def _human_numeric_key(self, val: str) -> tuple:
+        """Create a sort key for human-readable numeric sorting (1K, 1M, 1G)."""
+        suffixes = {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}
+        match = re.match(r"^\s*(-?\d+(?:\.\d+)?)\s*([kmgt]?)i?\s*$", val.strip(), re.IGNORECASE)
+        if match:
+            try:
+                num = float(match.group(1))
+                suffix = match.group(2).lower()
+                multiplier = suffixes.get(suffix, 1)
+                return (0, num * multiplier)
+            except ValueError:
+                pass
+        return (1, val)

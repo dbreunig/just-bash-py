@@ -378,9 +378,17 @@ class FindCommand:
                 elif act_name == "exec":
                     # Execute command with {} replaced by path
                     if act_val:
-                        # For now, just simulate exec by outputting what would run
-                        # Full exec would require invoking the interpreter
-                        pass
+                        # Replace {} with the current path
+                        cmd_parts = [p.replace("{}", abs_path) for p in act_val]
+                        # Build command string
+                        cmd_str = " ".join(cmd_parts)
+                        # Execute via the context's exec function
+                        try:
+                            result = await ctx.exec(cmd_str, {"cwd": ctx.cwd})
+                            output += result.stdout
+                            stderr += result.stderr
+                        except Exception as e:
+                            stderr += f"find: -exec failed: {e}\n"
 
         # Recurse into directories
         if stat.is_directory and (maxdepth < 0 or depth < maxdepth):

@@ -81,7 +81,7 @@ class AwkCommand:
             if arg == "-F":
                 if i + 1 < len(args):
                     i += 1
-                    field_sep = args[i]
+                    field_sep = self._unescape_field_sep(args[i])
                 else:
                     return ExecResult(
                         stdout="",
@@ -89,7 +89,7 @@ class AwkCommand:
                         exit_code=1,
                     )
             elif arg.startswith("-F"):
-                field_sep = arg[2:]
+                field_sep = self._unescape_field_sep(arg[2:])
             elif arg == "-v":
                 if i + 1 < len(args):
                     i += 1
@@ -488,7 +488,9 @@ class AwkCommand:
 
         # Handle print
         if stmt == "print" or stmt == "print $0":
-            state.output += line + state.variables.get("ORS", "\n")
+            # Use modified line if gsub/sub was called
+            current_line = state.variables.get("__line__", line)
+            state.output += current_line + state.variables.get("ORS", "\n")
             return
 
         if stmt.startswith("print "):
@@ -496,7 +498,7 @@ class AwkCommand:
             values = self._parse_print_args(args, state, fields, line)
             ofs = state.variables.get("OFS", " ")
             ors = state.variables.get("ORS", "\n")
-            state.output += ofs.join(str(v) for v in values) + ors
+            state.output += ofs.join(self._format_number(v) for v in values) + ors
             return
 
         # Handle printf
@@ -520,6 +522,78 @@ class AwkCommand:
         # Handle while statement
         if stmt.startswith("while"):
             self._execute_while(stmt, state, fields, line)
+            return
+
+        # Handle gsub (global substitution)
+        if stmt.startswith("gsub("):
+            match = re.match(r"gsub\s*\((.+)\)", stmt)
+            if match:
+                args = self._split_args(match.group(1))
+                if len(args) >= 2:
+                    pattern = args[0].strip()
+                    if pattern.startswith("/") and pattern.endswith("/"):
+                        pattern = pattern[1:-1]
+                    replacement = str(self._eval_expr(args[1], state, line, fields))
+                    # Default target is $0 (the line)
+                    if len(args) >= 3:
+                        target_var = args[2].strip()
+                    else:
+                        target_var = None
+                    try:
+                        if target_var:
+                            original = str(state.variables.get(target_var, ""))
+                            new_val = re.sub(pattern, replacement, original)
+                            state.variables[target_var] = new_val
+                        else:
+                            # Modify $0 - need to update fields array
+                            new_line = re.sub(pattern, replacement, line)
+                            # Update fields based on new line
+                            fs = state.variables.get("FS", " ")
+                            if fs == " ":
+                                new_fields = new_line.split()
+                            else:
+                                new_fields = new_line.split(fs)
+                            fields.clear()
+                            fields.extend(new_fields)
+                            state.variables["NF"] = len(new_fields)
+                            # Store the modified line for later use
+                            state.variables["__line__"] = new_line
+                    except re.error:
+                        pass
+            return
+
+        # Handle sub (single substitution)
+        if stmt.startswith("sub("):
+            match = re.match(r"sub\s*\((.+)\)", stmt)
+            if match:
+                args = self._split_args(match.group(1))
+                if len(args) >= 2:
+                    pattern = args[0].strip()
+                    if pattern.startswith("/") and pattern.endswith("/"):
+                        pattern = pattern[1:-1]
+                    replacement = str(self._eval_expr(args[1], state, line, fields))
+                    if len(args) >= 3:
+                        target_var = args[2].strip()
+                    else:
+                        target_var = None
+                    try:
+                        if target_var:
+                            original = str(state.variables.get(target_var, ""))
+                            new_val = re.sub(pattern, replacement, original, count=1)
+                            state.variables[target_var] = new_val
+                        else:
+                            new_line = re.sub(pattern, replacement, line, count=1)
+                            fs = state.variables.get("FS", " ")
+                            if fs == " ":
+                                new_fields = new_line.split()
+                            else:
+                                new_fields = new_line.split(fs)
+                            fields.clear()
+                            fields.extend(new_fields)
+                            state.variables["NF"] = len(new_fields)
+                            state.variables["__line__"] = new_line
+                    except re.error:
+                        pass
             return
 
         # Handle assignment
@@ -629,6 +703,14 @@ class AwkCommand:
         if expr in ("NR", "NF", "FS", "OFS", "ORS", "FILENAME"):
             return state.variables.get(expr, "")
 
+        # Array element access (arr[idx])
+        array_match = re.match(r"^([a-zA-Z_]\w*)\[(.+)\]$", expr)
+        if array_match:
+            arr_name = array_match.group(1)
+            idx = self._eval_expr(array_match.group(2), state, line, fields)
+            key = f"{arr_name}[{idx}]"
+            return state.variables.get(key, "")
+
         # User variables
         if re.match(r"^[a-zA-Z_]\w*$", expr):
             return state.variables.get(expr, "")
@@ -699,7 +781,104 @@ class AwkCommand:
                     return 0
             return 0
 
-        # String concatenation (spaces between expressions)
+        if expr.startswith("sin("):
+            match = re.match(r"sin\((.+)\)", expr)
+            if match:
+                import math
+                arg = self._eval_expr(match.group(1), state, line, fields)
+                try:
+                    return math.sin(float(arg))
+                except (ValueError, TypeError):
+                    return 0
+            return 0
+
+        if expr.startswith("cos("):
+            match = re.match(r"cos\((.+)\)", expr)
+            if match:
+                import math
+                arg = self._eval_expr(match.group(1), state, line, fields)
+                try:
+                    return math.cos(float(arg))
+                except (ValueError, TypeError):
+                    return 0
+            return 0
+
+        if expr.startswith("log("):
+            match = re.match(r"log\((.+)\)", expr)
+            if match:
+                import math
+                arg = self._eval_expr(match.group(1), state, line, fields)
+                try:
+                    return math.log(float(arg))
+                except (ValueError, TypeError):
+                    return 0
+            return 0
+
+        if expr.startswith("exp("):
+            match = re.match(r"exp\((.+)\)", expr)
+            if match:
+                import math
+                arg = self._eval_expr(match.group(1), state, line, fields)
+                try:
+                    return math.exp(float(arg))
+                except (ValueError, TypeError):
+                    return 0
+            return 0
+
+        if expr.startswith("split("):
+            match = re.match(r"split\((.+)\)", expr)
+            if match:
+                args = self._split_args(match.group(1))
+                if len(args) >= 2:
+                    s = str(self._eval_expr(args[0], state, line, fields))
+                    arr_name = args[1].strip()
+                    sep = state.variables.get("FS", " ")
+                    if len(args) >= 3:
+                        sep = str(self._eval_expr(args[2], state, line, fields))
+                    if sep == " ":
+                        parts = s.split()
+                    else:
+                        parts = s.split(sep)
+                    # Store array elements
+                    for i, part in enumerate(parts):
+                        state.variables[f"{arr_name}[{i+1}]"] = part
+                    return len(parts)
+            return 0
+
+        # Arithmetic - check for operators (including with spaces like "2 + 3")
+        for op in ["+", "-", "*", "/", "%"]:
+            if op in expr:
+                # Find the operator not in a function call
+                depth = 0
+                in_str = False
+                for i, c in enumerate(expr):
+                    if c == '"' and (i == 0 or expr[i-1] != '\\'):
+                        in_str = not in_str
+                    elif not in_str:
+                        if c == "(":
+                            depth += 1
+                        elif c == ")":
+                            depth -= 1
+                        elif c == op and depth == 0 and i > 0:
+                            left = self._eval_expr(expr[:i].strip(), state, line, fields)
+                            right = self._eval_expr(expr[i + 1:].strip(), state, line, fields)
+                            try:
+                                left = float(left)
+                                right = float(right)
+                                if op == "+":
+                                    return left + right
+                                elif op == "-":
+                                    return left - right
+                                elif op == "*":
+                                    return left * right
+                                elif op == "/":
+                                    return left / right if right != 0 else 0
+                                elif op == "%":
+                                    return left % right if right != 0 else 0
+                            except (ValueError, TypeError):
+                                return 0
+
+        # String concatenation (spaces between expressions - no operators)
         if " " in expr and not expr.startswith('"'):
             parts = expr.split()
             result = ""
@@ -707,35 +886,6 @@ class AwkCommand:
                 val = self._eval_expr(part, state, line, fields)
                 result += str(val)
             return result
-
-        # Arithmetic
-        for op in ["+", "-", "*", "/", "%"]:
-            if op in expr:
-                # Find the operator not in a function call
-                depth = 0
-                for i, c in enumerate(expr):
-                    if c == "(":
-                        depth += 1
-                    elif c == ")":
-                        depth -= 1
-                    elif c == op and depth == 0 and i > 0:
-                        left = self._eval_expr(expr[:i], state, line, fields)
-                        right = self._eval_expr(expr[i + 1:], state, line, fields)
-                        try:
-                            left = float(left)
-                            right = float(right)
-                            if op == "+":
-                                return left + right
-                            elif op == "-":
-                                return left - right
-                            elif op == "*":
-                                return left * right
-                            elif op == "/":
-                                return left / right if right != 0 else 0
-                            elif op == "%":
-                                return left % right if right != 0 else 0
-                        except (ValueError, TypeError):
-                            return 0
 
         return expr
 
@@ -985,3 +1135,34 @@ class AwkCommand:
             return int(s)
         except ValueError:
             return s
+
+    def _unescape_field_sep(self, s: str) -> str:
+        """Unescape field separator (handle \\t, \\n, etc.)."""
+        result = ""
+        i = 0
+        while i < len(s):
+            if s[i] == "\\" and i + 1 < len(s):
+                c = s[i + 1]
+                if c == "t":
+                    result += "\t"
+                elif c == "n":
+                    result += "\n"
+                elif c == "r":
+                    result += "\r"
+                elif c == "\\":
+                    result += "\\"
+                else:
+                    result += c
+                i += 2
+            else:
+                result += s[i]
+                i += 1
+        return result
+
+    def _format_number(self, n: Any) -> str:
+        """Format a number for output - integers without decimal point."""
+        if isinstance(n, float):
+            if n == int(n):
+                return str(int(n))
+            return str(n)
+        return str(n)

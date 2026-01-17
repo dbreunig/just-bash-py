@@ -6,7 +6,7 @@ to modify interpreter state (environment, cwd, options, etc.).
 
 from typing import TYPE_CHECKING, Optional, Callable, Awaitable
 
-from .test import handle_test
+from .test import handle_test, handle_bracket
 from .cd import handle_cd
 from .export import handle_export
 from .set import handle_set, handle_shift
@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 # Map of builtin names to their handler functions
 BUILTINS: dict[str, Callable[["InterpreterContext", list[str]], Awaitable["ExecResult"]]] = {
     "test": handle_test,
-    "[": handle_test,
+    "[": handle_bracket,
     "cd": handle_cd,
     "export": handle_export,
     "set": handle_set,
