@@ -55,7 +55,8 @@ def format_value(v: Any) -> str:
         return ""
     s = str(v)
     if "," in s or '"' in s or "\n" in s:
-        return f'"{s.replace('"', '""')}"'
+        escaped = s.replace('"', '""')
+        return f'"{escaped}"'
     return s
 
 

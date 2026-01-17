@@ -58,6 +58,8 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+# But not the env command
+!src/just_bash/commands/env/
 
 # Spyder project settings
 .spyderproject
