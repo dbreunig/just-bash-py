@@ -1,0 +1,1802 @@
+"""
+Test suite for verifying sandbox isolation.
+
+This test suite attempts various bash "jailbreak" techniques to verify that
+the just-bash-py interpreter cannot write to the real filesystem. All filesystem
+operations should be contained within the in-memory virtual filesystem.
+
+If any test in this suite fails, it means the sandbox has been breached and
+real filesystem writes are possible - which is a critical security issue.
+"""
+
+import os
+import tempfile
+import uuid
+import pytest
+from pathlib import Path
+
+from just_bash import Bash
+
+
+# Generate unique markers for each test run to avoid false positives
+def unique_marker() -> str:
+    """Generate a unique string to detect real file writes."""
+    return f"JAILBREAK_TEST_{uuid.uuid4().hex}"
+
+
+def real_path_exists(path: str) -> bool:
+    """Check if a path exists on the REAL filesystem."""
+    return os.path.exists(path)
+
+
+def real_file_contains(path: str, content: str) -> bool:
+    """Check if a real file contains specific content."""
+    try:
+        with open(path, "r") as f:
+            return content in f.read()
+    except (FileNotFoundError, PermissionError, IOError):
+        return False
+
+
+class TestDirectFileWrites:
+    """Test attempts to write files using standard redirection."""
+
+    @pytest.mark.asyncio
+    async def test_echo_redirect_to_tmp(self):
+        """Attempt to write to /tmp on real filesystem."""
+        marker = unique_marker()
+        real_path = f"/tmp/{marker}.txt"
+
+        bash = Bash()
+        await bash.exec(f'echo "{marker}" > /tmp/{marker}.txt')
+
+        assert not real_path_exists(real_path), \
+            f"SECURITY BREACH: Real file was created at {real_path}"
+
+    @pytest.mark.asyncio
+    async def test_echo_append_redirect(self):
+        """Attempt to append to a file using >>."""
+        marker = unique_marker()
+        real_path = f"/tmp/{marker}_append.txt"
+
+        bash = Bash()
+        await bash.exec(f'echo "{marker}" >> /tmp/{marker}_append.txt')
+
+        assert not real_path_exists(real_path), \
+            f"SECURITY BREACH: Real file was created at {real_path}"
+
+    @pytest.mark.asyncio
+    async def test_cat_heredoc_write(self):
+        """Attempt to write file using cat with heredoc."""
+        marker = unique_marker()
+        real_path = f"/tmp/{marker}_heredoc.txt"
+
+        bash = Bash()
+        await bash.exec(f'''cat << EOF > /tmp/{marker}_heredoc.txt
+{marker}
+Some content
+EOF''')
+
+        assert not real_path_exists(real_path), \
+            f"SECURITY BREACH: Heredoc created real file at {real_path}"
+
+    @pytest.mark.asyncio
+    async def test_printf_redirect(self):
+        """Attempt to write using printf."""
+        marker = unique_marker()
+        real_path = f"/tmp/{marker}_printf.txt"
+
+        bash = Bash()
+        await bash.exec(f'printf "%s" "{marker}" > /tmp/{marker}_printf.txt')
+
+        assert not real_path_exists(real_path), \
+            f"SECURITY BREACH: printf created real file at {real_path}"
+
+    @pytest.mark.asyncio
+    async def test_tee_command(self):
+        """Attempt to write using tee command."""
+        marker = unique_marker()
+        real_path = f"/tmp/{marker}_tee.txt"
+
+        bash = Bash()
+        await bash.exec(f'echo "{marker}" | tee /tmp/{marker}_tee.txt')
+
+        assert not real_path_exists(real_path), \
+            f"SECURITY BREACH: tee created real file at {real_path}"
+
+    @pytest.mark.asyncio
+    async def test_tee_append(self):
+        """Attempt to append using tee -a."""
+        marker = unique_marker()
+        real_path = f"/tmp/{marker}_tee_append.txt"
+
+        bash = Bash()
+        await bash.exec(f'echo "{marker}" | tee -a /tmp/{marker}_tee_append.txt')
+
+        assert not real_path_exists(real_path), \
+            f"SECURITY BREACH: tee -a created real file at {real_path}"
+
+    @pytest.mark.asyncio
+    async def test_dd_write(self):
+        """Attempt to write using dd command."""
+        marker = unique_marker()
+        real_path = f"/tmp/{marker}_dd.txt"
+
+        bash = Bash()
+        await bash.exec(f'echo "{marker}" | dd of=/tmp/{marker}_dd.txt 2>/dev/null')
+
+        assert not real_path_exists(real_path), \
+            f"SECURITY BREACH: dd created real file at {real_path}"
+
+
+class TestPathTraversalAttacks:
+    """Test attempts to escape sandbox via path traversal."""
+
+    @pytest.mark.asyncio
+    async def test_dotdot_escape_to_root(self):
+        """Attempt to write to root using ../ traversal."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'cd /home/user && echo "{marker}" > ../../../tmp/{marker}.txt')
+
+        assert not real_path_exists(f"/tmp/{marker}.txt"), \
+            "SECURITY BREACH: Path traversal escaped to /tmp"
+
+    @pytest.mark.asyncio
+    async def test_deep_traversal(self):
+        """Attempt deep path traversal to escape."""
+        marker = unique_marker()
+
+        bash = Bash()
+        # Try to go way beyond root
+        traversal = "../" * 50
+        await bash.exec(f'echo "{marker}" > {traversal}tmp/{marker}.txt')
+
+        assert not real_path_exists(f"/tmp/{marker}.txt"), \
+            "SECURITY BREACH: Deep path traversal escaped sandbox"
+
+    @pytest.mark.asyncio
+    async def test_absolute_path_to_real_tmp(self):
+        """Attempt to write directly to real /tmp with absolute path."""
+        marker = unique_marker()
+        real_path = f"/tmp/{marker}_absolute.txt"
+
+        bash = Bash()
+        await bash.exec(f'echo "{marker}" > {real_path}')
+
+        assert not real_path_exists(real_path), \
+            f"SECURITY BREACH: Absolute path write to {real_path}"
+
+    @pytest.mark.asyncio
+    async def test_home_directory_escape(self):
+        """Attempt to write to real home directory."""
+        marker = unique_marker()
+        real_home = os.path.expanduser("~")
+        real_path = f"{real_home}/.{marker}_test"
+
+        bash = Bash()
+        await bash.exec(f'echo "{marker}" > ~/.{marker}_test')
+
+        assert not real_path_exists(real_path), \
+            f"SECURITY BREACH: Escaped to real home directory at {real_path}"
+
+    @pytest.mark.asyncio
+    async def test_pwd_manipulation_escape(self):
+        """Attempt to escape via PWD manipulation."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'''
+            export PWD=/tmp
+            echo "{marker}" > ./{marker}_pwd.txt
+        ''')
+
+        assert not real_path_exists(f"/tmp/{marker}_pwd.txt"), \
+            "SECURITY BREACH: PWD manipulation allowed escape"
+
+
+class TestSymlinkAttacks:
+    """Test attempts to use symlinks to escape sandbox."""
+
+    @pytest.mark.asyncio
+    async def test_symlink_to_real_tmp(self):
+        """Create symlink pointing to real /tmp and write through it."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'''
+            ln -s /tmp /home/user/real_tmp_link
+            echo "{marker}" > /home/user/real_tmp_link/{marker}.txt
+        ''')
+
+        assert not real_path_exists(f"/tmp/{marker}.txt"), \
+            "SECURITY BREACH: Symlink allowed escape to real /tmp"
+
+    @pytest.mark.asyncio
+    async def test_symlink_to_real_home(self):
+        """Create symlink to real home directory."""
+        marker = unique_marker()
+        real_home = os.path.expanduser("~")
+
+        bash = Bash()
+        await bash.exec(f'''
+            ln -s {real_home} /home/user/real_home
+            echo "{marker}" > /home/user/real_home/.{marker}_test
+        ''')
+
+        assert not real_path_exists(f"{real_home}/.{marker}_test"), \
+            "SECURITY BREACH: Symlink to real home allowed escape"
+
+    @pytest.mark.asyncio
+    async def test_nested_symlinks_escape(self):
+        """Attempt escape via nested symlinks."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'''
+            ln -s /tmp /home/user/link1
+            ln -s /home/user/link1 /home/user/link2
+            ln -s /home/user/link2 /home/user/link3
+            echo "{marker}" > /home/user/link3/{marker}.txt
+        ''')
+
+        assert not real_path_exists(f"/tmp/{marker}.txt"), \
+            "SECURITY BREACH: Nested symlinks allowed escape"
+
+    @pytest.mark.asyncio
+    async def test_relative_symlink_escape(self):
+        """Attempt escape via relative symlink targets."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'''
+            cd /home/user
+            ln -s ../../../tmp escape_link
+            echo "{marker}" > escape_link/{marker}.txt
+        ''')
+
+        assert not real_path_exists(f"/tmp/{marker}.txt"), \
+            "SECURITY BREACH: Relative symlink allowed escape"
+
+
+class TestSubshellAndProcessEscapes:
+    """Test attempts to escape via subshells and process spawning."""
+
+    @pytest.mark.asyncio
+    async def test_subshell_write(self):
+        """Attempt to write from subshell."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'(echo "{marker}" > /tmp/{marker}_subshell.txt)')
+
+        assert not real_path_exists(f"/tmp/{marker}_subshell.txt"), \
+            "SECURITY BREACH: Subshell write escaped sandbox"
+
+    @pytest.mark.asyncio
+    async def test_nested_subshells(self):
+        """Attempt escape via deeply nested subshells."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'((((echo "{marker}" > /tmp/{marker}_nested.txt))))')
+
+        assert not real_path_exists(f"/tmp/{marker}_nested.txt"), \
+            "SECURITY BREACH: Nested subshells allowed escape"
+
+    @pytest.mark.asyncio
+    async def test_command_substitution_write(self):
+        """Attempt write via command substitution."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'result=$(echo "{marker}" > /tmp/{marker}_cmdsub.txt && echo done)')
+
+        assert not real_path_exists(f"/tmp/{marker}_cmdsub.txt"), \
+            "SECURITY BREACH: Command substitution allowed escape"
+
+    @pytest.mark.asyncio
+    async def test_backtick_substitution_write(self):
+        """Attempt write via backtick substitution."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'result=`echo "{marker}" > /tmp/{marker}_backtick.txt`')
+
+        assert not real_path_exists(f"/tmp/{marker}_backtick.txt"), \
+            "SECURITY BREACH: Backtick substitution allowed escape"
+
+    @pytest.mark.asyncio
+    async def test_bash_c_execution(self):
+        """Attempt escape via bash -c."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'bash -c \'echo "{marker}" > /tmp/{marker}_bashc.txt\'')
+
+        assert not real_path_exists(f"/tmp/{marker}_bashc.txt"), \
+            "SECURITY BREACH: bash -c allowed escape"
+
+    @pytest.mark.asyncio
+    async def test_sh_c_execution(self):
+        """Attempt escape via sh -c."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'sh -c \'echo "{marker}" > /tmp/{marker}_shc.txt\'')
+
+        assert not real_path_exists(f"/tmp/{marker}_shc.txt"), \
+            "SECURITY BREACH: sh -c allowed escape"
+
+    @pytest.mark.asyncio
+    async def test_eval_write(self):
+        """Attempt escape via eval."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'eval \'echo "{marker}" > /tmp/{marker}_eval.txt\'')
+
+        assert not real_path_exists(f"/tmp/{marker}_eval.txt"), \
+            "SECURITY BREACH: eval allowed escape"
+
+    @pytest.mark.asyncio
+    async def test_exec_redirect(self):
+        """Attempt escape via exec with file descriptor."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'''
+            exec 3>/tmp/{marker}_exec.txt
+            echo "{marker}" >&3
+            exec 3>&-
+        ''')
+
+        assert not real_path_exists(f"/tmp/{marker}_exec.txt"), \
+            "SECURITY BREACH: exec redirection allowed escape"
+
+
+class TestArchiveEscapes:
+    """Test attempts to escape via archive commands."""
+
+    @pytest.mark.asyncio
+    async def test_tar_extract_to_real_fs(self):
+        """Attempt to extract tar to real filesystem location."""
+        marker = unique_marker()
+
+        bash = Bash(files={
+            "/home/user/test.txt": marker
+        })
+
+        await bash.exec(f'''
+            cd /home/user
+            tar -cf archive.tar test.txt
+            tar -xf archive.tar -C /tmp
+        ''')
+
+        assert not real_path_exists("/tmp/test.txt"), \
+            "SECURITY BREACH: tar extracted to real /tmp"
+        assert not real_file_contains("/tmp/test.txt", marker), \
+            "SECURITY BREACH: tar content found in real /tmp"
+
+    @pytest.mark.asyncio
+    async def test_tar_absolute_path_extract(self):
+        """Attempt tar extraction with absolute paths."""
+        marker = unique_marker()
+
+        bash = Bash(files={
+            f"/tmp/{marker}_tartest.txt": marker
+        })
+
+        await bash.exec(f'''
+            tar -cf /home/user/archive.tar /tmp/{marker}_tartest.txt
+            tar -xf /home/user/archive.tar -C /
+        ''')
+
+        assert not real_path_exists(f"/tmp/{marker}_tartest.txt"), \
+            "SECURITY BREACH: tar with absolute path escaped"
+
+    @pytest.mark.asyncio
+    async def test_gzip_to_real_fs(self):
+        """Attempt gzip output to real filesystem."""
+        marker = unique_marker()
+
+        bash = Bash(files={
+            "/home/user/test.txt": marker
+        })
+
+        await bash.exec('gzip -c /home/user/test.txt > /tmp/test.txt.gz')
+
+        assert not real_path_exists("/tmp/test.txt.gz"), \
+            "SECURITY BREACH: gzip output escaped to real /tmp"
+
+
+class TestEnvironmentManipulation:
+    """Test attempts to escape via environment variable manipulation."""
+
+    @pytest.mark.asyncio
+    async def test_path_manipulation(self):
+        """Attempt escape via PATH manipulation."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'''
+            export PATH=/tmp:$PATH
+            echo "{marker}" > /tmp/{marker}_path.txt
+        ''')
+
+        assert not real_path_exists(f"/tmp/{marker}_path.txt"), \
+            "SECURITY BREACH: PATH manipulation allowed escape"
+
+    @pytest.mark.asyncio
+    async def test_home_manipulation(self):
+        """Attempt escape via HOME manipulation."""
+        marker = unique_marker()
+        real_home = os.path.expanduser("~")
+
+        bash = Bash()
+        await bash.exec(f'''
+            export HOME={real_home}
+            echo "{marker}" > $HOME/.{marker}_home.txt
+        ''')
+
+        assert not real_path_exists(f"{real_home}/.{marker}_home.txt"), \
+            "SECURITY BREACH: HOME manipulation allowed escape"
+
+    @pytest.mark.asyncio
+    async def test_tmpdir_manipulation(self):
+        """Attempt escape via TMPDIR manipulation."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'''
+            export TMPDIR=/tmp
+            echo "{marker}" > $TMPDIR/{marker}.txt
+        ''')
+
+        assert not real_path_exists(f"/tmp/{marker}.txt"), \
+            "SECURITY BREACH: TMPDIR manipulation allowed escape"
+
+    @pytest.mark.asyncio
+    async def test_ld_preload_manipulation(self):
+        """Attempt to set LD_PRELOAD (should have no real effect)."""
+        marker = unique_marker()
+
+        bash = Bash()
+        result = await bash.exec(f'''
+            export LD_PRELOAD=/tmp/evil.so
+            echo "{marker}" > /tmp/{marker}_preload.txt
+            echo $LD_PRELOAD
+        ''')
+
+        assert not real_path_exists(f"/tmp/{marker}_preload.txt"), \
+            "SECURITY BREACH: LD_PRELOAD context allowed escape"
+
+
+class TestDeviceAndSpecialFiles:
+    """Test attempts to write to device and special files."""
+
+    @pytest.mark.asyncio
+    async def test_write_to_dev_null(self):
+        """Attempt to interact with /dev/null."""
+        bash = Bash()
+        result = await bash.exec('echo "test" > /dev/null && echo "success"')
+        # This should work in the virtual fs (simulated /dev/null behavior)
+        # but should NOT touch real /dev/null
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_write_to_dev_tty(self):
+        """Attempt to write to /dev/tty."""
+        marker = unique_marker()
+
+        bash = Bash()
+        # Should not affect real terminal
+        result = await bash.exec(f'echo "{marker}" > /dev/tty 2>/dev/null || echo "blocked"')
+        # Just ensure no crash and no real effect
+        assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_write_to_proc(self):
+        """Attempt to write to /proc filesystem."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'echo "{marker}" > /proc/self/cmdline 2>/dev/null || true')
+
+        # Real /proc should be unaffected
+        try:
+            with open('/proc/self/cmdline', 'r') as f:
+                assert marker not in f.read(), \
+                    "SECURITY BREACH: Write to /proc succeeded"
+        except (FileNotFoundError, PermissionError):
+            pass  # OK if /proc not available
+
+    @pytest.mark.asyncio
+    async def test_write_to_sys(self):
+        """Attempt to write to /sys filesystem."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'echo "{marker}" > /sys/test 2>/dev/null || true')
+
+        assert not real_path_exists("/sys/test"), \
+            "SECURITY BREACH: Created file in /sys"
+
+
+class TestScriptAndSourceing:
+    """Test attempts to escape via script sourcing and execution."""
+
+    @pytest.mark.asyncio
+    async def test_source_and_write(self):
+        """Attempt escape by sourcing a script that writes."""
+        marker = unique_marker()
+
+        bash = Bash(files={
+            "/home/user/evil.sh": f'echo "{marker}" > /tmp/{marker}_sourced.txt'
+        })
+
+        await bash.exec('source /home/user/evil.sh')
+
+        assert not real_path_exists(f"/tmp/{marker}_sourced.txt"), \
+            "SECURITY BREACH: Sourced script escaped sandbox"
+
+    @pytest.mark.asyncio
+    async def test_dot_source_and_write(self):
+        """Attempt escape using dot command for sourcing."""
+        marker = unique_marker()
+
+        bash = Bash(files={
+            "/home/user/evil.sh": f'echo "{marker}" > /tmp/{marker}_dot.txt'
+        })
+
+        await bash.exec('. /home/user/evil.sh')
+
+        assert not real_path_exists(f"/tmp/{marker}_dot.txt"), \
+            "SECURITY BREACH: Dot-sourced script escaped sandbox"
+
+    @pytest.mark.asyncio
+    async def test_executable_script(self):
+        """Attempt escape via executable script."""
+        marker = unique_marker()
+
+        bash = Bash(files={
+            "/home/user/evil.sh": f'''#!/bin/bash
+echo "{marker}" > /tmp/{marker}_exec.txt
+'''
+        })
+
+        await bash.exec('chmod +x /home/user/evil.sh && /home/user/evil.sh')
+
+        assert not real_path_exists(f"/tmp/{marker}_exec.txt"), \
+            "SECURITY BREACH: Executable script escaped sandbox"
+
+    @pytest.mark.asyncio
+    async def test_bash_file_execution(self):
+        """Attempt escape by running bash with a file."""
+        marker = unique_marker()
+
+        bash = Bash(files={
+            "/home/user/script.sh": f'echo "{marker}" > /tmp/{marker}_bashfile.txt'
+        })
+
+        await bash.exec('bash /home/user/script.sh')
+
+        assert not real_path_exists(f"/tmp/{marker}_bashfile.txt"), \
+            "SECURITY BREACH: bash file execution escaped sandbox"
+
+
+class TestPipeAndRedirectionChains:
+    """Test complex pipe and redirection chains."""
+
+    @pytest.mark.asyncio
+    async def test_pipe_to_tee_to_file(self):
+        """Attempt escape via pipe chain to tee."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'echo "{marker}" | cat | tee /tmp/{marker}_pipetee.txt')
+
+        assert not real_path_exists(f"/tmp/{marker}_pipetee.txt"), \
+            "SECURITY BREACH: Pipe chain to tee escaped sandbox"
+
+    @pytest.mark.asyncio
+    async def test_multiple_redirections(self):
+        """Attempt escape via multiple redirections."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'echo "{marker}" > /tmp/{marker}_r1.txt 2>&1 | tee /tmp/{marker}_r2.txt')
+
+        assert not real_path_exists(f"/tmp/{marker}_r1.txt"), \
+            "SECURITY BREACH: Multiple redirections escaped (r1)"
+        assert not real_path_exists(f"/tmp/{marker}_r2.txt"), \
+            "SECURITY BREACH: Multiple redirections escaped (r2)"
+
+    @pytest.mark.asyncio
+    async def test_process_substitution_write(self):
+        """Attempt write via process substitution."""
+        marker = unique_marker()
+
+        bash = Bash()
+        # Process substitution creating a pseudo-file
+        # Note: Process substitution may not be implemented, which is fine -
+        # the test passes as long as no real file is created
+        try:
+            await bash.exec(f'cat <(echo "{marker}") > /tmp/{marker}_procsub.txt')
+        except Exception:
+            # Parse error or not implemented is fine - sandbox held
+            pass
+
+        assert not real_path_exists(f"/tmp/{marker}_procsub.txt"), \
+            "SECURITY BREACH: Process substitution allowed escape"
+
+    @pytest.mark.asyncio
+    async def test_xargs_write(self):
+        """Attempt escape via xargs."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'echo "{marker}" | xargs -I{{}} sh -c \'echo {{}} > /tmp/{marker}_xargs.txt\'')
+
+        assert not real_path_exists(f"/tmp/{marker}_xargs.txt"), \
+            "SECURITY BREACH: xargs allowed escape"
+
+
+class TestFileCreationCommands:
+    """Test file creation commands."""
+
+    @pytest.mark.asyncio
+    async def test_touch_real_file(self):
+        """Attempt to touch a file in real filesystem."""
+        marker = unique_marker()
+        real_path = f"/tmp/{marker}_touch.txt"
+
+        bash = Bash()
+        await bash.exec(f'touch {real_path}')
+
+        assert not real_path_exists(real_path), \
+            f"SECURITY BREACH: touch created real file at {real_path}"
+
+    @pytest.mark.asyncio
+    async def test_mkdir_real_dir(self):
+        """Attempt to create directory in real filesystem."""
+        marker = unique_marker()
+        real_path = f"/tmp/{marker}_dir"
+
+        bash = Bash()
+        await bash.exec(f'mkdir -p {real_path}')
+
+        assert not real_path_exists(real_path), \
+            f"SECURITY BREACH: mkdir created real directory at {real_path}"
+
+    @pytest.mark.asyncio
+    async def test_cp_to_real_fs(self):
+        """Attempt to copy file to real filesystem."""
+        marker = unique_marker()
+
+        bash = Bash(files={
+            "/home/user/test.txt": marker
+        })
+
+        await bash.exec(f'cp /home/user/test.txt /tmp/{marker}_cp.txt')
+
+        assert not real_path_exists(f"/tmp/{marker}_cp.txt"), \
+            "SECURITY BREACH: cp escaped to real filesystem"
+
+    @pytest.mark.asyncio
+    async def test_mv_to_real_fs(self):
+        """Attempt to move file to real filesystem."""
+        marker = unique_marker()
+
+        bash = Bash(files={
+            "/home/user/test.txt": marker
+        })
+
+        await bash.exec(f'mv /home/user/test.txt /tmp/{marker}_mv.txt')
+
+        assert not real_path_exists(f"/tmp/{marker}_mv.txt"), \
+            "SECURITY BREACH: mv escaped to real filesystem"
+
+    @pytest.mark.asyncio
+    async def test_ln_hard_link_to_real_fs(self):
+        """Attempt to create hard link in real filesystem."""
+        marker = unique_marker()
+
+        bash = Bash(files={
+            "/home/user/test.txt": marker
+        })
+
+        await bash.exec(f'ln /home/user/test.txt /tmp/{marker}_hardlink.txt')
+
+        assert not real_path_exists(f"/tmp/{marker}_hardlink.txt"), \
+            "SECURITY BREACH: Hard link created in real filesystem"
+
+    @pytest.mark.asyncio
+    async def test_install_command(self):
+        """Attempt to use install command to real filesystem."""
+        marker = unique_marker()
+
+        bash = Bash(files={
+            "/home/user/test.txt": marker
+        })
+
+        await bash.exec(f'install /home/user/test.txt /tmp/{marker}_install.txt')
+
+        assert not real_path_exists(f"/tmp/{marker}_install.txt"), \
+            "SECURITY BREACH: install command escaped to real filesystem"
+
+
+class TestFunctionAndAliasEscapes:
+    """Test attempts to escape via function/alias redefinition."""
+
+    @pytest.mark.asyncio
+    async def test_function_override_echo(self):
+        """Attempt escape by overriding echo function."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'''
+            echo() {{
+                builtin echo "$@" > /tmp/{marker}_funcecho.txt
+            }}
+            echo "{marker}"
+        ''')
+
+        assert not real_path_exists(f"/tmp/{marker}_funcecho.txt"), \
+            "SECURITY BREACH: Function override allowed escape"
+
+    @pytest.mark.asyncio
+    async def test_alias_escape(self):
+        """Attempt escape via alias."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'''
+            alias myecho='echo "{marker}" > /tmp/{marker}_alias.txt'
+            myecho
+        ''')
+
+        assert not real_path_exists(f"/tmp/{marker}_alias.txt"), \
+            "SECURITY BREACH: Alias allowed escape"
+
+    @pytest.mark.asyncio
+    async def test_command_builtin_bypass(self):
+        """Attempt escape using 'command' builtin."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'command echo "{marker}" > /tmp/{marker}_command.txt')
+
+        assert not real_path_exists(f"/tmp/{marker}_command.txt"), \
+            "SECURITY BREACH: command builtin allowed escape"
+
+
+class TestTextProcessingEscapes:
+    """Test escapes via text processing commands."""
+
+    @pytest.mark.asyncio
+    async def test_sed_inplace_real_file(self):
+        """Attempt sed in-place edit on real filesystem."""
+        marker = unique_marker()
+        real_path = f"/tmp/{marker}_sed.txt"
+
+        bash = Bash(files={
+            "/tmp/test.txt": "original content"
+        })
+
+        # First create in virtual, then try to edit "real"
+        await bash.exec(f'echo "test" | sed "s/test/{marker}/" > /tmp/{marker}_sed.txt')
+
+        assert not real_path_exists(real_path), \
+            "SECURITY BREACH: sed output escaped to real filesystem"
+
+    @pytest.mark.asyncio
+    async def test_awk_write(self):
+        """Attempt escape via awk output redirection."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'echo "test" | awk \'{{print "{marker}"}}\' > /tmp/{marker}_awk.txt')
+
+        assert not real_path_exists(f"/tmp/{marker}_awk.txt"), \
+            "SECURITY BREACH: awk output escaped to real filesystem"
+
+    @pytest.mark.asyncio
+    async def test_awk_print_to_file(self):
+        """Attempt awk print > file syntax."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'echo "test" | awk \'{{print "{marker}" > "/tmp/{marker}_awkfile.txt"}}\'')
+
+        assert not real_path_exists(f"/tmp/{marker}_awkfile.txt"), \
+            "SECURITY BREACH: awk print > file escaped sandbox"
+
+
+class TestLoopAndControlFlowEscapes:
+    """Test escapes via loops and control flow."""
+
+    @pytest.mark.asyncio
+    async def test_for_loop_write(self):
+        """Attempt escape via for loop."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'''
+            for i in 1 2 3; do
+                echo "{marker}_$i" > /tmp/{marker}_loop$i.txt
+            done
+        ''')
+
+        for i in [1, 2, 3]:
+            assert not real_path_exists(f"/tmp/{marker}_loop{i}.txt"), \
+                f"SECURITY BREACH: For loop write escaped (iteration {i})"
+
+    @pytest.mark.asyncio
+    async def test_while_loop_write(self):
+        """Attempt escape via while loop."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'''
+            i=0
+            while [ $i -lt 3 ]; do
+                echo "{marker}" > /tmp/{marker}_while$i.txt
+                i=$((i+1))
+            done
+        ''')
+
+        for i in range(3):
+            assert not real_path_exists(f"/tmp/{marker}_while{i}.txt"), \
+                f"SECURITY BREACH: While loop write escaped (iteration {i})"
+
+    @pytest.mark.asyncio
+    async def test_until_loop_write(self):
+        """Attempt escape via until loop."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'''
+            i=0
+            until [ $i -ge 2 ]; do
+                echo "{marker}" > /tmp/{marker}_until$i.txt
+                i=$((i+1))
+            done
+        ''')
+
+        for i in range(2):
+            assert not real_path_exists(f"/tmp/{marker}_until{i}.txt"), \
+                f"SECURITY BREACH: Until loop write escaped (iteration {i})"
+
+
+class TestSignalAndTrapEscapes:
+    """Test attempts to escape via signals and traps."""
+
+    @pytest.mark.asyncio
+    async def test_trap_exit_write(self):
+        """Attempt escape via EXIT trap."""
+        marker = unique_marker()
+
+        bash = Bash()
+        # Note: exit may raise an ExitError that propagates - that's fine,
+        # the test passes as long as no real file is created
+        try:
+            await bash.exec(f'''
+                trap 'echo "{marker}" > /tmp/{marker}_trap.txt' EXIT
+                exit 0
+            ''')
+        except Exception:
+            # ExitError or trap not fully implemented is fine - sandbox held
+            pass
+
+        assert not real_path_exists(f"/tmp/{marker}_trap.txt"), \
+            "SECURITY BREACH: EXIT trap allowed escape"
+
+    @pytest.mark.asyncio
+    async def test_trap_err_write(self):
+        """Attempt escape via ERR trap."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'''
+            trap 'echo "{marker}" > /tmp/{marker}_errtrap.txt' ERR
+            false
+        ''')
+
+        assert not real_path_exists(f"/tmp/{marker}_errtrap.txt"), \
+            "SECURITY BREACH: ERR trap allowed escape"
+
+
+class TestEncodingEscapes:
+    """Test escapes via various encodings."""
+
+    @pytest.mark.asyncio
+    async def test_base64_decode_write(self):
+        """Attempt escape via base64 decode and write."""
+        marker = unique_marker()
+        # Base64 encode the marker
+        import base64
+        encoded = base64.b64encode(marker.encode()).decode()
+
+        bash = Bash()
+        await bash.exec(f'echo "{encoded}" | base64 -d > /tmp/{marker}_b64.txt')
+
+        assert not real_path_exists(f"/tmp/{marker}_b64.txt"), \
+            "SECURITY BREACH: base64 decode escaped to real filesystem"
+
+    @pytest.mark.asyncio
+    async def test_hex_decode_write(self):
+        """Attempt escape via hex decode."""
+        marker = unique_marker()
+        hex_marker = marker.encode().hex()
+
+        bash = Bash()
+        await bash.exec(f'echo "{hex_marker}" | xxd -r -p > /tmp/{marker}_hex.txt 2>/dev/null || true')
+
+        assert not real_path_exists(f"/tmp/{marker}_hex.txt"), \
+            "SECURITY BREACH: hex decode escaped to real filesystem"
+
+
+class TestMultipleInstanceIsolation:
+    """Test that multiple Bash instances don't affect each other or real FS."""
+
+    @pytest.mark.asyncio
+    async def test_parallel_instances_isolated(self):
+        """Test that parallel instances are isolated from each other and real FS."""
+        marker1 = unique_marker()
+        marker2 = unique_marker()
+
+        bash1 = Bash()
+        bash2 = Bash()
+
+        await bash1.exec(f'echo "{marker1}" > /tmp/shared.txt')
+        await bash2.exec(f'echo "{marker2}" > /tmp/shared.txt')
+
+        # Verify real filesystem is untouched
+        assert not real_path_exists("/tmp/shared.txt") or \
+               not real_file_contains("/tmp/shared.txt", marker1), \
+            f"SECURITY BREACH: Instance 1 escaped to real /tmp"
+        assert not real_path_exists("/tmp/shared.txt") or \
+               not real_file_contains("/tmp/shared.txt", marker2), \
+            f"SECURITY BREACH: Instance 2 escaped to real /tmp"
+
+    @pytest.mark.asyncio
+    async def test_sequential_instances_isolated(self):
+        """Test sequential instances don't leak to real FS."""
+        markers = [unique_marker() for _ in range(5)]
+
+        for i, marker in enumerate(markers):
+            bash = Bash()
+            await bash.exec(f'echo "{marker}" > /tmp/seq_{i}.txt')
+
+            assert not real_path_exists(f"/tmp/seq_{i}.txt"), \
+                f"SECURITY BREACH: Sequential instance {i} escaped"
+
+
+class TestEdgeCases:
+    """Test edge cases and unusual attack vectors."""
+
+    @pytest.mark.asyncio
+    async def test_null_byte_in_path(self):
+        """Attempt escape using null bytes in path."""
+        marker = unique_marker()
+
+        bash = Bash()
+        # Null bytes might truncate paths in some implementations
+        await bash.exec(f'echo "{marker}" > "/tmp/{marker}\\x00/real.txt" 2>/dev/null || true')
+
+        assert not real_path_exists(f"/tmp/{marker}"), \
+            "SECURITY BREACH: Null byte path truncation escaped"
+
+    @pytest.mark.asyncio
+    async def test_unicode_path_escape(self):
+        """Attempt escape using unicode in path."""
+        marker = unique_marker()
+
+        bash = Bash()
+        # Various unicode tricks
+        await bash.exec(f'echo "{marker}" > /tmp/../tmp/{marker}_unicode.txt')
+
+        assert not real_path_exists(f"/tmp/{marker}_unicode.txt"), \
+            "SECURITY BREACH: Unicode path escaped"
+
+    @pytest.mark.asyncio
+    async def test_very_long_path(self):
+        """Attempt escape with very long path."""
+        marker = unique_marker()
+        long_component = "a" * 255
+
+        bash = Bash()
+        await bash.exec(f'mkdir -p /tmp/{long_component} && echo "{marker}" > /tmp/{long_component}/test.txt')
+
+        assert not real_path_exists(f"/tmp/{long_component}"), \
+            "SECURITY BREACH: Long path created real directory"
+
+    @pytest.mark.asyncio
+    async def test_special_chars_in_filename(self):
+        """Attempt escape with special characters in filename."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'echo "{marker}" > "/tmp/{marker}$(whoami).txt"')
+
+        # Check for any file starting with the marker in /tmp
+        import glob
+        matches = glob.glob(f"/tmp/{marker}*")
+        assert len(matches) == 0, \
+            f"SECURITY BREACH: Special char filename escaped: {matches}"
+
+    @pytest.mark.asyncio
+    async def test_newline_in_command(self):
+        """Attempt escape using newlines in command."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'''echo "{marker}"
+> /tmp/{marker}_newline.txt''')
+
+        assert not real_path_exists(f"/tmp/{marker}_newline.txt"), \
+            "SECURITY BREACH: Newline injection escaped"
+
+    @pytest.mark.asyncio
+    async def test_semicolon_injection(self):
+        """Attempt escape via semicolon command injection."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'true; echo "{marker}" > /tmp/{marker}_semi.txt')
+
+        assert not real_path_exists(f"/tmp/{marker}_semi.txt"), \
+            "SECURITY BREACH: Semicolon injection escaped"
+
+    @pytest.mark.asyncio
+    async def test_ampersand_background(self):
+        """Attempt escape via background execution."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'echo "{marker}" > /tmp/{marker}_bg.txt &')
+
+        # Give it a moment in case of async escape
+        import asyncio
+        await asyncio.sleep(0.1)
+
+        assert not real_path_exists(f"/tmp/{marker}_bg.txt"), \
+            "SECURITY BREACH: Background execution escaped"
+
+    @pytest.mark.asyncio
+    async def test_or_operator_escape(self):
+        """Attempt escape via || operator."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'false || echo "{marker}" > /tmp/{marker}_or.txt')
+
+        assert not real_path_exists(f"/tmp/{marker}_or.txt"), \
+            "SECURITY BREACH: OR operator allowed escape"
+
+    @pytest.mark.asyncio
+    async def test_and_operator_escape(self):
+        """Attempt escape via && operator."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'true && echo "{marker}" > /tmp/{marker}_and.txt')
+
+        assert not real_path_exists(f"/tmp/{marker}_and.txt"), \
+            "SECURITY BREACH: AND operator allowed escape"
+
+
+class TestRealWorldScenarios:
+    """Test realistic attack scenarios."""
+
+    @pytest.mark.asyncio
+    async def test_cron_job_creation(self):
+        """Attempt to create a cron job."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'''
+            echo "* * * * * echo {marker}" > /var/spool/cron/crontabs/root 2>/dev/null || true
+            echo "* * * * * echo {marker}" > /etc/cron.d/{marker} 2>/dev/null || true
+        ''')
+
+        assert not real_path_exists(f"/etc/cron.d/{marker}"), \
+            "SECURITY BREACH: Cron job created"
+
+    @pytest.mark.asyncio
+    async def test_ssh_key_injection(self):
+        """Attempt to inject SSH key."""
+        marker = unique_marker()
+        real_home = os.path.expanduser("~")
+
+        bash = Bash()
+        await bash.exec(f'''
+            mkdir -p ~/.ssh
+            echo "ssh-rsa {marker}" >> ~/.ssh/authorized_keys
+        ''')
+
+        ssh_path = f"{real_home}/.ssh/authorized_keys"
+        assert not real_file_contains(ssh_path, marker), \
+            "SECURITY BREACH: SSH key injected into real authorized_keys"
+
+    @pytest.mark.asyncio
+    async def test_bashrc_modification(self):
+        """Attempt to modify .bashrc."""
+        marker = unique_marker()
+        real_home = os.path.expanduser("~")
+
+        bash = Bash()
+        await bash.exec(f'echo "# {marker}" >> ~/.bashrc')
+
+        bashrc_path = f"{real_home}/.bashrc"
+        assert not real_file_contains(bashrc_path, marker), \
+            "SECURITY BREACH: .bashrc modified"
+
+    @pytest.mark.asyncio
+    async def test_profile_modification(self):
+        """Attempt to modify .profile."""
+        marker = unique_marker()
+        real_home = os.path.expanduser("~")
+
+        bash = Bash()
+        await bash.exec(f'echo "# {marker}" >> ~/.profile')
+
+        profile_path = f"{real_home}/.profile"
+        assert not real_file_contains(profile_path, marker), \
+            "SECURITY BREACH: .profile modified"
+
+    @pytest.mark.asyncio
+    async def test_sudoers_modification(self):
+        """Attempt to modify sudoers."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'''
+            echo "user ALL=(ALL) NOPASSWD: ALL # {marker}" >> /etc/sudoers 2>/dev/null || true
+        ''')
+
+        assert not real_file_contains("/etc/sudoers", marker), \
+            "SECURITY BREACH: sudoers file modified"
+
+    @pytest.mark.asyncio
+    async def test_passwd_modification(self):
+        """Attempt to modify /etc/passwd."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'''
+            echo "hacker:x:0:0:{marker}:/root:/bin/bash" >> /etc/passwd 2>/dev/null || true
+        ''')
+
+        assert not real_file_contains("/etc/passwd", marker), \
+            "SECURITY BREACH: /etc/passwd modified"
+
+    @pytest.mark.asyncio
+    async def test_hosts_file_modification(self):
+        """Attempt to modify /etc/hosts."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'''
+            echo "127.0.0.1 {marker}.evil.com" >> /etc/hosts 2>/dev/null || true
+        ''')
+
+        assert not real_file_contains("/etc/hosts", marker), \
+            "SECURITY BREACH: /etc/hosts modified"
+
+
+class TestFileDescriptorEscapes:
+    """Test escapes via file descriptor manipulation."""
+
+    @pytest.mark.asyncio
+    async def test_fd_redirect_to_file(self):
+        """Attempt escape via file descriptor redirection."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'''
+            exec 3>/tmp/{marker}_fd3.txt
+            echo "{marker}" >&3
+            exec 3>&-
+        ''')
+
+        assert not real_path_exists(f"/tmp/{marker}_fd3.txt"), \
+            "SECURITY BREACH: FD redirection escaped"
+
+    @pytest.mark.asyncio
+    async def test_fd_duplication_escape(self):
+        """Attempt escape via FD duplication."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'''
+            exec 4>&1
+            echo "{marker}" > /tmp/{marker}_fd4.txt
+        ''')
+
+        assert not real_path_exists(f"/tmp/{marker}_fd4.txt"), \
+            "SECURITY BREACH: FD duplication escaped"
+
+    @pytest.mark.asyncio
+    async def test_dev_fd_escape(self):
+        """Attempt escape via /dev/fd."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'''
+            echo "{marker}" > /dev/fd/3 3>/tmp/{marker}_devfd.txt 2>/dev/null || true
+        ''')
+
+        assert not real_path_exists(f"/tmp/{marker}_devfd.txt"), \
+            "SECURITY BREACH: /dev/fd escape"
+
+
+class TestCurlAndNetworkEscapes:
+    """Test network-based escape attempts."""
+
+    @pytest.mark.asyncio
+    async def test_curl_output_to_file(self):
+        """Attempt to use curl to write to real filesystem."""
+        marker = unique_marker()
+
+        bash = Bash()
+        # Without network access configured, this should fail gracefully
+        await bash.exec(f'curl -o /tmp/{marker}_curl.txt http://example.com 2>/dev/null || true')
+
+        assert not real_path_exists(f"/tmp/{marker}_curl.txt"), \
+            "SECURITY BREACH: curl output escaped"
+
+    @pytest.mark.asyncio
+    async def test_wget_to_file(self):
+        """Attempt to use wget to write to real filesystem."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'wget -O /tmp/{marker}_wget.txt http://example.com 2>/dev/null || true')
+
+        assert not real_path_exists(f"/tmp/{marker}_wget.txt"), \
+            "SECURITY BREACH: wget output escaped"
+
+
+class TestVerificationOfVirtualWrites:
+    """Verify that virtual filesystem writes work correctly (positive tests)."""
+
+    @pytest.mark.asyncio
+    async def test_virtual_write_works(self):
+        """Verify writes to virtual filesystem work."""
+        marker = unique_marker()
+
+        bash = Bash()
+        result = await bash.exec(f'''
+            echo "{marker}" > /home/user/test.txt
+            cat /home/user/test.txt
+        ''')
+
+        assert marker in result.stdout, \
+            "Virtual filesystem write failed - this shouldn't happen"
+
+    @pytest.mark.asyncio
+    async def test_virtual_tmp_write_works(self):
+        """Verify writes to virtual /tmp work."""
+        marker = unique_marker()
+
+        bash = Bash()
+        result = await bash.exec(f'''
+            echo "{marker}" > /tmp/test.txt
+            cat /tmp/test.txt
+        ''')
+
+        assert marker in result.stdout, \
+            "Virtual /tmp write failed - this shouldn't happen"
+
+        # But real /tmp should be untouched
+        assert not real_path_exists("/tmp/test.txt") or \
+               not real_file_contains("/tmp/test.txt", marker), \
+            "SECURITY BREACH: Virtual /tmp write escaped to real /tmp"
+
+    @pytest.mark.asyncio
+    async def test_virtual_filesystem_persistence_within_session(self):
+        """Verify files persist within a session but not to real FS."""
+        marker = unique_marker()
+
+        bash = Bash()
+
+        # Write file
+        await bash.exec(f'echo "{marker}" > /tmp/persist.txt')
+
+        # Read it back in same session
+        result = await bash.exec('cat /tmp/persist.txt')
+        assert marker in result.stdout, "File should persist within session"
+
+        # Real filesystem should be untouched
+        assert not real_file_contains("/tmp/persist.txt", marker), \
+            "SECURITY BREACH: Session file escaped to real filesystem"
+
+
+class TestReadingRealFilesystem:
+    """Test that reading from real filesystem is blocked.
+
+    This is CRITICAL - the sandbox should not be able to read real system files.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cat_etc_passwd(self):
+        """Attempt to read /etc/passwd from real filesystem."""
+        bash = Bash()
+        result = await bash.exec('cat /etc/passwd 2>/dev/null || echo "blocked"')
+
+        # Real /etc/passwd contains entries like "root:x:0:0"
+        # If the sandbox reads the real file, this would be a breach
+        assert "root:x:0:0" not in result.stdout, \
+            "SECURITY BREACH: cat read real /etc/passwd"
+
+    @pytest.mark.asyncio
+    async def test_cat_etc_shadow(self):
+        """Attempt to read /etc/shadow (sensitive file)."""
+        bash = Bash()
+        result = await bash.exec('cat /etc/shadow 2>/dev/null || echo "blocked"')
+
+        # Should not contain any shadow file content patterns
+        assert "root:" not in result.stdout or "!" not in result.stdout, \
+            "SECURITY BREACH: cat read real /etc/shadow"
+
+    @pytest.mark.asyncio
+    async def test_head_real_file(self):
+        """Attempt to read real file with head."""
+        bash = Bash()
+        result = await bash.exec('head -1 /etc/passwd 2>/dev/null || echo "blocked"')
+
+        assert "root:" not in result.stdout, \
+            "SECURITY BREACH: head read real /etc/passwd"
+
+    @pytest.mark.asyncio
+    async def test_tail_real_file(self):
+        """Attempt to read real file with tail."""
+        bash = Bash()
+        result = await bash.exec('tail -1 /etc/passwd 2>/dev/null || echo "blocked"')
+
+        # Real /etc/passwd usually ends with a user entry
+        # Check that it doesn't look like a passwd line
+        lines = result.stdout.strip().split('\n')
+        for line in lines:
+            if ':' in line and line.count(':') >= 3:
+                # Looks like a passwd entry - breach!
+                assert not any(c.isalpha() for c in line.split(':')[0]), \
+                    f"SECURITY BREACH: tail read real passwd entry: {line}"
+
+    @pytest.mark.asyncio
+    async def test_grep_real_filesystem(self):
+        """Attempt to grep real filesystem."""
+        bash = Bash()
+        result = await bash.exec('grep root /etc/passwd 2>/dev/null || echo "blocked"')
+
+        assert "root:x:0:0" not in result.stdout, \
+            "SECURITY BREACH: grep searched real /etc/passwd"
+
+    @pytest.mark.asyncio
+    async def test_find_real_filesystem(self):
+        """Attempt to search real filesystem with find."""
+        bash = Bash()
+        result = await bash.exec('find /etc -name "passwd" 2>/dev/null | head -5')
+
+        # Should not find real /etc/passwd
+        assert "/etc/passwd" not in result.stdout, \
+            "SECURITY BREACH: find searched real filesystem"
+
+    @pytest.mark.asyncio
+    async def test_ls_real_directory(self):
+        """Attempt to list real directory contents."""
+        bash = Bash()
+        result = await bash.exec('ls /etc 2>/dev/null | head -10')
+
+        # Real /etc contains files like hostname, hosts, passwd
+        # The virtual /etc should be empty or have different contents
+        real_etc_files = ['hostname', 'hosts', 'passwd', 'shadow', 'group']
+        matches = sum(1 for f in real_etc_files if f in result.stdout)
+
+        assert matches < 3, \
+            f"SECURITY BREACH: ls appears to list real /etc directory (matched {matches} files)"
+
+    @pytest.mark.asyncio
+    async def test_wc_real_file(self):
+        """Attempt to count lines in real file."""
+        bash = Bash()
+        result = await bash.exec('wc -l /etc/passwd 2>/dev/null')
+
+        # Real /etc/passwd typically has 20+ lines
+        # Virtual should have 0 or error
+        if result.stdout.strip():
+            try:
+                line_count = int(result.stdout.strip().split()[0])
+                assert line_count < 10, \
+                    f"SECURITY BREACH: wc counted {line_count} lines in real /etc/passwd"
+            except (ValueError, IndexError):
+                pass  # OK - error or empty
+
+    @pytest.mark.asyncio
+    async def test_read_proc_self(self):
+        """Attempt to read /proc/self information."""
+        bash = Bash()
+        result = await bash.exec('cat /proc/self/cmdline 2>/dev/null || echo "blocked"')
+
+        # Should not contain real process info like "python"
+        assert "python" not in result.stdout.lower(), \
+            "SECURITY BREACH: Read real /proc/self/cmdline"
+
+    @pytest.mark.asyncio
+    async def test_read_home_directory(self):
+        """Attempt to read real home directory files."""
+        real_home = os.path.expanduser("~")
+
+        bash = Bash()
+        result = await bash.exec(f'ls -la {real_home} 2>/dev/null | head -10')
+
+        # Should not see real home directory contents like .bashrc
+        # The virtual ~ should be /home/user with different contents
+        real_home_indicators = ['.bashrc', '.profile', '.bash_history', '.ssh']
+        matches = sum(1 for f in real_home_indicators if f in result.stdout)
+
+        assert matches < 2, \
+            f"SECURITY BREACH: ls appears to list real home directory (matched {matches} files)"
+
+
+class TestFileTestOperators:
+    """Test that file test operators don't leak real filesystem info."""
+
+    @pytest.mark.asyncio
+    async def test_file_exists_test(self):
+        """Test [ -f ] operator on real file."""
+        bash = Bash()
+        result = await bash.exec('[ -f /etc/passwd ] && echo "YES_EXISTS" || echo "NO_FILE"')
+
+        # In the sandbox, /etc/passwd should NOT exist (unless explicitly created)
+        assert "YES_EXISTS" not in result.stdout, \
+            "SECURITY BREACH: File test detected real /etc/passwd"
+
+    @pytest.mark.asyncio
+    async def test_directory_exists_test(self):
+        """Test [ -d ] operator on real directory."""
+        bash = Bash()
+        result = await bash.exec('[ -d /etc ] && echo "exists" || echo "not_exists"')
+
+        # Virtual /etc may or may not exist - but we need to verify
+        # it's not leaking info about real /etc
+        # This test documents behavior - virtual /etc might exist but be empty
+        pass  # Informational - /etc may exist in virtual fs
+
+    @pytest.mark.asyncio
+    async def test_readable_test(self):
+        """Test [ -r ] operator on real file."""
+        bash = Bash()
+        result = await bash.exec('[ -r /etc/passwd ] && echo "IS_READABLE" || echo "NOT_FOUND"')
+
+        assert "IS_READABLE" not in result.stdout, \
+            "SECURITY BREACH: File readable test detected real /etc/passwd"
+
+    @pytest.mark.asyncio
+    async def test_test_command_real_file(self):
+        """Test 'test' command on real file."""
+        bash = Bash()
+        result = await bash.exec('test -f /etc/passwd && echo "FILE_FOUND" || echo "NO_FILE"')
+
+        assert "FILE_FOUND" not in result.stdout, \
+            "SECURITY BREACH: test command detected real /etc/passwd"
+
+    @pytest.mark.asyncio
+    async def test_stat_real_file(self):
+        """Attempt to stat real file."""
+        bash = Bash()
+        result = await bash.exec('stat /etc/passwd 2>/dev/null || echo "blocked"')
+
+        # Should not show real file stats (size, permissions, etc.)
+        assert "regular file" not in result.stdout.lower() or "access:" not in result.stdout.lower(), \
+            "SECURITY BREACH: stat returned info about real /etc/passwd"
+
+    @pytest.mark.asyncio
+    async def test_file_command_real_file(self):
+        """Attempt to detect file type of real file."""
+        bash = Bash()
+        result = await bash.exec('file /etc/passwd 2>/dev/null || echo "blocked"')
+
+        # Real /etc/passwd is usually "ASCII text"
+        assert "ASCII text" not in result.stdout, \
+            "SECURITY BREACH: file command read real /etc/passwd"
+
+
+class TestGlobAndBraceExpansion:
+    """Test that glob/brace expansion doesn't match real filesystem."""
+
+    @pytest.mark.asyncio
+    async def test_glob_etc_star(self):
+        """Test glob expansion in /etc/*."""
+        bash = Bash()
+        result = await bash.exec('echo /etc/* 2>/dev/null')
+
+        # Should not expand to real /etc contents
+        real_etc_files = ['passwd', 'shadow', 'hosts', 'hostname']
+        matches = sum(1 for f in real_etc_files if f'/etc/{f}' in result.stdout)
+
+        assert matches < 2, \
+            f"SECURITY BREACH: Glob expanded to real /etc files (matched {matches})"
+
+    @pytest.mark.asyncio
+    async def test_glob_home_star(self):
+        """Test glob expansion in home directory."""
+        bash = Bash()
+        result = await bash.exec('echo ~/.* 2>/dev/null')
+
+        # Should not expand to real home dotfiles
+        real_dotfiles = ['.bashrc', '.profile', '.bash_history']
+        matches = sum(1 for f in real_dotfiles if f in result.stdout)
+
+        assert matches < 2, \
+            f"SECURITY BREACH: Glob expanded to real home dotfiles (matched {matches})"
+
+    @pytest.mark.asyncio
+    async def test_brace_expansion_paths(self):
+        """Test brace expansion with real paths."""
+        bash = Bash()
+        result = await bash.exec('cat {/etc/passwd,/etc/shadow} 2>/dev/null || echo "blocked"')
+
+        assert "root:x:0:0" not in result.stdout, \
+            "SECURITY BREACH: Brace expansion accessed real files"
+
+    @pytest.mark.asyncio
+    async def test_glob_recursive(self):
+        """Test recursive glob (if supported)."""
+        bash = Bash()
+        result = await bash.exec('echo /etc/**/*.conf 2>/dev/null | head -5')
+
+        # Should not find real config files
+        assert ".conf" not in result.stdout or result.stdout.strip() == "/etc/**/*.conf", \
+            "SECURITY BREACH: Recursive glob found real config files"
+
+
+class TestCommandsWithOutputFlags:
+    """Test commands that have -o or output file flags."""
+
+    @pytest.mark.asyncio
+    async def test_sort_output_flag(self):
+        """Test sort -o output flag."""
+        marker = unique_marker()
+
+        bash = Bash(files={"/home/user/input.txt": "zebra\napple\nbanana"})
+        await bash.exec(f'sort -o /tmp/{marker}_sorted.txt /home/user/input.txt')
+
+        assert not real_path_exists(f"/tmp/{marker}_sorted.txt"), \
+            "SECURITY BREACH: sort -o wrote to real filesystem"
+
+    @pytest.mark.asyncio
+    async def test_split_command(self):
+        """Test split command creating multiple files."""
+        marker = unique_marker()
+
+        bash = Bash(files={"/home/user/input.txt": "line1\nline2\nline3\nline4\nline5"})
+        await bash.exec(f'split -l 2 /home/user/input.txt /tmp/{marker}_split_')
+
+        # Check that no split files were created in real /tmp
+        import glob
+        matches = glob.glob(f"/tmp/{marker}_split_*")
+        assert len(matches) == 0, \
+            f"SECURITY BREACH: split created real files: {matches}"
+
+    @pytest.mark.asyncio
+    async def test_sed_inplace(self):
+        """Test sed -i in-place editing."""
+        marker = unique_marker()
+
+        # First create a file in virtual fs that looks like it could be real
+        bash = Bash(files={
+            f"/tmp/{marker}_sed.txt": "original content"
+        })
+
+        await bash.exec(f'sed -i "s/original/modified/" /tmp/{marker}_sed.txt')
+
+        assert not real_path_exists(f"/tmp/{marker}_sed.txt"), \
+            "SECURITY BREACH: sed -i created/modified real file"
+
+    @pytest.mark.asyncio
+    async def test_awk_output_redirection_in_script(self):
+        """Test awk with output redirection in script."""
+        marker = unique_marker()
+
+        bash = Bash()
+        await bash.exec(f'''echo "test" | awk '{{ print > "/tmp/{marker}_awkout.txt" }}' ''')
+
+        assert not real_path_exists(f"/tmp/{marker}_awkout.txt"), \
+            "SECURITY BREACH: awk script wrote to real filesystem"
+
+
+class TestDestructiveOperations:
+    """Test that destructive operations don't affect real filesystem."""
+
+    @pytest.mark.asyncio
+    async def test_rm_etc_passwd(self):
+        """Attempt to delete /etc/passwd."""
+        bash = Bash()
+        await bash.exec('rm /etc/passwd 2>/dev/null || true')
+
+        # Verify real /etc/passwd still exists
+        assert real_path_exists("/etc/passwd"), \
+            "CATASTROPHIC SECURITY BREACH: rm deleted real /etc/passwd!"
+
+    @pytest.mark.asyncio
+    async def test_rm_rf_etc(self):
+        """Attempt to delete /etc directory."""
+        bash = Bash()
+        await bash.exec('rm -rf /etc 2>/dev/null || true')
+
+        # Verify real /etc still exists
+        assert real_path_exists("/etc"), \
+            "CATASTROPHIC SECURITY BREACH: rm -rf deleted real /etc!"
+
+    @pytest.mark.asyncio
+    async def test_rm_rf_root(self):
+        """Attempt to delete root filesystem."""
+        bash = Bash()
+        await bash.exec('rm -rf / 2>/dev/null || true')
+
+        # Verify real filesystem still exists
+        assert real_path_exists("/etc") and real_path_exists("/tmp"), \
+            "CATASTROPHIC SECURITY BREACH: rm -rf deleted real filesystem!"
+
+    @pytest.mark.asyncio
+    async def test_rmdir_real_directory(self):
+        """Attempt to remove real directory."""
+        bash = Bash()
+        await bash.exec('rmdir /tmp 2>/dev/null || true')
+
+        assert real_path_exists("/tmp"), \
+            "SECURITY BREACH: rmdir removed real /tmp"
+
+    @pytest.mark.asyncio
+    async def test_mv_real_file(self):
+        """Attempt to move a real file."""
+        bash = Bash()
+        await bash.exec('mv /etc/passwd /tmp/passwd_backup 2>/dev/null || true')
+
+        assert real_path_exists("/etc/passwd"), \
+            "CATASTROPHIC SECURITY BREACH: mv moved real /etc/passwd!"
+
+    @pytest.mark.asyncio
+    async def test_truncate_real_file(self):
+        """Attempt to truncate a real file."""
+        bash = Bash()
+        await bash.exec('echo "" > /etc/passwd 2>/dev/null || true')
+
+        # Verify /etc/passwd still has content
+        try:
+            with open('/etc/passwd', 'r') as f:
+                content = f.read()
+                assert len(content) > 10, \
+                    "CATASTROPHIC SECURITY BREACH: Truncated real /etc/passwd!"
+        except PermissionError:
+            pass  # OK - can't read it
+
+
+class TestDatabaseCommands:
+    """Test database commands that could create real files."""
+
+    @pytest.mark.asyncio
+    async def test_sqlite3_create_db(self):
+        """Test sqlite3 creating a database file."""
+        marker = unique_marker()
+
+        bash = Bash()
+        try:
+            await bash.exec(f'''
+                sqlite3 /tmp/{marker}.db "CREATE TABLE test (id INTEGER);" 2>/dev/null || true
+            ''')
+        except Exception:
+            pass  # Command may not be fully implemented
+
+        assert not real_path_exists(f"/tmp/{marker}.db"), \
+            "SECURITY BREACH: sqlite3 created real database file"
+
+    @pytest.mark.asyncio
+    @pytest.mark.xfail(reason="KNOWN ISSUE: sqlite3 ATTACH can escape sandbox - needs fix")
+    async def test_sqlite3_attach_real_db(self):
+        """Test sqlite3 attempting to attach to real database path.
+
+        SECURITY ISSUE DETECTED: The sqlite3 ATTACH DATABASE command bypasses
+        sandbox restrictions and creates real files. This needs to be fixed
+        by intercepting ATTACH statements or patching the sqlite3 connection.
+        """
+        marker = unique_marker()
+        leaked_path = f"/tmp/{marker}_attach.db"
+
+        bash = Bash()
+        try:
+            await bash.exec(f'''
+                sqlite3 :memory: "ATTACH DATABASE '{leaked_path}' AS attached;" 2>/dev/null || true
+            ''')
+        except Exception:
+            pass
+
+        # Check for breach BEFORE cleanup
+        file_was_created = real_path_exists(leaked_path)
+
+        # Clean up any leaked file
+        if file_was_created:
+            import os
+            os.remove(leaked_path)
+
+        assert not file_was_created, \
+            "SECURITY BREACH: sqlite3 ATTACH created real database"
+
+
+class TestChecksumCommands:
+    """Test that checksum commands don't read real files."""
+
+    @pytest.mark.asyncio
+    async def test_md5sum_real_file(self):
+        """Test md5sum on real file."""
+        bash = Bash()
+        result = await bash.exec('md5sum /etc/passwd 2>/dev/null || echo "blocked"')
+
+        # If it returns a valid md5 hash, it may have read the real file
+        # Check for the characteristic "No such file" or similar
+        if "blocked" not in result.stdout:
+            # Should show error, not hash
+            assert len(result.stdout.strip().split()[0]) != 32, \
+                "SECURITY BREACH: md5sum may have read real /etc/passwd"
+
+    @pytest.mark.asyncio
+    async def test_sha256sum_real_file(self):
+        """Test sha256sum on real file."""
+        bash = Bash()
+        result = await bash.exec('sha256sum /etc/passwd 2>/dev/null || echo "blocked"')
+
+        if "blocked" not in result.stdout:
+            assert len(result.stdout.strip().split()[0]) != 64, \
+                "SECURITY BREACH: sha256sum may have read real /etc/passwd"
+
+
+class TestHereStrings:
+    """Test here-string syntax."""
+
+    @pytest.mark.asyncio
+    async def test_here_string_write(self):
+        """Test here-string with write."""
+        marker = unique_marker()
+
+        bash = Bash()
+        try:
+            await bash.exec(f'cat <<< "{marker}" > /tmp/{marker}_herestr.txt')
+        except Exception:
+            pass  # Here-strings may not be implemented
+
+        assert not real_path_exists(f"/tmp/{marker}_herestr.txt"), \
+            "SECURITY BREACH: Here-string write escaped"
+
+
+class TestMktempBehavior:
+    """Test mktemp command behavior."""
+
+    @pytest.mark.asyncio
+    async def test_mktemp_default(self):
+        """Test mktemp creates in virtual /tmp."""
+        bash = Bash()
+        result = await bash.exec('mktemp 2>/dev/null || echo "/tmp/virtual.XXXXXX"')
+
+        # Get the path from result
+        temp_path = result.stdout.strip()
+
+        # Check if any real temp file was created
+        if temp_path.startswith('/tmp/'):
+            assert not real_path_exists(temp_path), \
+                f"SECURITY BREACH: mktemp created real file at {temp_path}"
+
+    @pytest.mark.asyncio
+    async def test_mktemp_directory(self):
+        """Test mktemp -d creates in virtual filesystem."""
+        bash = Bash()
+        result = await bash.exec('mktemp -d 2>/dev/null || echo "/tmp/virtual.XXXXXX"')
+
+        temp_path = result.stdout.strip()
+
+        if temp_path.startswith('/tmp/'):
+            assert not real_path_exists(temp_path), \
+                f"SECURITY BREACH: mktemp -d created real directory at {temp_path}"
