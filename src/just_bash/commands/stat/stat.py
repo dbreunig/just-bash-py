@@ -101,6 +101,18 @@ class StatCommand:
         # %A - access rights in human readable form
         result = result.replace("%A", self._mode_to_string(stat.mode, stat.is_directory))
 
+        # %u - user ID (hardcoded for virtual FS)
+        result = result.replace("%u", "1000")
+
+        # %U - username (hardcoded for virtual FS)
+        result = result.replace("%U", "user")
+
+        # %g - group ID (hardcoded for virtual FS)
+        result = result.replace("%g", "1000")
+
+        # %G - group name (hardcoded for virtual FS)
+        result = result.replace("%G", "group")
+
         return result + "\n"
 
     def _default_format(self, path: str, stat) -> str:

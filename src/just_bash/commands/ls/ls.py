@@ -6,12 +6,16 @@ List information about the FILEs (the current directory by default).
 
 Options:
   -a, --all            do not ignore entries starting with .
+  -A, --almost-all     do not list implied . and ..
   -l                   use a long listing format
   -1                   list one file per line
   -R, --recursive      list subdirectories recursively
   -h, --human-readable with -l, print sizes in human readable format
   -d, --directory      list directories themselves, not their contents
   -F, --classify       append indicator (one of */=>@|) to entries
+  -S                   sort by file size, largest first
+  -t                   sort by modification time, newest first
+  -r, --reverse        reverse order while sorting
 """
 
 import stat
@@ -66,6 +70,7 @@ class LsCommand:
         """Execute the ls command."""
         # Options
         show_all = False
+        almost_all = False
         long_format = False
         one_per_line = False
         recursive = False
@@ -73,6 +78,8 @@ class LsCommand:
         dir_only = False
         classify = False
         reverse = False
+        sort_by_size = False
+        sort_by_time = False
 
         paths: list[str] = []
 
@@ -86,6 +93,8 @@ class LsCommand:
             elif arg.startswith("--"):
                 if arg == "--all":
                     show_all = True
+                elif arg == "--almost-all":
+                    almost_all = True
                 elif arg == "--recursive":
                     recursive = True
                 elif arg == "--human-readable":
@@ -106,6 +115,8 @@ class LsCommand:
                 for c in arg[1:]:
                     if c == 'a':
                         show_all = True
+                    elif c == 'A':
+                        almost_all = True
                     elif c == 'l':
                         long_format = True
                     elif c == '1':
@@ -120,6 +131,10 @@ class LsCommand:
                         classify = True
                     elif c == 'r':
                         reverse = True
+                    elif c == 'S':
+                        sort_by_size = True
+                    elif c == 't':
+                        sort_by_time = True
                     else:
                         return ExecResult(
                             stdout="",
@@ -164,10 +179,37 @@ class LsCommand:
                     continue
 
                 # Filter hidden files
-                if not show_all:
+                if not show_all and not almost_all:
                     entries = [e for e in entries if not e.startswith('.')]
+                elif almost_all:
+                    # -A shows hidden files but not . and ..
+                    entries = [e for e in entries if e not in (".", "..")]
+                # else: show_all shows everything including . and ..
 
-                entries.sort(reverse=reverse)
+                # Sort entries
+                if sort_by_size or sort_by_time:
+                    # Get stat for each entry
+                    entries_with_stats: list[tuple[str, int, float]] = []
+                    for e in entries:
+                        entry_path = f"{full_path}/{e}" if full_path != "/" else f"/{e}"
+                        try:
+                            entry_stat = await ctx.fs.stat(entry_path)
+                            entries_with_stats.append((e, entry_stat.size, entry_stat.mtime or 0))
+                        except Exception:
+                            entries_with_stats.append((e, 0, 0))
+
+                    if sort_by_time:
+                        # Sort by mtime, newest first (descending)
+                        entries_with_stats.sort(key=lambda x: (x[2], x[0]), reverse=True)
+                    elif sort_by_size:
+                        # Sort by size, largest first (descending)
+                        entries_with_stats.sort(key=lambda x: (x[1], x[0]), reverse=True)
+
+                    entries = [e for e, _, _ in entries_with_stats]
+                    if reverse:
+                        entries.reverse()
+                else:
+                    entries.sort(reverse=reverse)
 
                 if long_format:
                     for entry in entries:

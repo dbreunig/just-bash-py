@@ -28,7 +28,7 @@ from xml.etree import ElementTree as ET
 from configparser import ConfigParser
 
 from ...types import CommandContext, ExecResult
-from ..jq.jq import JqCommand
+from ...query_engine import parse, evaluate, EvalContext
 
 
 # Input formats supported
@@ -564,9 +564,6 @@ class YqCommand:
 
     name = "yq"
 
-    def __init__(self):
-        self._jq = JqCommand()
-
     async def execute(self, args: list[str], ctx: CommandContext) -> ExecResult:
         """Execute the yq command."""
         if "--help" in args or "-h" in args:
@@ -751,9 +748,10 @@ class YqCommand:
             if options.slurp and not options.null_input:
                 parsed = [parsed]
 
-            # Apply jq filter
-            jq_filter = self._jq._parse_filter(filter_str)
-            results = list(self._jq._apply_filter(jq_filter, parsed))
+            # Parse and evaluate filter using query engine
+            ast = parse(filter_str)
+            eval_ctx = EvalContext(env=dict(ctx.env))
+            results = evaluate(parsed, ast, eval_ctx)
 
             # Format output
             formatted = []

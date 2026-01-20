@@ -12,14 +12,14 @@ just-bash-py is a Python port of the just-bash TypeScript library - a pure Pytho
 # Install dependencies
 pip install -e ".[dev]"
 
-# Run tests
-pytest tests/ -v
+# Run tests (excludes spec_tests - use this by default)
+pytest tests/ --ignore=tests/spec_tests/ -v
 
 # Run specific test file
 pytest tests/test_commands/test_commands.py -v
 
 # Run tests matching pattern
-pytest tests/ -v -k "grep"
+pytest tests/ --ignore=tests/spec_tests/ -v -k "grep"
 
 # Type checking
 mypy src/
@@ -28,6 +28,8 @@ mypy src/
 ruff format src/ tests/
 ruff check src/ tests/ --fix
 ```
+
+**IMPORTANT: Do NOT run spec_tests unless explicitly asked.** The spec_tests suite takes 30+ minutes to run and contains many expected failures. Always use `--ignore=tests/spec_tests/` when running the full test suite.
 
 ## Test-Driven Development (TDD)
 
@@ -139,7 +141,7 @@ class NewCommand:
 - Keep implementations simple and focused
 - Use `ctx.fs` for all filesystem operations
 - Handle errors gracefully with appropriate exit codes
-- Verify with `pytest tests/ -v` before finishing
+- Verify with `pytest tests/ --ignore=tests/spec_tests/ -v` before finishing
 
 ## Known Issues
 

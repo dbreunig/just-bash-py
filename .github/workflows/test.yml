@@ -29,8 +29,3 @@ jobs:
       - name: Run tests
         run: |
           pytest tests/test_commands/ -v --tb=short
-
-      - name: Run spec tests (allowed to fail)
-        continue-on-error: true
-        run: |
-          pytest tests/spec_tests/ -v --tb=no -q | tail -20

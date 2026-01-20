@@ -1,5 +1,7 @@
 """Tests for command implementations."""
 
+import json
+
 import pytest
 from just_bash import Bash
 
@@ -59,6 +61,82 @@ class TestLsCommand:
         result = await bash.exec("ls /nonexistent")
         assert "No such file or directory" in result.stderr
         assert result.exit_code == 2
+
+    @pytest.mark.asyncio
+    async def test_ls_almost_all_flag(self):
+        """Test -A shows hidden files except . and .."""
+        bash = Bash(files={
+            "/dir/.hidden": "hidden",
+            "/dir/visible": "visible",
+        })
+        result = await bash.exec("ls -A /dir")
+        assert ".hidden" in result.stdout
+        assert "visible" in result.stdout
+        # . and .. should NOT appear
+        lines = result.stdout.strip().split()
+        assert "." not in lines
+        assert ".." not in lines
+
+    @pytest.mark.asyncio
+    async def test_ls_almost_all_long_option(self):
+        """Test --almost-all shows hidden files except . and .."""
+        bash = Bash(files={
+            "/dir/.config": "config",
+            "/dir/readme": "readme",
+        })
+        result = await bash.exec("ls --almost-all /dir")
+        assert ".config" in result.stdout
+        assert "readme" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_ls_sort_by_size(self):
+        """Test -S sorts by file size, largest first."""
+        bash = Bash(files={
+            "/dir/small": "x",
+            "/dir/medium": "xxxxx",
+            "/dir/large": "xxxxxxxxxx",
+        })
+        result = await bash.exec("ls -1S /dir")
+        lines = result.stdout.strip().split("\n")
+        assert lines == ["large", "medium", "small"]
+
+    @pytest.mark.asyncio
+    async def test_ls_sort_by_size_reverse(self):
+        """Test -Sr sorts by file size, smallest first."""
+        bash = Bash(files={
+            "/dir/small": "x",
+            "/dir/medium": "xxxxx",
+            "/dir/large": "xxxxxxxxxx",
+        })
+        result = await bash.exec("ls -1Sr /dir")
+        lines = result.stdout.strip().split("\n")
+        assert lines == ["small", "medium", "large"]
+
+    @pytest.mark.asyncio
+    async def test_ls_sort_by_time(self):
+        """Test -t sorts by modification time, newest first."""
+        bash = Bash(files={
+            "/dir/file1": "content1",
+            "/dir/file2": "content2",
+        })
+        # Touch file1 to make it newer
+        await bash.exec("touch /dir/file1")
+        result = await bash.exec("ls -1t /dir")
+        lines = result.stdout.strip().split("\n")
+        assert lines[0] == "file1"  # Most recently modified
+
+    @pytest.mark.asyncio
+    async def test_ls_sort_by_time_reverse(self):
+        """Test -tr sorts by modification time, oldest first."""
+        bash = Bash(files={
+            "/dir/file1": "content1",
+            "/dir/file2": "content2",
+        })
+        # Touch file1 to make it newer
+        await bash.exec("touch /dir/file1")
+        result = await bash.exec("ls -1tr /dir")
+        lines = result.stdout.strip().split("\n")
+        assert lines[-1] == "file1"  # Most recently modified is last
 
 
 class TestHeadCommand:
@@ -1303,6 +1381,214 @@ class TestJqCommand:
         result = await bash.exec("jq '.' /data.txt")
         assert result.exit_code == 2
 
+    @pytest.mark.asyncio
+    async def test_jq_group_by_multiple_groups(self):
+        """Test group_by with multiple groups - currently fails."""
+        bash = Bash(files={
+            "/data.json": '[{"name": "A", "val": 1}, {"name": "B", "val": 2}, {"name": "A", "val": 3}]'
+        })
+        result = await bash.exec("jq 'group_by(.name)' /data.json")
+
+        # group_by should produce an array of arrays grouped by .name
+        # Expected: [[{"name":"A","val":1},{"name":"A","val":3}],[{"name":"B","val":2}]]
+        import json
+        output = json.loads(result.stdout.strip())
+
+        assert result.exit_code == 0
+        assert isinstance(output, list), "group_by should return an array"
+        assert len(output) == 2, "Should have 2 groups (A and B)"
+
+        # Each group should be an array
+        for group in output:
+            assert isinstance(group, list), "Each group should be an array"
+
+        # Find group A and group B
+        group_a = next((g for g in output if g[0]["name"] == "A"), None)
+        group_b = next((g for g in output if g[0]["name"] == "B"), None)
+
+        assert group_a is not None, "Should have group A"
+        assert group_b is not None, "Should have group B"
+        assert len(group_a) == 2, "Group A should have 2 items"
+        assert len(group_b) == 1, "Group B should have 1 item"
+
+    # ============================================================
+    # UNIMPLEMENTED FEATURES - Expected to fail until implemented
+    # ============================================================
+
+    @pytest.mark.asyncio
+    async def test_jq_sort_by(self):
+        """sort_by(expr) - sort array by expression result."""
+        bash = Bash()
+        result = await bash.exec(
+            'echo \'[{"name":"Bob","age":30},{"name":"Alice","age":25}]\' | jq "sort_by(.name)"'
+        )
+        assert result.exit_code == 0
+        assert json.loads(result.stdout) == [
+            {"name": "Alice", "age": 25},
+            {"name": "Bob", "age": 30},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_jq_sort_by_numeric(self):
+        """sort_by(expr) - sort by numeric field."""
+        bash = Bash()
+        result = await bash.exec(
+            'echo \'[{"n":"a","v":3},{"n":"b","v":1},{"n":"c","v":2}]\' | jq "sort_by(.v)"'
+        )
+        assert result.exit_code == 0
+        assert json.loads(result.stdout) == [
+            {"n": "b", "v": 1},
+            {"n": "c", "v": 2},
+            {"n": "a", "v": 3},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_jq_unique_by(self):
+        """unique_by(expr) - remove duplicates by expression."""
+        bash = Bash()
+        result = await bash.exec(
+            'echo \'[{"name":"A","val":1},{"name":"B","val":2},{"name":"A","val":3}]\' | jq "unique_by(.name)"'
+        )
+        assert result.exit_code == 0
+        # Should keep first occurrence of each unique key
+        parsed = json.loads(result.stdout)
+        assert len(parsed) == 2
+        names = [item["name"] for item in parsed]
+        assert "A" in names
+        assert "B" in names
+
+    @pytest.mark.asyncio
+    async def test_jq_min_by(self):
+        """min_by(expr) - find minimum by expression."""
+        bash = Bash()
+        result = await bash.exec(
+            'echo \'[{"name":"Bob","age":30},{"name":"Alice","age":25}]\' | jq "min_by(.age)"'
+        )
+        assert result.exit_code == 0
+        assert json.loads(result.stdout) == {"name": "Alice", "age": 25}
+
+    @pytest.mark.asyncio
+    async def test_jq_max_by(self):
+        """max_by(expr) - find maximum by expression."""
+        bash = Bash()
+        result = await bash.exec(
+            'echo \'[{"name":"Bob","age":30},{"name":"Alice","age":25}]\' | jq "max_by(.age)"'
+        )
+        assert result.exit_code == 0
+        assert json.loads(result.stdout) == {"name": "Bob", "age": 30}
+
+    @pytest.mark.asyncio
+    async def test_jq_to_entries(self):
+        """to_entries - convert object to [{key, value}] array."""
+        bash = Bash()
+        result = await bash.exec('echo \'{"a":1,"b":2}\' | jq "to_entries"')
+        assert result.exit_code == 0
+        parsed = json.loads(result.stdout)
+        # Order may vary, so check contents
+        assert len(parsed) == 2
+        keys = {item["key"] for item in parsed}
+        assert keys == {"a", "b"}
+        values = {item["value"] for item in parsed}
+        assert values == {1, 2}
+
+    @pytest.mark.asyncio
+    async def test_jq_from_entries(self):
+        """from_entries - convert [{key, value}] array to object."""
+        bash = Bash()
+        result = await bash.exec(
+            'echo \'[{"key":"a","value":1},{"key":"b","value":2}]\' | jq "from_entries"'
+        )
+        assert result.exit_code == 0
+        assert json.loads(result.stdout) == {"a": 1, "b": 2}
+
+    @pytest.mark.asyncio
+    async def test_jq_with_entries(self):
+        """with_entries(f) - transform entries."""
+        bash = Bash()
+        result = await bash.exec(
+            'echo \'{"a":1,"b":2}\' | jq "with_entries(.value += 10)"'
+        )
+        assert result.exit_code == 0
+        assert json.loads(result.stdout) == {"a": 11, "b": 12}
+
+    @pytest.mark.asyncio
+    async def test_jq_floor(self):
+        """floor - round down."""
+        bash = Bash()
+        result = await bash.exec("echo '3.7' | jq 'floor'")
+        assert result.exit_code == 0
+        assert json.loads(result.stdout) == 3
+
+    @pytest.mark.asyncio
+    async def test_jq_ceil(self):
+        """ceil - round up."""
+        bash = Bash()
+        result = await bash.exec("echo '3.2' | jq 'ceil'")
+        assert result.exit_code == 0
+        assert json.loads(result.stdout) == 4
+
+    @pytest.mark.asyncio
+    async def test_jq_round(self):
+        """round - round to nearest integer."""
+        bash = Bash()
+        result = await bash.exec("echo '3.5' | jq 'round'")
+        assert result.exit_code == 0
+        assert json.loads(result.stdout) == 4
+
+    @pytest.mark.asyncio
+    async def test_jq_sqrt(self):
+        """sqrt - square root."""
+        bash = Bash()
+        result = await bash.exec("echo '16' | jq 'sqrt'")
+        assert result.exit_code == 0
+        assert json.loads(result.stdout) == 4
+
+    @pytest.mark.asyncio
+    async def test_jq_fabs(self):
+        """fabs - absolute value."""
+        bash = Bash()
+        result = await bash.exec("echo '-5.5' | jq 'fabs'")
+        assert result.exit_code == 0
+        assert json.loads(result.stdout) == 5.5
+
+    @pytest.mark.asyncio
+    async def test_jq_match(self):
+        """match(regex) - regex match with capture groups."""
+        bash = Bash()
+        result = await bash.exec('echo \'"test 123"\' | jq \'match("[0-9]+")\'')
+        assert result.exit_code == 0
+        parsed = json.loads(result.stdout)
+        assert parsed["offset"] == 5
+        assert parsed["length"] == 3
+        assert parsed["string"] == "123"
+
+    @pytest.mark.asyncio
+    async def test_jq_inside(self):
+        """inside(x) - inverse containment check."""
+        bash = Bash()
+        result = await bash.exec('echo \'{"a":1}\' | jq \'inside({"a":1,"b":2})\'')
+        assert result.exit_code == 0
+        assert json.loads(result.stdout) is True
+
+    @pytest.mark.asyncio
+    async def test_jq_getpath(self):
+        """getpath(path) - get value at path array."""
+        bash = Bash()
+        result = await bash.exec('echo \'{"a":{"b":1}}\' | jq \'getpath(["a","b"])\'')
+        assert result.exit_code == 0
+        assert json.loads(result.stdout) == 1
+
+    @pytest.mark.asyncio
+    async def test_jq_paths(self):
+        """paths - get all paths in structure."""
+        bash = Bash()
+        result = await bash.exec('echo \'{"a":1,"b":{"c":2}}\' | jq \'[paths]\'')
+        assert result.exit_code == 0
+        parsed = json.loads(result.stdout)
+        assert ["a"] in parsed
+        assert ["b"] in parsed
+        assert ["b", "c"] in parsed
+
 
 # =============================================================================
 # Additional Coverage Tests
@@ -2364,6 +2650,41 @@ class TestStatCommand:
         bash = Bash()
         result = await bash.exec("stat")
         assert result.exit_code == 1
+
+    @pytest.mark.asyncio
+    async def test_stat_format_uid(self):
+        """Test %u returns user ID."""
+        bash = Bash(files={"/file.txt": "content"})
+        result = await bash.exec("stat -c '%u' /file.txt")
+        assert result.stdout.strip() == "1000"
+
+    @pytest.mark.asyncio
+    async def test_stat_format_username(self):
+        """Test %U returns username."""
+        bash = Bash(files={"/file.txt": "content"})
+        result = await bash.exec("stat -c '%U' /file.txt")
+        assert result.stdout.strip() == "user"
+
+    @pytest.mark.asyncio
+    async def test_stat_format_gid(self):
+        """Test %g returns group ID."""
+        bash = Bash(files={"/file.txt": "content"})
+        result = await bash.exec("stat -c '%g' /file.txt")
+        assert result.stdout.strip() == "1000"
+
+    @pytest.mark.asyncio
+    async def test_stat_format_groupname(self):
+        """Test %G returns group name."""
+        bash = Bash(files={"/file.txt": "content"})
+        result = await bash.exec("stat -c '%G' /file.txt")
+        assert result.stdout.strip() == "group"
+
+    @pytest.mark.asyncio
+    async def test_stat_format_combined_ownership(self):
+        """Test combined ownership specifiers."""
+        bash = Bash(files={"/file.txt": "content"})
+        result = await bash.exec("stat -c '%U:%G' /file.txt")
+        assert result.stdout.strip() == "user:group"
 
 
 class TestDiffCommand:

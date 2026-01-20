@@ -67,8 +67,14 @@ class TouchCommand:
                 path = ctx.fs.resolve_path(ctx.cwd, f)
                 # Check if file exists
                 try:
-                    await ctx.fs.stat(path)
-                    # File exists - update timestamp (no-op in our virtual fs)
+                    stat = await ctx.fs.stat(path)
+                    if stat.is_directory:
+                        # Touching a directory - we can't easily update dir mtime
+                        # in current implementation, so just continue
+                        continue
+                    # File exists - read and re-write to update timestamp
+                    content = await ctx.fs.read_file(path)
+                    await ctx.fs.write_file(path, content)
                 except FileNotFoundError:
                     # File doesn't exist
                     if no_create:

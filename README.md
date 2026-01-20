@@ -13,7 +13,7 @@ This is a Python port of [just-bash](https://github.com/vercel-labs/just-bash), 
 ## Features
 
 - **Pure Python** - No external binaries, no WASM dependencies
-- **In-memory filesystem** - Sandboxed virtual filesystem for safe execution
+- **Flexible filesystems** - In-memory, real filesystem access, copy-on-write overlays, or mount multiple sources
 - **70+ commands** - grep, sed, awk, jq, curl, and more
 - **Full bash syntax** - Pipes, redirections, variables, arrays, functions, control flow
 - **32 shell builtins** - cd, export, declare, test, and more
@@ -95,8 +95,145 @@ bash = Bash(
     files={...},           # Initial filesystem contents
     env={...},             # Environment variables
     cwd="/home/user",      # Working directory
-    network_enabled=False, # Enable/disable network (curl)
+    network=NetworkConfig(...),  # Network configuration (for curl)
 )
+```
+
+### Filesystem Options
+
+just-bash provides four filesystem implementations for different use cases:
+
+#### InMemoryFs (Default)
+
+Pure in-memory filesystem - completely sandboxed with no disk access.
+
+```python
+from just_bash import Bash
+
+# Default: in-memory filesystem with optional initial files
+bash = Bash(files={
+    "/data/input.txt": "hello world\n",
+    "/config.json": '{"key": "value"}'
+})
+
+result = bash.run("cat /data/input.txt")
+print(result.stdout)  # hello world
+```
+
+#### ReadWriteFs
+
+Direct access to the real filesystem, rooted at a specific directory. All paths are translated relative to the root.
+
+```python
+from just_bash import Bash
+from just_bash.fs import ReadWriteFs, ReadWriteFsOptions
+
+# Access real files under /path/to/project
+fs = ReadWriteFs(ReadWriteFsOptions(root="/path/to/project"))
+bash = Bash(fs=fs, cwd="/")
+
+# /src/main.py in bash maps to /path/to/project/src/main.py on disk
+result = bash.run("cat /src/main.py")
+```
+
+**Warning**: ReadWriteFs provides direct disk access. Use with caution.
+
+#### OverlayFs
+
+Copy-on-write overlay - reads from the real filesystem, but all writes go to an in-memory layer. The real filesystem is never modified.
+
+```python
+from just_bash import Bash
+from just_bash.fs import OverlayFs, OverlayFsOptions
+
+# Overlay real files at /home/user/project, changes stay in memory
+fs = OverlayFs(OverlayFsOptions(
+    root="/path/to/real/project",
+    mount_point="/home/user/project"
+))
+bash = Bash(fs=fs)
+
+# Read real files
+result = bash.run("cat /home/user/project/README.md")
+
+# Writes only affect the in-memory layer
+bash.run("echo 'modified' > /home/user/project/README.md")
+# Real file on disk is unchanged!
+```
+
+Use cases:
+- Safe experimentation with real project files
+- Testing scripts without modifying actual files
+- AI agents that need to read real code but not write to disk
+
+#### MountableFs
+
+Mount multiple filesystems at different paths, similar to Unix mount points.
+
+```python
+from just_bash import Bash
+from just_bash.fs import (
+    MountableFs, MountableFsOptions, MountConfig,
+    InMemoryFs, ReadWriteFs, ReadWriteFsOptions, OverlayFs, OverlayFsOptions
+)
+
+# Create a mountable filesystem with multiple sources
+fs = MountableFs(MountableFsOptions(
+    base=InMemoryFs(),  # Default for paths outside mounts
+    mounts=[
+        # Mount real project at /project (read-write)
+        MountConfig(
+            mount_point="/project",
+            filesystem=ReadWriteFs(ReadWriteFsOptions(root="/path/to/project"))
+        ),
+        # Mount another project as overlay (read-only to disk)
+        MountConfig(
+            mount_point="/reference",
+            filesystem=OverlayFs(OverlayFsOptions(
+                root="/path/to/other/project",
+                mount_point="/"
+            ))
+        ),
+    ]
+))
+
+bash = Bash(fs=fs)
+
+# Access different filesystems through unified paths
+bash.run("ls /project")      # Real filesystem
+bash.run("ls /reference")    # Overlay filesystem
+bash.run("ls /tmp")          # In-memory (base)
+```
+
+#### Direct Filesystem Access
+
+You can also access the filesystem directly through the `bash.fs` property:
+
+```python
+import asyncio
+from just_bash import Bash
+
+bash = Bash(files={"/data.txt": "initial content"})
+
+# Async filesystem operations
+async def main():
+    # Read
+    content = await bash.fs.read_file("/data.txt")
+
+    # Write
+    await bash.fs.write_file("/output.txt", "new content")
+
+    # Check existence
+    exists = await bash.fs.exists("/data.txt")
+
+    # List directory
+    files = await bash.fs.readdir("/")
+
+    # Get file stats
+    stat = await bash.fs.stat("/data.txt")
+    print(f"Size: {stat.size}, Mode: {oct(stat.mode)}")
+
+asyncio.run(main())
 ```
 
 ## Security
