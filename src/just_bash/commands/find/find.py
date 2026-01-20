@@ -4,6 +4,9 @@ Usage: find [path...] [expression]
 
 Search for files in a directory hierarchy.
 
+Note: -user and -group predicates are not implemented as they are not
+applicable in an in-memory virtual filesystem designed for sandboxed execution.
+
 Options:
   -name PATTERN      match file name (shell glob)
   -iname PATTERN     like -name but case insensitive
@@ -17,8 +20,6 @@ Options:
   -mindepth N        do not apply tests at levels less than N
   -empty             match empty files/directories
   -perm MODE         match permission bits
-  -user NAME         match owner
-  -group NAME        match group
 
 Actions:
   -print             print path (default)

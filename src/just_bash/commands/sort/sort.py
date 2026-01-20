@@ -44,6 +44,7 @@ class SortCommand:
         human_numeric = False
         version_sort = False
         month_sort = False
+        dictionary_order = False
         files: list[str] = []
 
         # Parse arguments
@@ -109,6 +110,8 @@ class SortCommand:
                         version_sort = True
                     elif c == "M":
                         month_sort = True
+                    elif c == "d":
+                        dictionary_order = True
                     elif c == "t":
                         # -t requires a value
                         if j + 1 < len(arg):
@@ -223,6 +226,7 @@ class SortCommand:
                         "ignore_blanks": ignore_blanks,
                         "ignore_case": ignore_case,
                         "numeric": numeric,
+                        "dictionary_order": dictionary_order,
                     },
                 )
 
@@ -345,22 +349,28 @@ class SortCommand:
         if opts.get("ignore_blanks"):
             val = val.lstrip()
 
+        # Dictionary order: keep only blanks and alphanumerics for comparison
+        if opts.get("dictionary_order"):
+            compare_val = ''.join(c for c in val if c.isalnum() or c.isspace())
+        else:
+            compare_val = val
+
         if opts.get("ignore_case"):
-            val = val.lower()
+            compare_val = compare_val.lower()
 
         if opts.get("numeric"):
             # Try to extract leading number
-            match = re.match(r"^\s*(-?\d+(?:\.\d+)?)", val)
+            match = re.match(r"^\s*(-?\d+(?:\.\d+)?)", compare_val)
             if match:
                 try:
                     num = float(match.group(1))
-                    return (0, num, val)
+                    return (0, num, compare_val)
                 except ValueError:
                     pass
             # Non-numeric sorts before any number
-            return (1, 0, val)
+            return (1, 0, compare_val)
 
-        return (0, val)
+        return (0, compare_val)
 
     def _version_key(self, val: str) -> tuple:
         """Create a sort key for version sorting (v1.2.10 style)."""

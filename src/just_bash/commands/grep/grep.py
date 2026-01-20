@@ -102,6 +102,9 @@ class GrepCommand:
                     recursive = True
                 elif arg == "--extended-regexp":
                     extended_regexp = True
+                elif arg == "--perl-regexp":
+                    # Perl-compatible regex - Python's re is already PCRE-like
+                    extended_regexp = True
                 elif arg == "--fixed-strings":
                     fixed_strings = True
                 elif arg == "--word-regexp":
@@ -176,6 +179,9 @@ class GrepCommand:
                             extended_regexp = True
                         elif c == 'F':
                             fixed_strings = True
+                        elif c == 'P':
+                            # Perl-compatible regex - Python's re is already PCRE-like
+                            extended_regexp = True
                         elif c == 'w':
                             word_regexp = True
                         elif c == 'x':

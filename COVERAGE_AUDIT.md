@@ -49,117 +49,17 @@ These commands exist in TypeScript but have NO implementation in Python:
 
 ---
 
-## File/Directory Utilities
-
-### ls
-- Status: **AT PARITY** with TypeScript
-- Supports: `-a`, `-A`, `-l`, `-1`, `-R`, `-h`, `-d`, `-F`, `-r`, `-S`, `-t`
-
-### stat
-- Status: **AT PARITY** with TypeScript
-- Supports format specifiers: `%n`, `%s`, `%F`, `%a`, `%A`, `%u`, `%U`, `%g`, `%G`
-
-### file
-- Status: **AT PARITY** with TypeScript
-- Supports: Magic byte detection (PNG, GIF, JPEG, PDF, ZIP, gzip, bzip2, ELF, Mach-O, SQLite, RAR, 7z, MP3, FLAC, Ogg, HTML, XML)
-- Supports: Extension-based detection for 30+ file types
-- Supports: Shebang detection with `/usr/bin/env` handling
-- Supports: Empty file detection, MIME type output (`-i`)
-
-### ln
-- Missing flags: `-n` (--no-dereference)
-- Notes: Flag accepted but not implemented in TypeScript either
-
-### pwd
-- Missing flags: `-L` (logical), `-P` (physical)
-- Notes: Ignored in both implementations (appropriate for virtual FS)
-
-### cat, cp, mv, rm, mkdir, touch, chmod, head, tail, tee, diff, du, tree, basename, dirname, readlink
-- Status: Functionally equivalent or Python has MORE features
-
----
-
 ## Text Processing Commands
-
-### grep
-- Missing flags: `-P` (--perl-regexp)
-- Notes: Perl regex patterns are parsed but not functional
-
-### sed
-- Missing commands:
-  - `c\` (change) - incomplete multi-line handling
-  - `l` (list with escapes) - not implemented
-  - `F` (print filename) - not implemented
-  - `=` (print line number) - not implemented
-  - `b [label]` branch - incomplete
-  - `t [label]` branch on substitute - incomplete
-  - `T [label]` branch on no substitute - incomplete
-  - `:` label definitions - not fully supported
-  - `r` and `w` file I/O commands - not fully working
-  - `R` (read one line from file) - not implemented
-
-### sort
-- Missing flags:
-  - `-c` (--check) - check if sorted
-  - `-h` (--human-numeric-sort) - compare 2K, 1G, etc.
-  - `-M` (--month-sort) - month sorting
-  - `-V` (--version-sort) - natural version sorting
-  - `-d` (--dictionary-order) - blanks and alphanumeric only
-
-### uniq
-- Missing flags:
-  - `-D` - print all duplicate lines
-  - `-s N` (--skip-chars) - skip first N characters
-  - `-w N` (--check-chars) - compare only N characters
-  - `-f N` (--skip-fields) - skip first N fields
-
-### wc
-- Missing flags: `-L` (--max-line-length)
-
-### join
-- Missing flags:
-  - `-i` (ignore case)
-  - `-e STRING` (replace missing fields)
 
 ### printf
 - Missing flags: `-v var` (assign to variable)
 
-### split
-- Missing flags: `-n CHUNKS` (split into N equal chunks)
-
 ### strings
 - Missing flags: `-e ENCODING` (encoding selection)
-
-### tac
-- Notes: Python ignores options silently
-
-### cut, tr, fold, nl, paste, expand, column, comm, rev, od, echo, expr, seq
-- Status: Functionally equivalent or minor differences
 
 ---
 
 ## Complex/Special Commands
-
-### jq
-- Status: **SIGNIFICANTLY IMPROVED** - Now uses shared query-engine module
-- Implemented features:
-  - Full recursive descent parser with proper precedence
-  - 100+ builtin functions (keys, values, select, map, sort_by, group_by, etc.)
-  - Variable binding (`as $var`)
-  - Conditionals (`if-then-elif-else-end`)
-  - Try-catch error handling
-  - Reduce and foreach expressions
-  - Update operators (`|=`, `+=`, `-=`, etc.)
-  - Alternative operator (`//`)
-  - Recursive descent (`..`)
-  - String interpolation
-  - Format functions (`@base64`, `@uri`, `@csv`, `@json`, etc.)
-- Missing flags:
-  - `-j` (--join-output) - no newlines between outputs
-  - `-S` (--sort-keys) - sort object keys
-  - `-C` (--color) / `-M` (--monochrome) - color output
-  - `--tab` - use tabs for indentation
-  - `-a` (--ascii) - ASCII output
 
 ### curl
 - Missing functionality:
@@ -168,26 +68,14 @@ These commands exist in TypeScript but have NO implementation in Python:
   - Notes: Overall less complete than TypeScript
 
 ### find
-- Missing flags:
-  - `-regex PATTERN` / `-iregex PATTERN` - regex matching
-  - `-perm MODE` - permission matching
-  - `-user NAME` / `-group NAME` - ownership matching
-  - `-newer FILE` - partial implementation
-  - `-exec CMD {} ;` - minimal handling
-  - `-delete` - not fully implemented
+- Status: **COMPREHENSIVE** - Core predicates and actions implemented
+- Note: `-user` / `-group` intentionally not implemented (not applicable in virtual filesystem)
 
 ### rg (ripgrep)
+- Status: **COMPREHENSIVE** - Most common flags implemented
 - Missing flags:
-  - `-f FILE` (--file) - read patterns from file
-  - `--count-matches` - count individual matches
-  - `-b` (--byte-offset) - show byte offsets
-  - `--vimgrep` - vimgrep format
-  - `-U` (--multiline) - multiline matching
   - `-z` (--search-zip) - search compressed files
-  - `--sort TYPE` - sort output
-  - `--heading` - file path above matches
-  - `--passthru` - print all lines
-  - `--include-zero` - files with 0 matches
+  - `--include-zero` - show files with 0 matches in count mode
 
 ### tar
 - Missing flags:
@@ -215,12 +103,6 @@ These commands exist in TypeScript but have NO implementation in Python:
   - `-t` (--test) - test integrity
 
 ### yq
-- Status: **IMPROVED** - Now uses shared query-engine module for jq-style filtering
-- Implemented features:
-  - Full jq expression support via query-engine
-  - Format conversion: YAML, JSON, XML, INI, CSV, TOML
-  - `-p` (--input-format) and `-o` (--output-format) supported
-  - Auto-detection of format from file extension
 - Missing functionality:
   - `--front-matter` - extract markdown front matter
 
@@ -249,35 +131,34 @@ These commands exist in TypeScript but have NO implementation in Python:
 - Status: EXISTS in Python (sqlite3_cmd.py)
 - Notes: Needs detailed comparison for missing features
 
-### base64, date, sleep, which, hostname, help
-- Status: Functionally equivalent
-
 ---
 
 ## Summary by Severity
 
 ### HIGH PRIORITY (commonly used, significant gaps)
-1. **sed** - Many commands incomplete/missing
-2. **find** - Missing regex, perm, user/group, exec, delete
-3. **sort** - Missing human/version/month sorting
-4. **tar** - Very limited (only basic c/x/t/f/z/v/C)
-5. **rg** - Missing many search options
-6. **test command** - Entirely missing
+1. **tar** - Very limited (only basic c/x/t/f/z/v/C)
+2. **test command** - Entirely missing
 
 ### MEDIUM PRIORITY (useful features missing)
-1. **grep** - No Perl regex
-2. **uniq** - No field/char skipping
-3. **curl** - Incomplete cookie/header handling
-4. **gzip** - Missing list, test, recursive
-5. **timeout** - Missing kill-after, signal
-6. **env** - Can't execute commands with modified env
-7. **jq** - Missing output formatting options (core functionality now complete)
+1. **curl** - Incomplete cookie/header handling
+2. **gzip** - Missing list, test, recursive
+3. **timeout** - Missing kill-after, signal
+4. **env** - Can't execute commands with modified env
 
 ### LOW PRIORITY (nice to have)
-1. **wc** - Max line length
-2. **join** - Ignore case
-3. **printf** - Variable assignment
-4. **split** - Chunk mode
+1. **printf** - Variable assignment (`-v var`)
+2. **strings** - Encoding selection (`-e`)
+
+### RECENTLY COMPLETED (moved from missing)
+1. **grep** - `-P` (Perl regex) now implemented
+2. **sort** - `-c`, `-h`, `-M`, `-V`, `-d` all implemented
+3. **uniq** - `-D`, `-s`, `-w`, `-f` all implemented
+4. **wc** - `-L` (max line length) implemented
+5. **join** - `-i`, `-e` implemented
+6. **tac** - `-b`, `-r`, `-s` flags implemented
+7. **sed** - `=`, `r`, `w`, `l`, `F`, `R` commands implemented
+8. **split** - `-n CHUNKS` (split into N equal parts) implemented
+9. **jq** - `-j`, `-S`, `--tab`, `-a` output formatting flags implemented
 
 ---
 

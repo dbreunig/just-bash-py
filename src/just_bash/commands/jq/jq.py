@@ -5,12 +5,16 @@ Usage: jq [OPTIONS] FILTER [FILE...]
 JSON processor using jq-style expressions.
 
 Options:
-  -r, --raw-output    output strings without quotes
-  -c, --compact       compact output (no pretty printing)
-  -s, --slurp         read all inputs into an array
-  -e                  exit with 1 if last output is false or null
-  -n, --null-input    don't read any input
-  -R, --raw-input     read each line as a string
+  -r, --raw-output     output strings without quotes
+  -c, --compact        compact output (no pretty printing)
+  -s, --slurp          read all inputs into an array
+  -e                   exit with 1 if last output is false or null
+  -n, --null-input     don't read any input
+  -R, --raw-input      read each line as a string
+  -j, --join-output    no newlines between outputs
+  -S, --sort-keys      sort object keys alphabetically
+  --tab                use tabs for indentation
+  -a, --ascii-output   escape non-ASCII characters
 
 Filters:
   .                   identity (output input unchanged)
@@ -75,6 +79,10 @@ class JqCommand:
         exit_on_false = False
         null_input = False
         raw_input = False
+        join_output = False
+        sort_keys = False
+        use_tabs = False
+        ascii_output = False
         filter_str: str | None = None
         files: list[str] = []
 
@@ -97,6 +105,14 @@ class JqCommand:
                 null_input = True
             elif arg in ("-R", "--raw-input"):
                 raw_input = True
+            elif arg in ("-j", "--join-output"):
+                join_output = True
+            elif arg in ("-S", "--sort-keys"):
+                sort_keys = True
+            elif arg == "--tab":
+                use_tabs = True
+            elif arg in ("-a", "--ascii-output"):
+                ascii_output = True
             elif arg.startswith("-") and len(arg) > 1:
                 # Combined flags
                 for c in arg[1:]:
@@ -112,6 +128,12 @@ class JqCommand:
                         null_input = True
                     elif c == "R":
                         raw_input = True
+                    elif c == "j":
+                        join_output = True
+                    elif c == "S":
+                        sort_keys = True
+                    elif c == "a":
+                        ascii_output = True
                     else:
                         return ExecResult(
                             stdout="",
@@ -207,7 +229,13 @@ class JqCommand:
         # Format output
         output = ""
         for val in outputs:
-            output += self._format_value(val, raw_output, compact) + "\n"
+            formatted = self._format_value(
+                val, raw_output, compact, sort_keys, use_tabs, ascii_output
+            )
+            if join_output:
+                output += formatted
+            else:
+                output += formatted + "\n"
 
         # Determine exit code
         exit_code = 0
@@ -221,7 +249,15 @@ class JqCommand:
 
         return ExecResult(stdout=output, stderr="", exit_code=exit_code)
 
-    def _format_value(self, value: Any, raw: bool, compact: bool) -> str:
+    def _format_value(
+        self,
+        value: Any,
+        raw: bool,
+        compact: bool,
+        sort_keys: bool = False,
+        use_tabs: bool = False,
+        ascii_output: bool = False,
+    ) -> str:
         """Format a value for output."""
         if value is None:
             return "null"
@@ -230,10 +266,15 @@ class JqCommand:
         elif isinstance(value, str):
             if raw:
                 return value
-            return json.dumps(value)
+            return json.dumps(value, ensure_ascii=ascii_output)
         elif isinstance(value, (int, float)):
             return json.dumps(value)
         else:
-            if compact:
-                return json.dumps(value, separators=(",", ":"))
-            return json.dumps(value, indent=2)
+            indent_val = "\t" if use_tabs else (None if compact else 2)
+            return json.dumps(
+                value,
+                indent=indent_val,
+                separators=(",", ":") if compact else None,
+                sort_keys=sort_keys,
+                ensure_ascii=ascii_output,
+            )

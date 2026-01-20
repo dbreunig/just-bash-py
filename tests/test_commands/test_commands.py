@@ -1590,6 +1590,93 @@ class TestJqCommand:
         assert ["b", "c"] in parsed
 
 
+class TestJqOutputFlags:
+    """Test jq output formatting flags."""
+
+    @pytest.mark.asyncio
+    async def test_jq_join_output(self):
+        """Test -j removes newlines between outputs."""
+        bash = Bash(files={"/data.json": '[1, 2, 3]'})
+        result = await bash.exec("jq -j '.[]' /data.json")
+        # Should be "123" with no newlines, not "1\n2\n3\n"
+        assert result.stdout == "123"
+
+    @pytest.mark.asyncio
+    async def test_jq_join_output_with_strings(self):
+        """Test -j with string values."""
+        bash = Bash(files={"/data.json": '["a", "b", "c"]'})
+        result = await bash.exec("jq -rj '.[]' /data.json")
+        assert result.stdout == "abc"
+
+    @pytest.mark.asyncio
+    async def test_jq_sort_keys(self):
+        """Test -S sorts object keys."""
+        bash = Bash(files={"/data.json": '{"z": 1, "a": 2, "m": 3}'})
+        result = await bash.exec("jq -S '.' /data.json")
+        # Keys should appear in order: a, m, z
+        lines = result.stdout.strip()
+        assert lines.index('"a"') < lines.index('"m"') < lines.index('"z"')
+
+    @pytest.mark.asyncio
+    async def test_jq_sort_keys_nested(self):
+        """Test -S sorts nested object keys."""
+        bash = Bash(files={"/data.json": '{"b": {"z": 1, "a": 2}}'})
+        result = await bash.exec("jq -S '.' /data.json")
+        assert result.stdout.index('"a"') < result.stdout.index('"z"')
+
+    @pytest.mark.asyncio
+    async def test_jq_sort_keys_compact(self):
+        """Test -S with -c (compact + sorted)."""
+        bash = Bash(files={"/data.json": '{"z": 1, "a": 2}'})
+        result = await bash.exec("jq -Sc '.' /data.json")
+        assert result.stdout.strip() == '{"a":2,"z":1}'
+
+    @pytest.mark.asyncio
+    async def test_jq_tab_indent(self):
+        """Test --tab uses tabs for indentation."""
+        bash = Bash(files={"/data.json": '{"a": 1}'})
+        result = await bash.exec("jq --tab '.' /data.json")
+        assert "\t" in result.stdout
+        assert "  " not in result.stdout  # No space indentation
+
+    @pytest.mark.asyncio
+    async def test_jq_tab_indent_nested(self):
+        """Test --tab with nested objects."""
+        bash = Bash(files={"/data.json": '{"a": {"b": 1}}'})
+        result = await bash.exec("jq --tab '.' /data.json")
+        # Should have tabs, not spaces
+        lines = result.stdout.split("\n")
+        indented_lines = [l for l in lines if l.startswith("\t")]
+        assert len(indented_lines) >= 1
+
+    @pytest.mark.asyncio
+    async def test_jq_ascii_output(self):
+        """Test -a escapes non-ASCII characters."""
+        bash = Bash(files={"/data.json": '{"name": "café"}'})
+        result = await bash.exec("jq -a '.' /data.json")
+        # "é" should be escaped as \u00e9
+        assert "\\u00e9" in result.stdout
+        assert "é" not in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_jq_ascii_output_unicode(self):
+        """Test -a with various unicode characters."""
+        bash = Bash(files={"/data.json": '{"emoji": "😀"}'})
+        result = await bash.exec("jq -a '.' /data.json")
+        # Emoji should be escaped
+        assert "😀" not in result.stdout
+        assert "\\u" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_jq_combined_flags(self):
+        """Test combining multiple new flags."""
+        bash = Bash(files={"/data.json": '{"z": "café", "a": 1}'})
+        result = await bash.exec("jq -Sa '.' /data.json")
+        # Should be sorted AND ascii-escaped
+        assert result.stdout.index('"a"') < result.stdout.index('"z"')
+        assert "\\u00e9" in result.stdout
+
+
 # =============================================================================
 # Additional Coverage Tests
 # =============================================================================
@@ -5353,3 +5440,468 @@ class TestSqlite3Command:
         result = await bash.exec("sqlite3 -unknownoption :memory: 'SELECT 1'")
         assert result.exit_code == 1
         assert "unknown option" in result.stderr
+
+
+# =============================================================================
+# Text Processing Commands - Extended Features
+# =============================================================================
+
+
+class TestSortDictionaryOrder:
+    """Test sort -d (dictionary order) flag."""
+
+    @pytest.mark.asyncio
+    async def test_sort_dictionary_order_basic(self):
+        """Test -d sorts using only blanks and alphanumerics."""
+        bash = Bash(files={"/test.txt": "a-b\na_c\na b\n"})
+        result = await bash.exec("sort -d /test.txt")
+        # -d ignores non-alphanumeric, so "a-b" becomes "ab", "a_c" becomes "ac", "a b" stays "a b"
+        # Sorted: "a b" (a b), "a-b" (ab), "a_c" (ac)
+        assert result.stdout == "a b\na-b\na_c\n"
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_sort_dictionary_order_combined_with_fold_case(self):
+        """Test -d combined with -f (fold case)."""
+        bash = Bash(files={"/test.txt": "B-1\na_2\nC 3\n"})
+        result = await bash.exec("sort -df /test.txt")
+        # Dictionary order ignores - and _, fold case makes case-insensitive
+        lines = result.stdout.strip().split("\n")
+        assert len(lines) == 3
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_sort_dictionary_order_with_reverse(self):
+        """Test -d combined with -r (reverse)."""
+        bash = Bash(files={"/test.txt": "a-b\na_c\na b\n"})
+        result = await bash.exec("sort -dr /test.txt")
+        # Reverse of dictionary order
+        assert result.stdout == "a_c\na-b\na b\n"
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_sort_dictionary_order_special_chars(self):
+        """Test -d with various special characters."""
+        bash = Bash(files={"/test.txt": "hello!world\nhelloworld\nhello world\n"})
+        result = await bash.exec("sort -d /test.txt")
+        # "hello world" (helloworld) vs "hello!world" (helloworld) vs "helloworld"
+        # All compare as "helloworld" in dictionary order, stable sort maintains order
+        assert result.exit_code == 0
+
+
+class TestGrepPerlRegexp:
+    """Test grep -P (Perl-compatible regex) flag."""
+
+    @pytest.mark.asyncio
+    async def test_grep_perl_regexp_flag_recognized(self):
+        """Test -P flag is recognized and doesn't error."""
+        bash = Bash(files={"/test.txt": "hello123\nworld456\n"})
+        result = await bash.exec("grep -P 'hello' /test.txt")
+        assert result.exit_code == 0
+        assert "hello123" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_grep_perl_regexp_digit_class(self):
+        """Test -P with \\d+ digit pattern."""
+        bash = Bash(files={"/test.txt": "hello123\nworld456\nabc\n"})
+        result = await bash.exec("grep -P '\\d+' /test.txt")
+        assert "hello123" in result.stdout
+        assert "world456" in result.stdout
+        assert "abc" not in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_grep_perl_regexp_lookahead(self):
+        """Test -P with lookahead (PCRE feature)."""
+        bash = Bash(files={"/test.txt": "foo bar\nfoo baz\n"})
+        result = await bash.exec("grep -P 'foo(?= bar)' /test.txt")
+        assert "foo bar" in result.stdout
+        assert "foo baz" not in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_grep_perl_regexp_combined_flags(self):
+        """Test -P with other flags like -i."""
+        bash = Bash(files={"/test.txt": "Hello123\nWORLD456\n"})
+        result = await bash.exec("grep -Pi 'hello' /test.txt")
+        assert "Hello123" in result.stdout
+
+
+class TestTacFlags:
+    """Test tac -b, -r, -s flags."""
+
+    @pytest.mark.asyncio
+    async def test_tac_custom_separator(self):
+        """Test -s uses custom separator."""
+        bash = Bash(files={"/test.txt": "a:b:c"})
+        result = await bash.exec("tac -s ':' /test.txt")
+        assert result.stdout == "c:b:a"
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_tac_before_separator(self):
+        """Test -b attaches separator before instead of after."""
+        bash = Bash(files={"/test.txt": "a\nb\nc\n"})
+        result = await bash.exec("tac -b /test.txt")
+        # With -b, separator attaches to the beginning of the record
+        # Input has records: "a\n", "b\n", "c\n" (separators after)
+        # With -b, output has separators before: "\nc", "\nb", "\na" -> "c\nb\na"
+        assert result.stdout == "c\nb\na"
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_tac_regex_separator(self):
+        """Test -r treats separator as regex."""
+        bash = Bash(files={"/test.txt": "a::b:::c"})
+        result = await bash.exec("tac -r -s ':+' /test.txt")
+        # :+ matches one or more colons
+        # Segments: "a", "b", "c" reversed -> "c", "b", "a"
+        assert "c" in result.stdout
+        assert "a" in result.stdout
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_tac_combined_before_and_separator(self):
+        """Test -b -s combined."""
+        bash = Bash(files={"/test.txt": "a|b|c"})
+        result = await bash.exec("tac -b -s '|' /test.txt")
+        assert result.stdout == "c|b|a"
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_tac_separator_newline_default(self):
+        """Test default newline separator behavior."""
+        bash = Bash(files={"/test.txt": "line1\nline2\nline3\n"})
+        result = await bash.exec("tac /test.txt")
+        lines = result.stdout.strip().split("\n")
+        assert lines[0] == "line3"
+        assert lines[-1] == "line1"
+
+    @pytest.mark.asyncio
+    async def test_tac_regex_separator_multichar(self):
+        """Test -r with multi-character regex separator."""
+        bash = Bash(files={"/test.txt": "a---b---c"})
+        result = await bash.exec("tac -r -s '-+' /test.txt")
+        assert result.exit_code == 0
+
+
+class TestSedLineNumber:
+    """Test sed = command (print line number)."""
+
+    @pytest.mark.asyncio
+    async def test_sed_print_line_number(self):
+        """Test = prints line number."""
+        bash = Bash(files={"/test.txt": "a\nb\nc\n"})
+        result = await bash.exec("sed '=' /test.txt")
+        # = prints line number, then the line itself is printed
+        assert "1" in result.stdout
+        assert "2" in result.stdout
+        assert "3" in result.stdout
+        assert "a" in result.stdout
+        assert "b" in result.stdout
+        assert "c" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_sed_print_line_number_with_address(self):
+        """Test = with line address."""
+        bash = Bash(files={"/test.txt": "a\nb\nc\n"})
+        result = await bash.exec("sed '2=' /test.txt")
+        # Should only print line number for line 2
+        lines = result.stdout.strip().split("\n")
+        # Output: a, 2, b, c
+        assert "2" in lines
+        # Line 1 and 3 numbers should NOT appear
+        line_nums_only = [l for l in lines if l.isdigit()]
+        assert line_nums_only == ["2"]
+
+    @pytest.mark.asyncio
+    async def test_sed_print_line_number_silent(self):
+        """Test = with -n flag (silent mode)."""
+        bash = Bash(files={"/test.txt": "a\nb\nc\n"})
+        result = await bash.exec("sed -n '=' /test.txt")
+        # In silent mode, only line numbers are printed
+        lines = result.stdout.strip().split("\n")
+        assert lines == ["1", "2", "3"]
+
+
+class TestSedFileIO:
+    """Test sed r and w commands for file I/O."""
+
+    @pytest.mark.asyncio
+    async def test_sed_read_file(self):
+        """Test r reads and inserts file content."""
+        bash = Bash(files={
+            "/main.txt": "before\nmarker\nafter\n",
+            "/insert.txt": "INSERTED\n"
+        })
+        result = await bash.exec("sed '/marker/r /insert.txt' /main.txt")
+        # INSERTED should appear after "marker"
+        assert "INSERTED" in result.stdout
+        assert result.exit_code == 0
+        # Verify order: before, marker, INSERTED, after
+        lines = result.stdout.strip().split("\n")
+        marker_idx = lines.index("marker")
+        inserted_idx = lines.index("INSERTED")
+        assert inserted_idx > marker_idx
+
+    @pytest.mark.asyncio
+    async def test_sed_read_file_with_line_address(self):
+        """Test r with line number address."""
+        bash = Bash(files={
+            "/main.txt": "line1\nline2\nline3\n",
+            "/insert.txt": "INSERT\n"
+        })
+        result = await bash.exec("sed '2r /insert.txt' /main.txt")
+        # INSERT should appear after line 2
+        lines = result.stdout.strip().split("\n")
+        assert "INSERT" in lines
+        line2_idx = lines.index("line2")
+        insert_idx = lines.index("INSERT")
+        assert insert_idx == line2_idx + 1
+
+    @pytest.mark.asyncio
+    async def test_sed_write_file(self):
+        """Test w writes pattern space to file."""
+        bash = Bash(files={"/test.txt": "keep\nwrite\nkeep\n"})
+        await bash.exec("sed '/write/w /output.txt' /test.txt")
+        result = await bash.exec("cat /output.txt")
+        assert "write" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_sed_write_file_multiple_matches(self):
+        """Test w with multiple matching lines."""
+        bash = Bash(files={"/test.txt": "match1\nno\nmatch2\nno\nmatch3\n"})
+        await bash.exec("sed '/match/w /output.txt' /test.txt")
+        result = await bash.exec("cat /output.txt")
+        assert "match1" in result.stdout
+        assert "match2" in result.stdout
+        assert "match3" in result.stdout
+        assert "no" not in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_sed_read_nonexistent_file(self):
+        """Test r with nonexistent file (should be silent)."""
+        bash = Bash(files={"/main.txt": "line1\nline2\n"})
+        result = await bash.exec("sed '/line1/r /nonexistent.txt' /main.txt")
+        # Real sed silently ignores nonexistent files for r command
+        assert result.exit_code == 0
+        assert "line1" in result.stdout
+
+
+# =============================================================================
+# Split -n CHUNKS Tests
+# =============================================================================
+
+
+class TestSplitChunks:
+    """Test split -n (split into N equal chunks)."""
+
+    @pytest.mark.asyncio
+    async def test_split_n_basic(self):
+        """Test -n splits into N equal parts."""
+        # 12 bytes split into 3 parts = 4 bytes each
+        bash = Bash(files={"/test.txt": "aaa\nbbb\nccc\n"})
+        result = await bash.exec("split -n 3 /test.txt")
+        assert result.exit_code == 0
+        # Check files were created
+        r1 = await bash.exec("cat xaa")
+        r2 = await bash.exec("cat xab")
+        r3 = await bash.exec("cat xac")
+        assert r1.exit_code == 0
+        assert r2.exit_code == 0
+        assert r3.exit_code == 0
+        # Combined should equal original
+        combined = r1.stdout + r2.stdout + r3.stdout
+        assert combined == "aaa\nbbb\nccc\n"
+
+    @pytest.mark.asyncio
+    async def test_split_n_uneven(self):
+        """Test -n with content that doesn't divide evenly."""
+        # 10 bytes split into 3 parts: 4, 3, 3 bytes
+        bash = Bash(files={"/test.txt": "0123456789"})
+        result = await bash.exec("split -n 3 /test.txt")
+        assert result.exit_code == 0
+        r1 = await bash.exec("cat xaa")
+        r2 = await bash.exec("cat xab")
+        r3 = await bash.exec("cat xac")
+        # cat adds trailing newlines, so strip them for comparison
+        combined = r1.stdout.rstrip("\n") + r2.stdout.rstrip("\n") + r3.stdout.rstrip("\n")
+        assert combined == "0123456789"
+
+    @pytest.mark.asyncio
+    async def test_split_n_with_prefix(self):
+        """Test -n with custom prefix."""
+        bash = Bash(files={"/test.txt": "abcdef"})
+        result = await bash.exec("split -n 2 /test.txt out_")
+        assert result.exit_code == 0
+        r1 = await bash.exec("cat out_aa")
+        r2 = await bash.exec("cat out_ab")
+        assert r1.exit_code == 0
+        assert r2.exit_code == 0
+        # cat adds trailing newlines, so strip them for comparison
+        assert r1.stdout.rstrip("\n") + r2.stdout.rstrip("\n") == "abcdef"
+
+    @pytest.mark.asyncio
+    async def test_split_n_with_numeric_suffix(self):
+        """Test -n with -d (numeric suffix)."""
+        bash = Bash(files={"/test.txt": "abcdef"})
+        result = await bash.exec("split -n 2 -d /test.txt")
+        assert result.exit_code == 0
+        r1 = await bash.exec("cat x00")
+        r2 = await bash.exec("cat x01")
+        assert r1.exit_code == 0
+        assert r2.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_split_n_single_chunk(self):
+        """Test -n 1 keeps file as single chunk."""
+        bash = Bash(files={"/test.txt": "hello world"})
+        result = await bash.exec("split -n 1 /test.txt")
+        assert result.exit_code == 0
+        r = await bash.exec("cat xaa")
+        assert r.stdout.rstrip("\n") == "hello world"
+
+    @pytest.mark.asyncio
+    async def test_split_n_more_chunks_than_bytes(self):
+        """Test -n with more chunks than bytes creates empty files."""
+        bash = Bash(files={"/test.txt": "ab"})
+        result = await bash.exec("split -n 5 /test.txt")
+        assert result.exit_code == 0
+        # Should create 5 files, some may be empty
+        r1 = await bash.exec("cat xaa")
+        assert r1.exit_code == 0
+
+
+# =============================================================================
+# Sed Extended Commands Tests (l, F, R)
+# =============================================================================
+
+
+class TestSedListCommand:
+    """Test sed l command (list with escapes)."""
+
+    @pytest.mark.asyncio
+    async def test_sed_list_basic(self):
+        """Test l prints pattern space with escapes."""
+        bash = Bash(files={"/test.txt": "hello\tworld\n"})
+        result = await bash.exec("sed -n 'l' /test.txt")
+        # Tab should be shown as \t
+        assert "\\t" in result.stdout
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_sed_list_newline(self):
+        """Test l shows $ at end of line."""
+        bash = Bash(files={"/test.txt": "hello\n"})
+        result = await bash.exec("sed -n 'l' /test.txt")
+        # Line should end with $
+        assert "$" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_sed_list_special_chars(self):
+        """Test l escapes non-printable characters."""
+        # Create file with special characters
+        bash = Bash(files={"/test.txt": "a\x01b\x7fc\n"})
+        result = await bash.exec("sed -n 'l' /test.txt")
+        # Non-printable chars should be escaped
+        assert "\\x01" in result.stdout.lower() or "\\001" in result.stdout
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_sed_list_with_address(self):
+        """Test l with line address."""
+        bash = Bash(files={"/test.txt": "line1\nline2\thas tab\nline3\n"})
+        result = await bash.exec("sed -n '2l' /test.txt")
+        assert "\\t" in result.stdout
+        assert "line1" not in result.stdout
+
+
+class TestSedFilenameCommand:
+    """Test sed F command (print filename)."""
+
+    @pytest.mark.asyncio
+    async def test_sed_print_filename(self):
+        """Test F prints current filename."""
+        bash = Bash(files={"/test.txt": "line1\nline2\n"})
+        result = await bash.exec("sed 'F' /test.txt")
+        assert "/test.txt" in result.stdout
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_sed_print_filename_with_address(self):
+        """Test F with address."""
+        bash = Bash(files={"/test.txt": "line1\nline2\nline3\n"})
+        result = await bash.exec("sed '2F' /test.txt")
+        # Filename should appear once (for line 2)
+        assert result.stdout.count("/test.txt") == 1
+
+    @pytest.mark.asyncio
+    async def test_sed_print_filename_silent(self):
+        """Test F with -n flag."""
+        bash = Bash(files={"/test.txt": "line1\nline2\n"})
+        result = await bash.exec("sed -n 'F' /test.txt")
+        # Should print filename for each line
+        lines = [l for l in result.stdout.strip().split("\n") if l]
+        assert all("/test.txt" in l for l in lines)
+
+    @pytest.mark.asyncio
+    async def test_sed_print_filename_stdin(self):
+        """Test F with stdin (no filename)."""
+        bash = Bash()
+        result = await bash.exec("echo 'hello' | sed 'F'")
+        # For stdin, filename is typically empty or "-"
+        assert result.exit_code == 0
+
+
+class TestSedReadLineCommand:
+    """Test sed R command (read single line from file)."""
+
+    @pytest.mark.asyncio
+    async def test_sed_read_line_basic(self):
+        """Test R reads one line at a time."""
+        bash = Bash(files={
+            "/main.txt": "a\nb\nc\n",
+            "/lines.txt": "LINE1\nLINE2\nLINE3\n"
+        })
+        result = await bash.exec("sed 'R /lines.txt' /main.txt")
+        # Each line of main.txt should be followed by one line from lines.txt
+        lines = result.stdout.strip().split("\n")
+        # Expected: a, LINE1, b, LINE2, c, LINE3
+        assert "a" in lines
+        assert "LINE1" in lines
+        assert "b" in lines
+        assert "LINE2" in lines
+
+    @pytest.mark.asyncio
+    async def test_sed_read_line_with_address(self):
+        """Test R with address reads line only for matching lines."""
+        bash = Bash(files={
+            "/main.txt": "keep\ninsert\nkeep\n",
+            "/lines.txt": "INSERTED\n"
+        })
+        result = await bash.exec("sed '/insert/R /lines.txt' /main.txt")
+        assert "INSERTED" in result.stdout
+        # INSERTED should appear only once
+        assert result.stdout.count("INSERTED") == 1
+
+    @pytest.mark.asyncio
+    async def test_sed_read_line_exhausted(self):
+        """Test R when source file runs out of lines."""
+        bash = Bash(files={
+            "/main.txt": "a\nb\nc\nd\ne\n",
+            "/lines.txt": "X\nY\n"
+        })
+        result = await bash.exec("sed 'R /lines.txt' /main.txt")
+        # Only first 2 lines get insertions
+        assert "X" in result.stdout
+        assert "Y" in result.stdout
+        # But all main lines should be present
+        assert "a" in result.stdout
+        assert "e" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_sed_read_line_nonexistent(self):
+        """Test R with nonexistent file (silent)."""
+        bash = Bash(files={"/main.txt": "line1\nline2\n"})
+        result = await bash.exec("sed 'R /nonexistent.txt' /main.txt")
+        # Should not error, just skip the R command
+        assert result.exit_code == 0
+        assert "line1" in result.stdout

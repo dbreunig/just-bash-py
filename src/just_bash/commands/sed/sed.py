@@ -181,7 +181,62 @@ class SedCommand:
                     path = ctx.fs.resolve_path(ctx.cwd, f)
                     content = await ctx.fs.read_file(path)
 
-                output = self._process_content(content, commands, silent, ctx)
+                # Determine the current file name for F command
+                current_file = f if f != "-" else ""
+
+                output, write_buffers, read_requests, r_file_pos = self._process_content(
+                    content, commands, silent, ctx, current_file
+                )
+
+                # Process read requests (r command)
+                for idx, filename in read_requests:
+                    placeholder = f"__READ_FILE__{idx}__"
+                    try:
+                        read_path = ctx.fs.resolve_path(ctx.cwd, filename)
+                        file_content = await ctx.fs.read_file(read_path)
+                        # Ensure content ends with newline
+                        if file_content and not file_content.endswith("\n"):
+                            file_content += "\n"
+                        output = output.replace(placeholder, file_content)
+                    except FileNotFoundError:
+                        # Real sed silently ignores nonexistent files for r command
+                        output = output.replace(placeholder, "")
+
+                # Process R command (read single line)
+                # Cache file lines for efficiency
+                r_file_cache: dict[str, list[str]] = {}
+                for filename, max_pos in r_file_pos.items():
+                    if filename not in r_file_cache:
+                        try:
+                            read_path = ctx.fs.resolve_path(ctx.cwd, filename)
+                            file_content = await ctx.fs.read_file(read_path)
+                            r_file_cache[filename] = file_content.split("\n")
+                            # Remove trailing empty line if file ended with newline
+                            if r_file_cache[filename] and r_file_cache[filename][-1] == "":
+                                r_file_cache[filename] = r_file_cache[filename][:-1]
+                        except FileNotFoundError:
+                            r_file_cache[filename] = []
+
+                    # Replace placeholders with actual lines
+                    for pos in range(max_pos):
+                        placeholder = f"__READ_LINE__{filename}__{pos}__"
+                        if pos < len(r_file_cache[filename]):
+                            line = r_file_cache[filename][pos] + "\n"
+                            output = output.replace(placeholder, line)
+                        else:
+                            # No more lines in file
+                            output = output.replace(placeholder, "")
+
+                # Process write buffers (w command)
+                for filename, lines in write_buffers.items():
+                    try:
+                        write_path = ctx.fs.resolve_path(ctx.cwd, filename)
+                        write_content = "\n".join(lines)
+                        if write_content and not write_content.endswith("\n"):
+                            write_content += "\n"
+                        await ctx.fs.write_file(write_path, write_content)
+                    except Exception:
+                        pass  # Silently ignore write errors like real sed
 
                 if in_place and f != "-":
                     path = ctx.fs.resolve_path(ctx.cwd, f)
@@ -359,8 +414,20 @@ class SedCommand:
         elif cmd_char == "d":
             return SedCommand_(cmd="d", address=address)
 
+        elif cmd_char == "=":
+            # Print line number
+            return SedCommand_(cmd="=", address=address)
+
         elif cmd_char == "p":
             return SedCommand_(cmd="p", address=address)
+
+        elif cmd_char == "l":
+            # List pattern space with escapes
+            return SedCommand_(cmd="l", address=address)
+
+        elif cmd_char == "F":
+            # Print filename
+            return SedCommand_(cmd="F", address=address)
 
         elif cmd_char == "q":
             return SedCommand_(cmd="q", address=address)
@@ -414,6 +481,11 @@ class SedCommand:
             filename = cmd_str[pos:].strip()
             return SedCommand_(cmd="w", address=address, filename=filename)
 
+        elif cmd_char == "R":
+            # Read single line from file
+            filename = cmd_str[pos:].strip()
+            return SedCommand_(cmd="R", address=address, filename=filename)
+
         elif cmd_char == "{":
             # Start of block (handled in parsing)
             return None
@@ -439,8 +511,9 @@ class SedCommand:
 
     def _process_content(
         self, content: str, commands: list[SedCommand_], silent: bool,
-        ctx: "CommandContext | None" = None
-    ) -> str:
+        ctx: "CommandContext | None" = None,
+        current_file: str = ""
+    ) -> tuple[str, dict[str, list[str]], list[tuple[int, str]], dict[str, int]]:
         """Process content through sed commands."""
         lines = content.split("\n")
         # Remove trailing empty line if present
@@ -467,6 +540,11 @@ class SedCommand:
 
         # Write file buffers
         write_buffers: dict[str, list[str]] = {}
+        # Read file requests: (output_position, filename)
+        read_requests: list[tuple[int, str]] = []
+        # R command file state: tracks current line position for each file
+        r_file_lines: dict[str, list[str]] = {}
+        r_file_pos: dict[str, int] = {}
 
         line_idx = 0
         while line_idx < len(lines):
@@ -535,8 +613,21 @@ class SedCommand:
                     else:
                         deleted = True
 
+                elif cmd.cmd == "=":
+                    # Print line number
+                    output += str(line_num) + "\n"
+
                 elif cmd.cmd == "p":
                     output += pattern_space + "\n"
+
+                elif cmd.cmd == "l":
+                    # List pattern space with escapes
+                    escaped = self._escape_for_list(pattern_space)
+                    output += escaped + "$\n"
+
+                elif cmd.cmd == "F":
+                    # Print current filename
+                    output += current_file + "\n"
 
                 elif cmd.cmd == "P":
                     # Print first line of pattern space
@@ -630,14 +721,10 @@ class SedCommand:
 
                 elif cmd.cmd == "r":
                     # Read file (content appended after current line)
-                    if ctx and cmd.filename:
-                        try:
-                            path = ctx.fs.resolve_path(ctx.cwd, cmd.filename)
-                            # We need async read, but we're in sync context
-                            # Store filename to read later
-                            read_text += f"__READ_FILE__{cmd.filename}__"
-                        except Exception:
-                            pass
+                    if cmd.filename:
+                        # Store placeholder for where to insert file content
+                        append_text += f"__READ_FILE__{len(read_requests)}__"
+                        read_requests.append((len(read_requests), cmd.filename))
 
                 elif cmd.cmd == "w":
                     # Write pattern space to file
@@ -645,6 +732,18 @@ class SedCommand:
                         if cmd.filename not in write_buffers:
                             write_buffers[cmd.filename] = []
                         write_buffers[cmd.filename].append(pattern_space)
+
+                elif cmd.cmd == "R":
+                    # Read single line from file
+                    if cmd.filename:
+                        # Initialize file lines if not already loaded
+                        if cmd.filename not in r_file_lines:
+                            r_file_lines[cmd.filename] = None  # Placeholder for async load
+                            r_file_pos[cmd.filename] = 0
+                        # Store placeholder for where to insert the line
+                        pos = r_file_pos.get(cmd.filename, 0)
+                        append_text += f"__READ_LINE__{cmd.filename}__{pos}__"
+                        r_file_pos[cmd.filename] = pos + 1
 
                 cmd_idx += 1
 
@@ -666,7 +765,7 @@ class SedCommand:
 
             line_idx += 1
 
-        return output
+        return output, write_buffers, read_requests, r_file_pos
 
     def _address_matches(
         self,
@@ -735,3 +834,30 @@ class SedCommand:
         # Handle & for entire match
         result = result.replace("&", r"\g<0>")
         return result
+
+    def _escape_for_list(self, s: str) -> str:
+        """Escape a string for the 'l' command output."""
+        result = []
+        for c in s:
+            if c == "\\":
+                result.append("\\\\")
+            elif c == "\t":
+                result.append("\\t")
+            elif c == "\n":
+                result.append("\\n")
+            elif c == "\r":
+                result.append("\\r")
+            elif c == "\a":
+                result.append("\\a")
+            elif c == "\b":
+                result.append("\\b")
+            elif c == "\f":
+                result.append("\\f")
+            elif c == "\v":
+                result.append("\\v")
+            elif ord(c) < 32 or ord(c) > 126:
+                # Non-printable character - show as octal or hex
+                result.append(f"\\x{ord(c):02x}")
+            else:
+                result.append(c)
+        return "".join(result)

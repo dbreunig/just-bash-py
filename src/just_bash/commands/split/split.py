@@ -12,6 +12,7 @@ class SplitCommand:
         """Execute the split command."""
         lines_per_file = 1000
         bytes_per_file = None
+        num_chunks = None
         numeric_suffix = False
         suffix_length = 2
         prefix = "x"
@@ -60,6 +61,29 @@ class SplitCommand:
                     return ExecResult(
                         stdout="",
                         stderr=f"split: invalid number of bytes: '{arg[2:]}'\n",
+                        exit_code=1,
+                    )
+            elif arg == "-n" and i + 1 < len(args):
+                i += 1
+                try:
+                    num_chunks = int(args[i])
+                    if num_chunks <= 0:
+                        raise ValueError("must be positive")
+                except ValueError:
+                    return ExecResult(
+                        stdout="",
+                        stderr=f"split: invalid number of chunks: '{args[i]}'\n",
+                        exit_code=1,
+                    )
+            elif arg.startswith("-n"):
+                try:
+                    num_chunks = int(arg[2:])
+                    if num_chunks <= 0:
+                        raise ValueError("must be positive")
+                except ValueError:
+                    return ExecResult(
+                        stdout="",
+                        stderr=f"split: invalid number of chunks: '{arg[2:]}'\n",
                         exit_code=1,
                     )
             elif arg in ("-d", "--numeric-suffixes"):
@@ -119,7 +143,9 @@ class SplitCommand:
             )
 
         # Split the content
-        if bytes_per_file is not None:
+        if num_chunks is not None:
+            chunks = self._split_into_chunks(content_bytes, num_chunks)
+        elif bytes_per_file is not None:
             chunks = self._split_by_bytes(content_bytes, bytes_per_file)
         else:
             chunks = self._split_by_lines(content, lines_per_file)
@@ -175,6 +201,27 @@ class SplitCommand:
         for i in range(0, len(content), bytes_per_file):
             chunks.append(content[i:i + bytes_per_file])
         return chunks if chunks else [b""]
+
+    def _split_into_chunks(self, content: bytes, num_chunks: int) -> list[bytes]:
+        """Split content into exactly N chunks."""
+        total = len(content)
+        if total == 0:
+            # Return empty chunks
+            return [b""] * num_chunks
+
+        # Calculate base size and remainder
+        base_size = total // num_chunks
+        remainder = total % num_chunks
+
+        chunks = []
+        pos = 0
+        for i in range(num_chunks):
+            # First 'remainder' chunks get one extra byte
+            chunk_size = base_size + (1 if i < remainder else 0)
+            chunks.append(content[pos:pos + chunk_size])
+            pos += chunk_size
+
+        return chunks
 
     def _generate_suffix(self, idx: int, length: int, numeric: bool) -> str:
         """Generate suffix for output file."""
