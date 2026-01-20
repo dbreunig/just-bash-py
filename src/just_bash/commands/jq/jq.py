@@ -57,6 +57,7 @@ Filters:
 """
 
 import json
+import math
 import re
 import base64
 from urllib.parse import quote as uri_quote
@@ -273,7 +274,8 @@ class JqCommand:
         # Handle functions
         for func in ["select", "map", "group_by", "sort_by", "unique_by", "max_by", "min_by",
                      "has", "in", "contains", "inside", "split", "join", "test", "match",
-                     "ltrimstr", "rtrimstr", "startswith", "endswith", "tostring", "tonumber"]:
+                     "ltrimstr", "rtrimstr", "startswith", "endswith", "tostring", "tonumber",
+                     "getpath", "with_entries"]:
             if s.startswith(func + "("):
                 end = self._find_matching_paren(s, len(func))
                 if end != -1:
@@ -285,9 +287,9 @@ class JqCommand:
         simple_funcs = ["keys", "values", "length", "type", "empty", "add", "first", "last",
                         "reverse", "sort", "unique", "flatten", "min", "max", "not", "null",
                         "true", "false", "ascii_downcase", "ascii_upcase", "keys_unsorted",
-                        "to_entries", "from_entries", "with_entries", "floor", "ceil", "round",
+                        "to_entries", "from_entries", "floor", "ceil", "round",
                         "sqrt", "fabs", "infinite", "nan", "isnan", "isinfinite", "isfinite",
-                        "isnormal", "env", "now", "getpath", "paths", "leaf_paths"]
+                        "isnormal", "env", "now", "paths", "leaf_paths"]
 
         for func in simple_funcs:
             if s == func:
@@ -297,6 +299,14 @@ class JqCommand:
         if s.startswith("@"):
             format_name = s[1:]
             return JqFilter(type="format", value=format_name)
+
+        # Handle update operators (+=, -=, etc.) - must come before arithmetic
+        for op in ["+=", "-=", "*=", "/="]:
+            if f" {op} " in s:
+                parts = s.split(f" {op} ", 1)
+                left = self._parse_filter(parts[0])
+                right = self._parse_filter(parts[1])
+                return JqFilter(type=op, left=left, right=right)
 
         # Handle arithmetic and comparison
         for op in ["==", "!=", "<=", ">=", "<", ">", "+", "-", "*", "/", "%", "and", "or"]:
@@ -918,6 +928,222 @@ class JqCommand:
             if left_results and left_results[0]:
                 return left_results
             return self._apply_filter(f.right, value)
+
+        # Update operators (+=, -=, *=, /=)
+        elif f.type in ("+=", "-=", "*=", "/="):
+            # Get the field to update (left side should be a field access)
+            if f.left and f.left.type == "field" and isinstance(value, dict):
+                field_name = f.left.value
+                current_val = value.get(field_name)
+                right_results = self._apply_filter(f.right, value)
+                if right_results and current_val is not None:
+                    right_val = right_results[0]
+                    try:
+                        if f.type == "+=":
+                            new_val = current_val + right_val
+                        elif f.type == "-=":
+                            new_val = current_val - right_val
+                        elif f.type == "*=":
+                            new_val = current_val * right_val
+                        elif f.type == "/=":
+                            new_val = current_val / right_val
+                        else:
+                            new_val = current_val
+                        return [{**value, field_name: new_val}]
+                    except (TypeError, ZeroDivisionError):
+                        return [value]
+            return [value]
+
+        elif f.type == "group_by":
+            if isinstance(value, list) and f.left:
+                groups: dict[str, list[Any]] = {}
+                for item in value:
+                    key_results = self._apply_filter(f.left, item)
+                    key = json.dumps(key_results[0]) if key_results else "null"
+                    if key not in groups:
+                        groups[key] = []
+                    groups[key].append(item)
+                return [list(groups.values())]
+            return [value]
+
+        # Math functions
+        elif f.type == "floor":
+            if isinstance(value, (int, float)):
+                return [math.floor(value)]
+            return [value]
+
+        elif f.type == "ceil":
+            if isinstance(value, (int, float)):
+                return [math.ceil(value)]
+            return [value]
+
+        elif f.type == "round":
+            if isinstance(value, (int, float)):
+                return [round(value)]
+            return [value]
+
+        elif f.type == "sqrt":
+            if isinstance(value, (int, float)) and value >= 0:
+                result = math.sqrt(value)
+                return [int(result) if result == int(result) else result]
+            return [value]
+
+        elif f.type == "fabs":
+            if isinstance(value, (int, float)):
+                return [abs(value)]
+            return [value]
+
+        # Entry functions
+        elif f.type == "to_entries":
+            if isinstance(value, dict):
+                return [[{"key": k, "value": v} for k, v in value.items()]]
+            return [value]
+
+        elif f.type == "from_entries":
+            if isinstance(value, list):
+                obj = {}
+                for item in value:
+                    if isinstance(item, dict):
+                        key = item.get("key") or item.get("name") or item.get("k")
+                        val = item.get("value") if "value" in item else item.get("v")
+                        if key is not None:
+                            obj[key] = val
+                return [obj]
+            return [value]
+
+        elif f.type == "with_entries":
+            if isinstance(value, dict) and f.left:
+                entries = [{"key": k, "value": v} for k, v in value.items()]
+                new_entries = []
+                for entry in entries:
+                    results = self._apply_filter(f.left, entry)
+                    if results:
+                        new_entries.append(results[0])
+                obj = {}
+                for item in new_entries:
+                    if isinstance(item, dict):
+                        key = item.get("key")
+                        val = item.get("value")
+                        if key is not None:
+                            obj[key] = val
+                return [obj]
+            return [value]
+
+        # _by functions
+        elif f.type == "sort_by":
+            if isinstance(value, list) and f.left:
+                items_with_keys = []
+                for item in value:
+                    key_results = self._apply_filter(f.left, item)
+                    key = key_results[0] if key_results else None
+                    items_with_keys.append((key, item))
+                sorted_items = sorted(items_with_keys, key=lambda x: (x[0] is None, x[0]))
+                return [[item for _, item in sorted_items]]
+            return [value]
+
+        elif f.type == "unique_by":
+            if isinstance(value, list) and f.left:
+                seen: dict[str, bool] = {}
+                result = []
+                for item in value:
+                    key_results = self._apply_filter(f.left, item)
+                    key = json.dumps(key_results[0]) if key_results else "null"
+                    if key not in seen:
+                        seen[key] = True
+                        result.append(item)
+                return [result]
+            return [value]
+
+        elif f.type == "min_by":
+            if isinstance(value, list) and f.left and value:
+                min_item = None
+                min_key = None
+                for item in value:
+                    key_results = self._apply_filter(f.left, item)
+                    key = key_results[0] if key_results else None
+                    if min_item is None or (key is not None and (min_key is None or key < min_key)):
+                        min_item = item
+                        min_key = key
+                return [min_item] if min_item is not None else [None]
+            return [value]
+
+        elif f.type == "max_by":
+            if isinstance(value, list) and f.left and value:
+                max_item = None
+                max_key = None
+                for item in value:
+                    key_results = self._apply_filter(f.left, item)
+                    key = key_results[0] if key_results else None
+                    if max_item is None or (key is not None and (max_key is None or key > max_key)):
+                        max_item = item
+                        max_key = key
+                return [max_item] if max_item is not None else [None]
+            return [value]
+
+        # Path functions
+        elif f.type == "getpath":
+            path_results = self._apply_filter(f.left, value)
+            if path_results and isinstance(path_results[0], list):
+                path = path_results[0]
+                current = value
+                for key in path:
+                    if current is None:
+                        return [None]
+                    if isinstance(current, dict):
+                        current = current.get(key)
+                    elif isinstance(current, list) and isinstance(key, int):
+                        if 0 <= key < len(current):
+                            current = current[key]
+                        else:
+                            return [None]
+                    else:
+                        return [None]
+                return [current]
+            return [None]
+
+        elif f.type == "paths":
+            def get_paths(obj: Any, current_path: list[Any] | None = None) -> list[list[Any]]:
+                if current_path is None:
+                    current_path = []
+                result: list[list[Any]] = []
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        new_path = current_path + [k]
+                        result.append(new_path)
+                        result.extend(get_paths(v, new_path))
+                elif isinstance(obj, list):
+                    for i, v in enumerate(obj):
+                        new_path = current_path + [i]
+                        result.append(new_path)
+                        result.extend(get_paths(v, new_path))
+                return result
+            return get_paths(value)
+
+        # Containment
+        elif f.type == "inside":
+            x_results = self._apply_filter(f.left, value)
+            if x_results:
+                x = x_results[0]
+                return [self._contains(x, value)]
+            return [False]
+
+        # Regex
+        elif f.type == "match":
+            pattern_results = self._apply_filter(f.left, value)
+            if pattern_results and isinstance(value, str):
+                pattern = pattern_results[0]
+                try:
+                    match_obj = re.search(pattern, value)
+                    if match_obj:
+                        return [{
+                            "offset": match_obj.start(),
+                            "length": match_obj.end() - match_obj.start(),
+                            "string": match_obj.group(),
+                            "captures": []
+                        }]
+                except re.error:
+                    pass
+            return [None]
 
         return [value]
 
