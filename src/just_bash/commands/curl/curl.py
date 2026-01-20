@@ -1,7 +1,9 @@
 """Curl command implementation."""
 
 import base64
+import gzip
 import time
+import zlib
 from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import urlencode, urlparse, quote
@@ -29,6 +31,7 @@ class CurlOptions:
     user: Optional[str] = None
     upload_file: Optional[str] = None
     cookie_jar: Optional[str] = None
+    cookie_file: Optional[str] = None  # -b @file
     output_file: Optional[str] = None
     use_remote_name: bool = False
     head_only: bool = False
@@ -37,6 +40,8 @@ class CurlOptions:
     show_error: bool = False
     fail_silently: bool = False
     follow_redirects: bool = True
+    max_redirects: Optional[int] = None  # --max-redirs
+    compressed: bool = False  # --compressed
     write_out: Optional[str] = None
     verbose: bool = False
     timeout_ms: Optional[int] = None
@@ -138,10 +143,32 @@ def extract_filename(url: str) -> str:
 def apply_write_out(format_str: str, result: dict) -> str:
     """Apply write-out format string replacements."""
     output = format_str
-    output = output.replace("%{http_code}", str(result.get("status", 0)))
-    output = output.replace("%{content_type}", result.get("headers", {}).get("content-type", ""))
+    status = str(result.get("status", 0))
+    headers = result.get("headers", {})
+
+    # Basic variables
+    output = output.replace("%{http_code}", status)
+    output = output.replace("%{response_code}", status)  # Alias for http_code
+    output = output.replace("%{content_type}", headers.get("content-type", ""))
     output = output.replace("%{url_effective}", result.get("url", ""))
     output = output.replace("%{size_download}", str(result.get("body_length", 0)))
+
+    # Redirect variables
+    output = output.replace("%{num_redirects}", str(result.get("redirect_count", 0)))
+    output = output.replace("%{redirect_url}", result.get("url", ""))
+
+    # Header size (calculated from formatted headers)
+    header_size = result.get("header_size", 0)
+    output = output.replace("%{header_size}", str(header_size))
+
+    # Timing variables
+    time_total = result.get("time_total", 0.0)
+    output = output.replace("%{time_total}", f"{time_total:.6f}")
+
+    # Speed (bytes/sec)
+    speed_download = result.get("speed_download", 0.0)
+    output = output.replace("%{speed_download}", f"{speed_download:.3f}")
+
     output = output.replace("\\n", "\n")
     return output
 
@@ -270,11 +297,23 @@ def parse_options(args: list[str]) -> CurlOptions | ExecResult:
 
         elif arg == "-b" or arg == "--cookie":
             i += 1
-            options.headers["Cookie"] = args[i] if i < len(args) else ""
+            cookie_value = args[i] if i < len(args) else ""
+            if cookie_value.startswith("@"):
+                options.cookie_file = cookie_value[1:]  # Store file path without @
+            else:
+                options.headers["Cookie"] = cookie_value
         elif arg.startswith("-b"):
-            options.headers["Cookie"] = arg[2:]
+            cookie_value = arg[2:]
+            if cookie_value.startswith("@"):
+                options.cookie_file = cookie_value[1:]
+            else:
+                options.headers["Cookie"] = cookie_value
         elif arg.startswith("--cookie="):
-            options.headers["Cookie"] = arg[9:]
+            cookie_value = arg[9:]
+            if cookie_value.startswith("@"):
+                options.cookie_file = cookie_value[1:]
+            else:
+                options.headers["Cookie"] = cookie_value
 
         elif arg == "-c" or arg == "--cookie-jar":
             i += 1
@@ -353,10 +392,17 @@ def parse_options(args: list[str]) -> CurlOptions | ExecResult:
             options.follow_redirects = True
 
         elif arg == "--max-redirs":
-            i += 1  # Skip value, handled by network config
+            i += 1
+            try:
+                options.max_redirects = int(args[i]) if i < len(args) else None
+            except ValueError:
+                pass
 
         elif arg.startswith("--max-redirs="):
-            pass  # Handled by network config
+            try:
+                options.max_redirects = int(arg[13:])
+            except ValueError:
+                pass
 
         elif arg == "-w" or arg == "--write-out":
             i += 1
@@ -366,6 +412,9 @@ def parse_options(args: list[str]) -> CurlOptions | ExecResult:
 
         elif arg == "-v" or arg == "--verbose":
             options.verbose = True
+
+        elif arg == "--compressed":
+            options.compressed = True
 
         elif arg.startswith("--") and arg != "--":
             return ExecResult(
@@ -481,21 +530,57 @@ class CurlCommand:
             url = f"https://{url}"
 
         try:
+            # Load cookies from file if specified
+            if options.cookie_file:
+                cookie_path = ctx.fs.resolve_path(ctx.cwd, options.cookie_file)
+                try:
+                    cookie_content = await ctx.fs.read_file(cookie_path)
+                    options.headers["Cookie"] = cookie_content.strip()
+                except Exception:
+                    return ExecResult(
+                        stdout="",
+                        stderr=f"curl: (26) Failed to open/read cookie file: {options.cookie_file}: No such file or directory\n",
+                        exit_code=26,
+                    )
+
             # Prepare body and headers
             body, content_type = await self._prepare_request_body(options, ctx)
             headers = self._prepare_headers(options, content_type)
 
+            # Add Accept-Encoding header if --compressed
+            if options.compressed and "Accept-Encoding" not in headers:
+                headers["Accept-Encoding"] = "gzip, deflate"
+
+            # Track timing for write-out variables
+            start_time = time.time()
+
             # Make the request
-            result = await ctx.fetch(url, {
+            fetch_options = {
                 "method": options.method,
                 "headers": headers if headers else None,
                 "body": body,
                 "followRedirects": options.follow_redirects,
                 "timeoutMs": options.timeout_ms,
-            })
+            }
+            if options.max_redirects is not None:
+                fetch_options["maxRedirects"] = options.max_redirects
+
+            result = await ctx.fetch(url, fetch_options)
+
+            # Calculate timing
+            elapsed_time = time.time() - start_time
+
+            # Decompress response if --compressed and Content-Encoding is set
+            response_headers = result.get("headers", {})
+            content_encoding = response_headers.get("content-encoding", "").lower()
+            body = result.get("body", "")
+
+            if options.compressed and content_encoding:
+                body = self._decompress_body(body, content_encoding)
+                result["body"] = body
 
             # Save cookies if requested
-            await self._save_cookies(options, result.get("headers", {}), ctx)
+            await self._save_cookies(options, response_headers, ctx)
 
             # Check for HTTP errors with -f/--fail
             status = result.get("status", 0)
@@ -505,7 +590,26 @@ class CurlCommand:
                     stderr = f"curl: (22) The requested URL returned error: {status}\n"
                 return ExecResult(stdout="", stderr=stderr, exit_code=22)
 
-            output = self._build_output(options, result, url)
+            # Calculate header size (approximate)
+            header_size = len(format_headers(response_headers)) + 20  # +20 for status line
+
+            # Calculate download speed (bytes/sec)
+            body_length = len(body) if isinstance(body, str) else len(body)
+            speed_download = body_length / elapsed_time if elapsed_time > 0 else 0.0
+
+            # Prepare write-out data
+            write_out_data = {
+                "status": status,
+                "headers": response_headers,
+                "url": result.get("url", url),
+                "body_length": body_length,
+                "redirect_count": result.get("redirectCount", 0),
+                "header_size": header_size,
+                "time_total": elapsed_time,
+                "speed_download": speed_download,
+            }
+
+            output = self._build_output(options, result, url, write_out_data)
 
             # Write to file
             if options.output_file or options.use_remote_name:
@@ -520,12 +624,7 @@ class CurlCommand:
 
                 # Add write-out after file write
                 if options.write_out:
-                    output = apply_write_out(options.write_out, {
-                        "status": status,
-                        "headers": result.get("headers", {}),
-                        "url": result.get("url", url),
-                        "body_length": len(result.get("body", "")),
-                    })
+                    output = apply_write_out(options.write_out, write_out_data)
 
             return ExecResult(stdout=output, stderr="", exit_code=0)
 
@@ -622,11 +721,33 @@ class CurlCommand:
         file_path = ctx.fs.resolve_path(ctx.cwd, options.cookie_jar)
         await ctx.fs.write_file(file_path, set_cookie)
 
+    def _decompress_body(self, body: str | bytes, encoding: str) -> str:
+        """Decompress response body based on Content-Encoding."""
+        try:
+            # Handle bytes or string input
+            if isinstance(body, str):
+                body_bytes = body.encode("latin-1")
+            else:
+                body_bytes = body
+
+            if encoding == "gzip":
+                decompressed = gzip.decompress(body_bytes)
+            elif encoding == "deflate":
+                decompressed = zlib.decompress(body_bytes)
+            else:
+                return body if isinstance(body, str) else body.decode("utf-8", errors="replace")
+
+            return decompressed.decode("utf-8", errors="replace")
+        except Exception:
+            # If decompression fails, return original body
+            return body if isinstance(body, str) else body.decode("utf-8", errors="replace")
+
     def _build_output(
         self,
         options: CurlOptions,
         result: dict,
         request_url: str,
+        write_out_data: dict | None = None,
     ) -> str:
         """Build output string from response."""
         output = ""
@@ -667,11 +788,14 @@ class CurlCommand:
 
         # Write-out format
         if options.write_out:
-            output += apply_write_out(options.write_out, {
-                "status": status,
-                "headers": headers,
-                "url": url,
-                "body_length": len(body),
-            })
+            # Use provided write_out_data if available, otherwise build basic data
+            if write_out_data is None:
+                write_out_data = {
+                    "status": status,
+                    "headers": headers,
+                    "url": url,
+                    "body_length": len(body),
+                }
+            output += apply_write_out(options.write_out, write_out_data)
 
         return output

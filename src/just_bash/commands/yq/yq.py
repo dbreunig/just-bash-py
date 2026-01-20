@@ -75,6 +75,43 @@ def detect_format_from_extension(filename: str) -> str | None:
     return None
 
 
+def extract_front_matter(content: str) -> str | None:
+    """Extract YAML front matter from markdown content.
+
+    Front matter is YAML content between --- markers at the start of a file.
+    Returns the YAML content without the markers, or None if no front matter found.
+    """
+    content = content.lstrip()
+
+    # Must start with ---
+    if not content.startswith("---"):
+        return None
+
+    # Find the closing ---
+    # Start searching after the opening ---
+    rest = content[3:]
+
+    # Skip the newline after opening ---
+    if rest.startswith("\n"):
+        rest = rest[1:]
+    elif rest.startswith("\r\n"):
+        rest = rest[2:]
+
+    # Find the closing --- on its own line
+    lines = rest.split("\n")
+    front_matter_lines = []
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == "---":
+            # Found the closing marker
+            return "\n".join(front_matter_lines)
+        front_matter_lines.append(line)
+
+    # No closing marker found
+    return None
+
+
 def parse_yaml(content: str) -> Any:
     """Parse YAML content (simplified parser)."""
     # This is a simplified YAML parser that handles common cases
@@ -581,6 +618,7 @@ class YqCommand:
                     "  -s, --slurp              read entire input into array\n"
                     "  -n, --null-input         don't read any input\n"
                     "  -j, --join-output        don't print newlines after each output\n"
+                    "  -f, --front-matter       extract YAML front matter from markdown\n"
                     "  --help                   display this help and exit\n\n"
                     "Examples:\n"
                     "  yq '.name' config.yaml\n"
@@ -669,6 +707,8 @@ class YqCommand:
                 options.join_output = True
             elif a in ("-i", "--inplace"):
                 options.inplace = True
+            elif a in ("-f", "--front-matter"):
+                options.front_matter = True
             elif a == "-":
                 files.append("-")
             elif a.startswith("--"):
@@ -694,6 +734,8 @@ class YqCommand:
                         options.join_output = True
                     elif c == "i":
                         options.inplace = True
+                    elif c == "f":
+                        options.front_matter = True
                     else:
                         return ExecResult(
                             stdout="",
@@ -739,8 +781,21 @@ class YqCommand:
                 )
 
         try:
+            # Extract front matter if requested
+            if options.front_matter and not options.null_input:
+                front_matter = extract_front_matter(content)
+                if front_matter is None:
+                    # No front matter found - return null
+                    content = ""
+                else:
+                    content = front_matter
+                # Front matter is always YAML
+                options.input_format = "yaml"
+
             # Parse input
             if options.null_input:
+                parsed = None
+            elif options.front_matter and not content:
                 parsed = None
             else:
                 parsed = parse_input(content, options)

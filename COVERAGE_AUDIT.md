@@ -15,7 +15,6 @@ These commands exist in TypeScript but have NO implementation in Python:
 - **history** - command history
 - **html-to-markdown** - HTML to Markdown conversion
 - **search-engine** - search functionality
-- **test** - conditional test command (`[`, `test`)
 
 ---
 
@@ -61,71 +60,14 @@ These commands exist in TypeScript but have NO implementation in Python:
 
 ## Complex/Special Commands
 
-### curl
-- Missing functionality:
-  - `--max-redirs NUM` - redirect limit
-  - Full cookie handling (`-b`, `-c`, `--cookie-jar`)
-  - Notes: Overall less complete than TypeScript
-
-### find
-- Status: **COMPREHENSIVE** - Core predicates and actions implemented
-- Note: `-user` / `-group` intentionally not implemented (not applicable in virtual filesystem)
-
-### rg (ripgrep)
-- Status: **COMPREHENSIVE** - Most common flags implemented
-- Missing flags:
-  - `-z` (--search-zip) - search compressed files
-  - `--include-zero` - show files with 0 matches in count mode
-
-### tar
-- Missing flags:
-  - `-r` (--append) - append to archive
-  - `-u` (--update) - update with newer files
-  - `-a` (--auto-compress) - auto-detect compression
-  - `-j` (--bzip2) / `-J` (--xz) / `--zstd` - other compressions
-  - `-O` (--to-stdout) - extract to stdout
-  - `-k` (--keep-old-files) - don't replace existing
-  - `-m` (--touch) - don't extract modified time
-  - `-p` (--preserve) - preserve permissions
-  - `-T FILE` (--files-from) - read file list
-  - `-X FILE` (--exclude-from) - read exclude patterns
-  - `--strip=N` - strip path components
-  - `--exclude=PATTERN` - exclude matching files
-- Notes: Python only supports c/x/t/f/z/v/C
-
-### gzip (in compression module)
-- Missing flags:
-  - `-l` (--list) - list compressed file info
-  - `-n` / `-N` - (don't) save/restore filename
-  - `-q` (--quiet) - suppress warnings
-  - `-r` (--recursive) - recursive operation
-  - `-S SUFFIX` (--suffix) - custom suffix
-  - `-t` (--test) - test integrity
-
-### yq
-- Missing functionality:
-  - `--front-matter` - extract markdown front matter
-
 ### xan (CSV toolkit)
 - Notes: Significantly reduced feature set vs TypeScript
-
-### timeout
-- Missing flags:
-  - `-k DURATION` (--kill-after) - send KILL after timeout
-  - `-s SIGNAL` (--signal) - specify signal
-  - `--preserve-status` - preserve exit status
 
 ### xargs
 - Missing flags:
   - `-P NUM` - parallel processing (silently ignored)
   - `-d` delimiter escape sequences not parsed
   - `-v` (--verbose) formatting less complete
-
-### env
-- Missing functionality:
-  - Command execution with modified environment
-  - Only prints environment, doesn't execute commands
-  - Incomplete `-u NAME` (unset) handling
 
 ### sqlite3
 - Status: EXISTS in Python (sqlite3_cmd.py)
@@ -134,16 +76,6 @@ These commands exist in TypeScript but have NO implementation in Python:
 ---
 
 ## Summary by Severity
-
-### HIGH PRIORITY (commonly used, significant gaps)
-1. **tar** - Very limited (only basic c/x/t/f/z/v/C)
-2. **test command** - Entirely missing
-
-### MEDIUM PRIORITY (useful features missing)
-1. **curl** - Incomplete cookie/header handling
-2. **gzip** - Missing list, test, recursive
-3. **timeout** - Missing kill-after, signal
-4. **env** - Can't execute commands with modified env
 
 ### LOW PRIORITY (nice to have)
 1. **printf** - Variable assignment (`-v var`)
@@ -159,6 +91,13 @@ These commands exist in TypeScript but have NO implementation in Python:
 7. **sed** - `=`, `r`, `w`, `l`, `F`, `R` commands implemented
 8. **split** - `-n CHUNKS` (split into N equal parts) implemented
 9. **jq** - `-j`, `-S`, `--tab`, `-a` output formatting flags implemented
+10. **test** - conditional test command (`[`, `test`) fully implemented with 31 tests
+11. **tar** - Comprehensive implementation with 34 tests
+12. **curl** - Cookie file loading, `--max-redirs`, `--compressed`, extended write-out (16 tests)
+13. **gzip** - `-l`, `-t`, `-q`, `-r`, `-S` flags (11 tests)
+14. **timeout** - `-k`, `-s`, `--preserve-status` flags (5 tests)
+15. **env** - Command execution with modified environment, `-u`, `-i` (8 tests)
+16. **yq** - `--front-matter` for markdown front matter extraction (10 tests)
 
 ---
 

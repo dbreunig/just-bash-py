@@ -305,6 +305,39 @@ tr        unexpand  uniq      wc
 jq        yq        xan       sqlite3
 ```
 
+#### xan - CSV Toolkit
+
+The `xan` command provides CSV manipulation capabilities. Most commands are implemented:
+
+**Implemented:**
+```
+headers     count       head        tail        slice       select
+drop        rename      filter      search      sort        reverse
+behead      enum        shuffle     sample      dedup       top
+cat         transpose   fixlengths  flatten     explode     implode
+split       view        stats       frequency   to json     from json
+```
+
+**Not Yet Implemented** (require expression evaluation):
+```
+join        agg         groupby     map         transform   pivot
+```
+
+Example usage:
+```python
+# Show column names
+bash.run("xan headers data.csv")
+
+# Filter and select
+bash.run("xan filter 'age > 30' data.csv | xan select name,age")
+
+# Convert to JSON
+bash.run("xan to json data.csv")
+
+# Sample random rows
+bash.run("xan sample 10 --seed 42 data.csv")
+```
+
 ### Path Utilities
 ```
 basename  dirname   pwd       readlink  which
