@@ -24,6 +24,8 @@ Example usage:
 import asyncio
 from typing import Optional
 
+import nest_asyncio  # type: ignore[import-untyped]
+
 from .commands import create_command_registry
 from .fs import InMemoryFs
 from .interpreter import Interpreter, InterpreterState, ShellOptions
@@ -172,8 +174,8 @@ class Bash:
     ) -> ExecResult:
         """Execute a bash script synchronously.
 
-        This is a convenience wrapper around exec() for use in the REPL
-        or other synchronous contexts.
+        This is a convenience wrapper around exec() that works in any context,
+        including Jupyter notebooks and async frameworks.
 
         Args:
             script: The bash script to execute.
@@ -189,6 +191,14 @@ class Bash:
             >>> print(result.stdout)
             Hello, World!
         """
+        try:
+            asyncio.get_running_loop()
+            # We're in an existing event loop (Jupyter, async framework, etc.)
+            # Apply nest_asyncio to allow nested event loops
+            nest_asyncio.apply()
+        except RuntimeError:
+            # No running event loop, asyncio.run() will work fine
+            pass
         return asyncio.run(self.exec(script, env=env, cwd=cwd))
 
     def reset(self) -> None:

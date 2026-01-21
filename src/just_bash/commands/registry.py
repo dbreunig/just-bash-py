@@ -139,6 +139,8 @@ COMMAND_NAMES = [
     "yq",
     "xan",
     "sqlite3",
+    # HTML conversion
+    "html-to-markdown",
 ]
 
 # Network command names
@@ -256,6 +258,8 @@ _command_loaders: list[LazyCommandDef] = [
     LazyCommandDef(name="xan", load=lambda: _load_xan()),
     # Database
     LazyCommandDef(name="sqlite3", load=lambda: _load_sqlite3()),
+    # HTML conversion
+    LazyCommandDef(name="html-to-markdown", load=lambda: _load_html_to_markdown()),
 ]
 
 
@@ -749,6 +753,12 @@ async def _load_sqlite3() -> Command:
     """Load the sqlite3 command."""
     from .sqlite3.sqlite3_cmd import Sqlite3Command
     return Sqlite3Command()
+
+
+async def _load_html_to_markdown() -> Command:
+    """Load the html-to-markdown command."""
+    from .html_to_markdown.html_to_markdown import HtmlToMarkdownCommand
+    return HtmlToMarkdownCommand()
 
 
 # Network command loaders

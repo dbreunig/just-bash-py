@@ -144,23 +144,63 @@ class HistoryCommand:
 
     async def execute(self, args: list[str], ctx: CommandContext) -> ExecResult:
         """Execute the history command."""
+        import json
+
         if "--help" in args:
             return ExecResult(
-                stdout="Usage: history [n]\nDisplay command history.\n",
+                stdout="Usage: history [-c] [n]\nDisplay or clear command history.\n",
                 stderr="",
                 exit_code=0,
             )
 
-        # In this simulated environment, we don't have actual history
-        # Return empty or a placeholder message
-        # Check for HISTFILE in environment
-        if "BASH_HISTORY" in ctx.env:
-            history = ctx.env["BASH_HISTORY"].split("\n")
-            lines = []
-            for i, cmd in enumerate(history, 1):
-                if cmd:
-                    lines.append(f"  {i}  {cmd}")
-            return ExecResult(stdout="\n".join(lines) + "\n" if lines else "", stderr="", exit_code=0)
+        # Handle -c flag to clear history
+        if "-c" in args:
+            ctx.env["BASH_HISTORY"] = "[]"
+            return ExecResult(stdout="", stderr="", exit_code=0)
+
+        # Parse numeric argument for limiting output
+        limit = None
+        for arg in args:
+            if arg.isdigit():
+                limit = int(arg)
+                break
 
         # No history available
-        return ExecResult(stdout="", stderr="", exit_code=0)
+        if "BASH_HISTORY" not in ctx.env:
+            return ExecResult(stdout="", stderr="", exit_code=0)
+
+        history_value = ctx.env["BASH_HISTORY"]
+
+        # Try to parse as JSON array first
+        try:
+            history = json.loads(history_value)
+            if not isinstance(history, list):
+                # Fallback to newline-separated
+                history = [cmd for cmd in history_value.split("\n") if cmd]
+        except json.JSONDecodeError:
+            # Fallback to newline-separated format for backward compatibility
+            history = [cmd for cmd in history_value.split("\n") if cmd]
+
+        if not history:
+            return ExecResult(stdout="", stderr="", exit_code=0)
+
+        # Apply limit if specified
+        total = len(history)
+        if limit is not None:
+            if limit == 0:
+                return ExecResult(stdout="", stderr="", exit_code=0)
+            # Show last N entries with their original line numbers
+            start_idx = max(0, total - limit)
+        else:
+            start_idx = 0
+
+        # Format output with 5-character right-justified line numbers
+        lines = []
+        for i, cmd in enumerate(history[start_idx:], start_idx + 1):
+            lines.append(f"{str(i).rjust(5)}  {cmd}")
+
+        return ExecResult(
+            stdout="\n".join(lines) + "\n" if lines else "",
+            stderr="",
+            exit_code=0,
+        )

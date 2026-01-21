@@ -34,27 +34,27 @@ from just_bash import Bash
 bash = Bash()
 
 # Simple command
-result = bash.run('echo "Hello, World!"')
+result = await bash.exec('echo "Hello, World!"')
 print(result.stdout)  # Hello, World!
 
 # Pipes and text processing
-result = bash.run('echo "banana apple cherry" | tr " " "\\n" | sort')
+result = await bash.exec('echo "banana apple cherry" | tr " " "\\n" | sort')
 print(result.stdout)  # apple\nbanana\ncherry\n
 
 # Variables and arithmetic
-result = bash.run('x=5; echo $((x * 2))')
+result = await bash.exec('x=5; echo $((x * 2))')
 print(result.stdout)  # 10
 
 # Arrays
-result = bash.run('arr=(a b c); echo "${arr[@]}"')
+result = await bash.exec('arr=(a b c); echo "${arr[@]}"')
 print(result.stdout)  # a b c
 
 # In-memory files
-result = bash.run('echo "test" > /tmp/file.txt; cat /tmp/file.txt')
+result = await bash.exec('echo "test" > /tmp/file.txt; cat /tmp/file.txt')
 print(result.stdout)  # test
 ```
 
-For async contexts, use `await bash.exec()` instead of `bash.run()`.
+A synchronous `bash.run()` wrapper is also available and works in any context, including Jupyter notebooks.
 
 ## Demo
 
@@ -116,7 +116,7 @@ bash = Bash(files={
     "/config.json": '{"key": "value"}'
 })
 
-result = bash.run("cat /data/input.txt")
+result = await bash.exec("cat /data/input.txt")
 print(result.stdout)  # hello world
 ```
 
@@ -133,7 +133,7 @@ fs = ReadWriteFs(ReadWriteFsOptions(root="/path/to/project"))
 bash = Bash(fs=fs, cwd="/")
 
 # /src/main.py in bash maps to /path/to/project/src/main.py on disk
-result = bash.run("cat /src/main.py")
+result = await bash.exec("cat /src/main.py")
 ```
 
 **Warning**: ReadWriteFs provides direct disk access. Use with caution.
@@ -154,10 +154,10 @@ fs = OverlayFs(OverlayFsOptions(
 bash = Bash(fs=fs)
 
 # Read real files
-result = bash.run("cat /home/user/project/README.md")
+result = await bash.exec("cat /home/user/project/README.md")
 
 # Writes only affect the in-memory layer
-bash.run("echo 'modified' > /home/user/project/README.md")
+await bash.exec("echo 'modified' > /home/user/project/README.md")
 # Real file on disk is unchanged!
 ```
 
@@ -200,9 +200,9 @@ fs = MountableFs(MountableFsOptions(
 bash = Bash(fs=fs)
 
 # Access different filesystems through unified paths
-bash.run("ls /project")      # Real filesystem
-bash.run("ls /reference")    # Overlay filesystem
-bash.run("ls /tmp")          # In-memory (base)
+await bash.exec("ls /project")      # Real filesystem
+await bash.exec("ls /reference")    # Overlay filesystem
+await bash.exec("ls /tmp")          # In-memory (base)
 ```
 
 #### Direct Filesystem Access
@@ -326,16 +326,16 @@ join        agg         groupby     map         transform   pivot
 Example usage:
 ```python
 # Show column names
-bash.run("xan headers data.csv")
+await bash.exec("xan headers data.csv")
 
 # Filter and select
-bash.run("xan filter 'age > 30' data.csv | xan select name,age")
+await bash.exec("xan filter 'age > 30' data.csv | xan select name,age")
 
 # Convert to JSON
-bash.run("xan to json data.csv")
+await bash.exec("xan to json data.csv")
 
 # Sample random rows
-bash.run("xan sample 10 --seed 42 data.csv")
+await bash.exec("xan sample 10 --seed 42 data.csv")
 ```
 
 ### Path Utilities
@@ -368,6 +368,12 @@ bash      sh
 ## License
 
 Apache 2.0
+
+## Backlog
+
+Future improvements under consideration:
+
+- **Separate sync/async implementations**: Replace the current `nest_asyncio`-based `run()` wrapper with a truly synchronous implementation. This would follow the pattern used by libraries like httpx (`Client` vs `AsyncClient`) and the OpenAI SDK, providing cleaner separation without event loop patching.
 
 ## Acknowledgments
 
