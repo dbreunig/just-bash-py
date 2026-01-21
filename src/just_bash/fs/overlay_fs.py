@@ -155,6 +155,9 @@ class OverlayFs:
 
     def _is_under_mount(self, path: str) -> bool:
         """Check if a normalized path is under the mount point."""
+        # Special case: root mount point means all paths are under it
+        if self._mount_point == "/":
+            return True
         return path == self._mount_point or path.startswith(self._mount_point + "/")
 
     def _to_real_path(self, virtual_path: str) -> Path | None:
@@ -172,7 +175,11 @@ class OverlayFs:
             return self._root
 
         # Strip mount point prefix
-        relative = normalized[len(self._mount_point) + 1:]  # +1 for the /
+        # Special case: when mount_point is "/", just strip the leading "/"
+        if self._mount_point == "/":
+            relative = normalized[1:]  # Just strip the leading /
+        else:
+            relative = normalized[len(self._mount_point) + 1:]  # +1 for the /
         return self._root / relative
 
     def _is_deleted(self, path: str) -> bool:
