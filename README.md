@@ -96,6 +96,7 @@ bash = Bash(
     env={...},             # Environment variables
     cwd="/home/user",      # Working directory
     network=NetworkConfig(...),  # Network configuration (for curl)
+    unescape_html=True,    # Auto-fix HTML entities in LLM output (default: True)
 )
 ```
 
@@ -235,6 +236,32 @@ async def main():
 
 asyncio.run(main())
 ```
+
+### HTML Escaping Compatibility
+
+When LLMs generate bash commands, they sometimes output HTML-escaped operators:
+
+```bash
+wc -l &lt; file.txt      # LLM outputs this instead of: wc -l < file.txt
+echo "done" &amp;&amp; exit  # Instead of: echo "done" && exit
+```
+
+By default, just-bash automatically unescapes these HTML entities (`&lt;` → `<`, `&gt;` → `>`, `&amp;` → `&`, `&quot;` → `"`, `&apos;` → `'`) in operator positions, so LLM-generated commands work correctly.
+
+Entities inside quotes and heredocs are preserved:
+
+```python
+# These work as expected
+await bash.exec('echo "&lt;"')  # Outputs: &lt;
+await bash.exec("cat << 'EOF'\n&lt;tag&gt;\nEOF")  # Outputs: &lt;tag&gt;
+```
+
+To disable this behavior for strict bash compatibility:
+
+```python
+bash = Bash(unescape_html=False)
+```
+
 
 ## Security
 
