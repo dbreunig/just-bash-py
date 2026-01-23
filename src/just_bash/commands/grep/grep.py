@@ -203,8 +203,18 @@ class GrepCommand:
             if pattern:
                 # If pattern was set, it's actually a file
                 files.insert(0, pattern)
-            pattern = "|".join(f"({p})" for p in patterns)
-        elif pattern is None:
+            # Convert each pattern from BRE before combining (if not ERE mode)
+            if not extended_regexp and not fixed_strings:
+                converted = [self._bre_to_python_regex(p) for p in patterns]
+                pattern = "|".join(f"({p})" for p in converted)
+            else:
+                pattern = "|".join(f"({p})" for p in patterns)
+            # Mark as already converted
+            patterns_already_converted = True
+        else:
+            patterns_already_converted = False
+
+        if pattern is None and not patterns:
             return ExecResult(
                 stdout="",
                 stderr="grep: pattern not specified\n",
@@ -220,6 +230,10 @@ class GrepCommand:
             if fixed_strings:
                 # Escape all regex metacharacters
                 pattern = re.escape(pattern)
+            elif not extended_regexp and not patterns_already_converted:
+                # Convert BRE (Basic Regular Expression) to Python regex
+                pattern = self._bre_to_python_regex(pattern)
+
             if word_regexp:
                 pattern = r'\b' + pattern + r'\b'
             if line_regexp:
@@ -381,6 +395,101 @@ class GrepCommand:
 
         exit_code = 0 if found_match else 1
         return ExecResult(stdout=stdout, stderr=stderr, exit_code=exit_code)
+
+    def _bre_to_python_regex(self, pattern: str) -> str:
+        """Convert BRE (Basic Regular Expression) to Python regex.
+
+        In BRE:
+        - \\| is alternation, | is literal
+        - \\+ is one-or-more, + is literal
+        - \\? is zero-or-one, ? is literal
+        - \\( \\) is grouping, ( ) are literal
+        - \\{ \\} is repetition, { } are literal
+        - \\< \\> is word boundary
+
+        In Python regex (like ERE):
+        - | is alternation, \\| is literal
+        - + is one-or-more, \\+ is literal
+        - etc.
+        """
+        result = []
+        i = 0
+        while i < len(pattern):
+            if pattern[i] == '\\' and i + 1 < len(pattern):
+                next_char = pattern[i + 1]
+                if next_char == '|':
+                    # BRE \| -> Python |
+                    result.append('|')
+                    i += 2
+                elif next_char == '+':
+                    # BRE \+ -> Python +
+                    result.append('+')
+                    i += 2
+                elif next_char == '?':
+                    # BRE \? -> Python ?
+                    result.append('?')
+                    i += 2
+                elif next_char == '(':
+                    # BRE \( -> Python (
+                    result.append('(')
+                    i += 2
+                elif next_char == ')':
+                    # BRE \) -> Python )
+                    result.append(')')
+                    i += 2
+                elif next_char == '{':
+                    # BRE \{ -> Python {
+                    result.append('{')
+                    i += 2
+                elif next_char == '}':
+                    # BRE \} -> Python }
+                    result.append('}')
+                    i += 2
+                elif next_char == '<':
+                    # BRE \< (word start) -> Python \b
+                    result.append(r'\b')
+                    i += 2
+                elif next_char == '>':
+                    # BRE \> (word end) -> Python \b
+                    result.append(r'\b')
+                    i += 2
+                else:
+                    # Other escapes pass through as-is
+                    result.append(pattern[i:i + 2])
+                    i += 2
+            elif pattern[i] == '|':
+                # BRE literal | -> Python \|
+                result.append(r'\|')
+                i += 1
+            elif pattern[i] == '+':
+                # BRE literal + -> Python \+
+                result.append(r'\+')
+                i += 1
+            elif pattern[i] == '?':
+                # BRE literal ? -> Python \?
+                result.append(r'\?')
+                i += 1
+            elif pattern[i] == '(':
+                # BRE literal ( -> Python \(
+                result.append(r'\(')
+                i += 1
+            elif pattern[i] == ')':
+                # BRE literal ) -> Python \)
+                result.append(r'\)')
+                i += 1
+            elif pattern[i] == '{':
+                # BRE literal { -> Python \{
+                result.append(r'\{')
+                i += 1
+            elif pattern[i] == '}':
+                # BRE literal } -> Python \}
+                result.append(r'\}')
+                i += 1
+            else:
+                result.append(pattern[i])
+                i += 1
+
+        return ''.join(result)
 
     async def _get_files_recursive(self, ctx: CommandContext, path: str) -> list[str]:
         """Get all files in a directory recursively."""

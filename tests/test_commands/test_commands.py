@@ -2362,6 +2362,129 @@ class TestGrepCommandExtended:
         assert not any("catch" in l and l.strip() == "catch" for l in lines)
 
 
+class TestGrepBRE:
+    """Test grep Basic Regular Expression (BRE) mode."""
+
+    @pytest.mark.asyncio
+    async def test_grep_bre_alternation(self):
+        """Test BRE alternation with \\|."""
+        bash = Bash(files={"/test.txt": "apple\nbanana\ncherry\norange\n"})
+        result = await bash.exec(r"grep 'apple\|banana' /test.txt")
+        assert result.exit_code == 0
+        assert "apple" in result.stdout
+        assert "banana" in result.stdout
+        assert "cherry" not in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_grep_bre_multiple_alternation(self):
+        """Test BRE with multiple alternations."""
+        bash = Bash(files={"/test.txt": "toyota\nhonda\nford\nbmw\nrandom\n"})
+        result = await bash.exec(r"grep 'toyota\|honda\|ford\|bmw' /test.txt")
+        assert result.exit_code == 0
+        lines = result.stdout.strip().split("\n")
+        assert len(lines) == 4
+        assert "random" not in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_grep_bre_one_or_more(self):
+        """Test BRE one-or-more with \\+."""
+        bash = Bash(files={"/test.txt": "a\nab\nabb\nabbb\n"})
+        result = await bash.exec(r"grep 'ab\+' /test.txt")
+        assert result.exit_code == 0
+        assert "a\n" not in result.stdout  # Just 'a' should not match
+        assert "ab" in result.stdout
+        assert "abb" in result.stdout
+        assert "abbb" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_grep_bre_zero_or_one(self):
+        """Test BRE zero-or-one with \\?."""
+        bash = Bash(files={"/test.txt": "color\ncolour\ncolouur\n"})
+        result = await bash.exec(r"grep 'colou\?r' /test.txt")
+        assert result.exit_code == 0
+        assert "color" in result.stdout
+        assert "colour" in result.stdout
+        assert "colouur" not in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_grep_bre_grouping(self):
+        """Test BRE grouping with \\( \\)."""
+        bash = Bash(files={"/test.txt": "abab\nabcd\nab\n"})
+        result = await bash.exec(r"grep '\(ab\)\1' /test.txt")
+        assert result.exit_code == 0
+        assert "abab" in result.stdout
+        assert "abcd" not in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_grep_bre_bounded_repetition(self):
+        """Test BRE bounded repetition with \\{n,m\\}."""
+        bash = Bash(files={"/test.txt": "a\naa\naaa\naaaa\n"})
+        result = await bash.exec(r"grep 'a\{2,3\}' /test.txt")
+        assert result.exit_code == 0
+        assert "aa" in result.stdout
+        assert "aaa" in result.stdout
+        # Single 'a' alone should not match
+        lines = [l.strip() for l in result.stdout.strip().split("\n")]
+        assert "a" not in lines or len([l for l in lines if l == "a"]) == 0
+
+    @pytest.mark.asyncio
+    async def test_grep_bre_word_boundary(self):
+        """Test BRE word boundaries with \\< and \\>."""
+        bash = Bash(files={"/test.txt": "cat\ncatch\nthe cat runs\n"})
+        result = await bash.exec(r"grep '\<cat\>' /test.txt")
+        assert result.exit_code == 0
+        assert "cat" in result.stdout
+        # Should match "the cat runs" (whole word cat)
+        lines = [l.strip() for l in result.stdout.strip().split("\n")]
+        # "catch" should NOT be in the results as standalone
+        assert "catch" not in lines
+
+    @pytest.mark.asyncio
+    async def test_grep_bre_literal_plus(self):
+        """Test that literal + in BRE matches literal plus."""
+        bash = Bash(files={"/test.txt": "a+b\nab\naab\n"})
+        result = await bash.exec("grep 'a+b' /test.txt")
+        assert result.exit_code == 0
+        assert "a+b" in result.stdout
+        # In BRE, unescaped + is literal, so "ab" should NOT match
+        lines = [l.strip() for l in result.stdout.strip().split("\n")]
+        assert "ab" not in lines
+
+    @pytest.mark.asyncio
+    async def test_grep_bre_literal_pipe(self):
+        """Test that literal | in BRE matches literal pipe."""
+        bash = Bash(files={"/test.txt": "a|b\nab\na b\n"})
+        result = await bash.exec("grep 'a|b' /test.txt")
+        assert result.exit_code == 0
+        assert "a|b" in result.stdout
+        lines = [l.strip() for l in result.stdout.strip().split("\n")]
+        assert len(lines) == 1
+
+    @pytest.mark.asyncio
+    async def test_grep_bre_literal_question(self):
+        """Test that literal ? in BRE matches literal question mark."""
+        bash = Bash(files={"/test.txt": "what?\nwhat\nwhats\n"})
+        result = await bash.exec("grep 'what?' /test.txt")
+        assert result.exit_code == 0
+        assert "what?" in result.stdout
+        lines = [l.strip() for l in result.stdout.strip().split("\n")]
+        assert len(lines) == 1
+
+    @pytest.mark.asyncio
+    async def test_grep_ere_vs_bre(self):
+        """Test that -E changes behavior for alternation."""
+        bash = Bash(files={"/test.txt": "apple\nbanana\n"})
+        # ERE: unescaped | is alternation
+        result_ere = await bash.exec("grep -E 'apple|banana' /test.txt")
+        assert result_ere.exit_code == 0
+        assert "apple" in result_ere.stdout
+        assert "banana" in result_ere.stdout
+
+        # BRE: unescaped | is literal
+        result_bre = await bash.exec("grep 'apple|banana' /test.txt")
+        assert result_bre.exit_code == 1  # No match
+
+
 class TestSortCommandExtended:
     """Extended sort command tests."""
 
