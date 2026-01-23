@@ -543,7 +543,9 @@ class Interpreter:
         if node.name is None:
             return _ok()
 
-        # Process redirections for heredocs
+        # Process redirections for heredocs and input redirections
+        from ..ast.types import WordNode
+
         for redir in node.redirections:
             if redir.operator in ("<<", "<<-"):
                 # Here-document: the target should be a HereDocNode
@@ -557,6 +559,17 @@ class Interpreter:
                         lines = heredoc_content.split("\n")
                         heredoc_content = "\n".join(line.lstrip("\t") for line in lines)
                     stdin = heredoc_content
+            elif redir.operator == "<":
+                # Input redirection: read file content into stdin
+                if redir.target is not None and isinstance(redir.target, WordNode):
+                    target_path = await expand_word_async(self._ctx, redir.target)
+                    target_path = self._fs.resolve_path(self._state.cwd, target_path)
+                    try:
+                        stdin = await self._fs.read_file(target_path)
+                    except FileNotFoundError:
+                        return _failure(f"bash: {target_path}: No such file or directory\n")
+                    except IsADirectoryError:
+                        return _failure(f"bash: {target_path}: Is a directory\n")
 
         try:
             # Expand command name

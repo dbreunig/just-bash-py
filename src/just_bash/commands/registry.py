@@ -113,6 +113,7 @@ COMMAND_NAMES = [
     "timeout",
     "seq",
     "expr",
+    "shuf",
     # Checksums
     "md5sum",
     "sha1sum",
@@ -186,6 +187,7 @@ _command_loaders: list[LazyCommandDef] = [
     LazyCommandDef(name="date", load=lambda: _load_date()),
     LazyCommandDef(name="seq", load=lambda: _load_seq()),
     LazyCommandDef(name="expr", load=lambda: _load_expr()),
+    LazyCommandDef(name="shuf", load=lambda: _load_shuf()),
     # JSON processing
     LazyCommandDef(name="jq", load=lambda: _load_jq()),
     # High priority commands
@@ -387,6 +389,12 @@ async def _load_expr() -> Command:
     """Load the expr command."""
     from .expr.expr import ExprCommand
     return ExprCommand()
+
+
+async def _load_shuf() -> Command:
+    """Load the shuf command."""
+    from .shuf.shuf import ShufCommand
+    return ShufCommand()
 
 
 async def _load_uniq() -> Command:

@@ -22,6 +22,8 @@ Variables:
   FS            field separator
   OFS           output field separator
   ORS           output record separator
+  RSTART        start of match (set by match())
+  RLENGTH       length of match (set by match())
 
 Built-in functions:
   length(s)     string length
@@ -30,13 +32,35 @@ Built-in functions:
   split(s,a,fs) split s into array a
   sub(r,s)      substitute first match
   gsub(r,s)     substitute all matches
+  match(s,r)    find regex r in s, set RSTART/RLENGTH
   tolower(s)    convert to lowercase
   toupper(s)    convert to uppercase
-  printf(fmt,args...)  formatted print
+  sprintf(fmt,args...)  return formatted string
+  printf(fmt,args...)   formatted print
   print         print current line
+
+Math functions:
+  int(x)        truncate to integer
+  sqrt(x)       square root
+  sin(x)        sine
+  cos(x)        cosine
+  log(x)        natural logarithm
+  exp(x)        exponential
+  atan2(y,x)    arctangent of y/x
+
+Random functions:
+  rand()        random number 0 <= n < 1
+  srand([seed]) seed random generator
+
+Time functions:
+  systime()     current epoch timestamp
+  strftime(fmt,ts)  format timestamp
 """
 
+import math
+import random
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any
 from ...types import CommandContext, ExecResult
@@ -60,6 +84,7 @@ class AwkState:
     output: str = ""
     next_record: bool = False
     exit_program: bool = False
+    rng: random.Random = field(default_factory=random.Random)
 
 
 class AwkCommand:
@@ -596,6 +621,17 @@ class AwkCommand:
                         pass
             return
 
+        # Handle match() as a statement (for side effects on RSTART/RLENGTH)
+        if stmt.startswith("match("):
+            # Just evaluate it - _eval_expr will set RSTART/RLENGTH
+            self._eval_expr(stmt, state, line, fields)
+            return
+
+        # Handle srand() as a statement
+        if stmt.startswith("srand(") or stmt == "srand()":
+            self._eval_expr(stmt, state, line, fields)
+            return
+
         # Handle assignment
         if "=" in stmt and not stmt.startswith("if") and "==" not in stmt and "!=" not in stmt:
             # Handle += -= *= /=
@@ -773,7 +809,6 @@ class AwkCommand:
         if expr.startswith("sqrt("):
             match = re.match(r"sqrt\((.+)\)", expr)
             if match:
-                import math
                 arg = self._eval_expr(match.group(1), state, line, fields)
                 try:
                     return math.sqrt(float(arg))
@@ -784,7 +819,6 @@ class AwkCommand:
         if expr.startswith("sin("):
             match = re.match(r"sin\((.+)\)", expr)
             if match:
-                import math
                 arg = self._eval_expr(match.group(1), state, line, fields)
                 try:
                     return math.sin(float(arg))
@@ -795,7 +829,6 @@ class AwkCommand:
         if expr.startswith("cos("):
             match = re.match(r"cos\((.+)\)", expr)
             if match:
-                import math
                 arg = self._eval_expr(match.group(1), state, line, fields)
                 try:
                     return math.cos(float(arg))
@@ -806,7 +839,6 @@ class AwkCommand:
         if expr.startswith("log("):
             match = re.match(r"log\((.+)\)", expr)
             if match:
-                import math
                 arg = self._eval_expr(match.group(1), state, line, fields)
                 try:
                     return math.log(float(arg))
@@ -817,7 +849,6 @@ class AwkCommand:
         if expr.startswith("exp("):
             match = re.match(r"exp\((.+)\)", expr)
             if match:
-                import math
                 arg = self._eval_expr(match.group(1), state, line, fields)
                 try:
                     return math.exp(float(arg))
@@ -844,6 +875,104 @@ class AwkCommand:
                         state.variables[f"{arr_name}[{i+1}]"] = part
                     return len(parts)
             return 0
+
+        # rand() - return random number 0 <= n < 1
+        if expr == "rand()":
+            return state.rng.random()
+
+        # srand([seed]) - seed the random number generator
+        if expr.startswith("srand(") or expr == "srand()":
+            match = re.match(r"srand\(([^)]*)\)", expr)
+            if match:
+                seed_str = match.group(1).strip()
+                if seed_str:
+                    seed = self._eval_expr(seed_str, state, line, fields)
+                    try:
+                        state.rng.seed(int(float(seed)))
+                    except (ValueError, TypeError):
+                        state.rng.seed(int(time.time()))
+                else:
+                    state.rng.seed(int(time.time()))
+                return 0  # srand returns previous seed, but we just return 0
+
+        # sprintf(fmt, args...) - return formatted string
+        if expr.startswith("sprintf("):
+            match = re.match(r"sprintf\((.+)\)", expr)
+            if match:
+                args = self._split_args(match.group(1))
+                if args:
+                    fmt = str(self._eval_expr(args[0], state, line, fields))
+                    values = [self._eval_expr(a, state, line, fields) for a in args[1:]]
+                    return self._format_string(fmt, values)
+            return ""
+
+        # match(s, r) - return position of regex match, set RSTART and RLENGTH
+        if expr.startswith("match("):
+            match_call = re.match(r"match\((.+)\)", expr)
+            if match_call:
+                args = self._split_args(match_call.group(1))
+                if len(args) >= 2:
+                    s = str(self._eval_expr(args[0], state, line, fields))
+                    pattern = args[1].strip()
+                    # Handle /regex/ syntax
+                    if pattern.startswith("/") and pattern.endswith("/"):
+                        pattern = pattern[1:-1]
+                    try:
+                        regex_match = re.search(pattern, s)
+                        if regex_match:
+                            pos = regex_match.start() + 1  # 1-based
+                            length = regex_match.end() - regex_match.start()
+                            state.variables["RSTART"] = pos
+                            state.variables["RLENGTH"] = length
+                            return pos
+                        else:
+                            state.variables["RSTART"] = 0
+                            state.variables["RLENGTH"] = -1
+                            return 0
+                    except re.error:
+                        state.variables["RSTART"] = 0
+                        state.variables["RLENGTH"] = -1
+                        return 0
+            return 0
+
+        # atan2(y, x) - arctangent of y/x
+        if expr.startswith("atan2("):
+            match = re.match(r"atan2\((.+)\)", expr)
+            if match:
+                args = self._split_args(match.group(1))
+                if len(args) >= 2:
+                    y = self._eval_expr(args[0], state, line, fields)
+                    x = self._eval_expr(args[1], state, line, fields)
+                    try:
+                        return math.atan2(float(y), float(x))
+                    except (ValueError, TypeError):
+                        return 0
+            return 0
+
+        # systime() - return current epoch timestamp
+        if expr == "systime()":
+            return int(time.time())
+
+        # strftime(fmt, timestamp) - format timestamp as string
+        if expr.startswith("strftime("):
+            match = re.match(r"strftime\((.+)\)", expr)
+            if match:
+                args = self._split_args(match.group(1))
+                if args:
+                    fmt = str(self._eval_expr(args[0], state, line, fields))
+                    if len(args) >= 2:
+                        timestamp = self._eval_expr(args[1], state, line, fields)
+                        try:
+                            timestamp = int(float(timestamp))
+                        except (ValueError, TypeError):
+                            timestamp = int(time.time())
+                    else:
+                        timestamp = int(time.time())
+                    try:
+                        return time.strftime(fmt, time.localtime(timestamp))
+                    except (ValueError, OSError):
+                        return ""
+            return ""
 
         # Arithmetic - check for operators (including with spaces like "2 + 3")
         for op in ["+", "-", "*", "/", "%"]:
@@ -1010,17 +1139,70 @@ class AwkCommand:
         self, stmt: str, state: AwkState, fields: list[str], line: str
     ) -> None:
         """Execute an if statement."""
-        # Parse: if (condition) { action } [else { action }]
-        match = re.match(r"if\s*\((.+?)\)\s*\{(.+?)\}(?:\s*else\s*\{(.+?)\})?", stmt, re.DOTALL)
-        if match:
-            condition = match.group(1)
-            then_action = match.group(2)
-            else_action = match.group(3)
+        # Find the condition by matching balanced parentheses
+        if not stmt.startswith("if"):
+            return
+
+        # Find opening paren
+        paren_start = stmt.find("(")
+        if paren_start == -1:
+            return
+
+        # Find matching closing paren
+        depth = 1
+        pos = paren_start + 1
+        while pos < len(stmt) and depth > 0:
+            if stmt[pos] == "(":
+                depth += 1
+            elif stmt[pos] == ")":
+                depth -= 1
+            pos += 1
+
+        if depth != 0:
+            return
+
+        condition = stmt[paren_start + 1:pos - 1]
+        rest = stmt[pos:].strip()
+
+        # Check for braced then-action
+        if rest.startswith("{"):
+            # Find matching closing brace
+            brace_depth = 1
+            brace_pos = 1
+            while brace_pos < len(rest) and brace_depth > 0:
+                if rest[brace_pos] == "{":
+                    brace_depth += 1
+                elif rest[brace_pos] == "}":
+                    brace_depth -= 1
+                brace_pos += 1
+
+            then_action = rest[1:brace_pos - 1]
+            after_then = rest[brace_pos:].strip()
+
+            # Check for else
+            else_action = None
+            if after_then.startswith("else"):
+                else_rest = after_then[4:].strip()
+                if else_rest.startswith("{"):
+                    # Find matching brace for else
+                    brace_depth = 1
+                    brace_pos = 1
+                    while brace_pos < len(else_rest) and brace_depth > 0:
+                        if else_rest[brace_pos] == "{":
+                            brace_depth += 1
+                        elif else_rest[brace_pos] == "}":
+                            brace_depth -= 1
+                        brace_pos += 1
+                    else_action = else_rest[1:brace_pos - 1]
 
             if self._eval_condition(condition, state, fields, line):
                 self._execute_action(then_action, state, fields, line)
             elif else_action:
                 self._execute_action(else_action, state, fields, line)
+        else:
+            # No braces - rest is the statement
+            if self._eval_condition(condition, state, fields, line):
+                self._execute_statement(rest, state, fields, line)
 
     def _execute_for(
         self, stmt: str, state: AwkState, fields: list[str], line: str
@@ -1166,3 +1348,61 @@ class AwkCommand:
                 return str(int(n))
             return str(n)
         return str(n)
+
+    def _format_string(self, fmt: str, values: list[Any]) -> str:
+        """Format a string using printf-style format specifiers."""
+        result = ""
+        i = 0
+        val_idx = 0
+
+        while i < len(fmt):
+            if fmt[i] == "\\" and i + 1 < len(fmt):
+                c = fmt[i + 1]
+                if c == "n":
+                    result += "\n"
+                elif c == "t":
+                    result += "\t"
+                elif c == "\\":
+                    result += "\\"
+                else:
+                    result += c
+                i += 2
+            elif fmt[i] == "%" and i + 1 < len(fmt):
+                # Parse format spec
+                j = i + 1
+                while j < len(fmt) and fmt[j] in "-+0 #":
+                    j += 1
+                while j < len(fmt) and fmt[j].isdigit():
+                    j += 1
+                if j < len(fmt) and fmt[j] == ".":
+                    j += 1
+                    while j < len(fmt) and fmt[j].isdigit():
+                        j += 1
+                if j < len(fmt):
+                    spec = fmt[i:j + 1]
+                    conv = fmt[j]
+                    if conv == "%":
+                        result += "%"
+                    elif val_idx < len(values):
+                        val = values[val_idx]
+                        val_idx += 1
+                        try:
+                            if conv in "diouxX":
+                                result += spec % int(float(val))
+                            elif conv in "eEfFgG":
+                                result += spec % float(val)
+                            elif conv == "s":
+                                result += spec % str(val)
+                            else:
+                                result += spec % val
+                        except (ValueError, TypeError):
+                            result += str(val)
+                    i = j + 1
+                else:
+                    result += fmt[i]
+                    i += 1
+            else:
+                result += fmt[i]
+                i += 1
+
+        return result

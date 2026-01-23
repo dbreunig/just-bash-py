@@ -1173,6 +1173,281 @@ class TestAwkCommand:
         assert "42" in result.stdout
 
 
+class TestAwkRandFunctions:
+    """Test awk rand() and srand() functions."""
+
+    @pytest.mark.asyncio
+    async def test_awk_rand_returns_number(self):
+        """Test rand() returns a number between 0 and 1."""
+        bash = Bash()
+        result = await bash.exec("awk 'BEGIN {print rand()}'")
+        assert result.exit_code == 0
+        val = float(result.stdout.strip())
+        assert 0 <= val < 1
+
+    @pytest.mark.asyncio
+    async def test_awk_rand_in_condition(self):
+        """Test rand() works in conditions."""
+        bash = Bash(files={"/data.txt": "\n".join(["line"] * 1000) + "\n"})
+        # With 1000 lines and 50% chance, we should get roughly 500 lines
+        result = await bash.exec("awk '{if(rand() < 0.5) print}' /data.txt")
+        assert result.exit_code == 0
+        lines = [l for l in result.stdout.split("\n") if l]
+        # Should be roughly 500, allow wide margin
+        assert 200 < len(lines) < 800
+
+    @pytest.mark.asyncio
+    async def test_awk_srand_seeds_generator(self):
+        """Test srand() with same seed produces same sequence."""
+        bash = Bash()
+        result1 = await bash.exec("awk 'BEGIN {srand(42); print rand(), rand(), rand()}'")
+        result2 = await bash.exec("awk 'BEGIN {srand(42); print rand(), rand(), rand()}'")
+        assert result1.exit_code == 0
+        assert result2.exit_code == 0
+        assert result1.stdout == result2.stdout
+
+    @pytest.mark.asyncio
+    async def test_awk_srand_different_seeds(self):
+        """Test srand() with different seeds produces different sequences."""
+        bash = Bash()
+        result1 = await bash.exec("awk 'BEGIN {srand(1); print rand()}'")
+        result2 = await bash.exec("awk 'BEGIN {srand(2); print rand()}'")
+        assert result1.exit_code == 0
+        assert result2.exit_code == 0
+        assert result1.stdout != result2.stdout
+
+    @pytest.mark.asyncio
+    async def test_awk_srand_no_arg(self):
+        """Test srand() without argument uses time-based seed."""
+        bash = Bash()
+        result = await bash.exec("awk 'BEGIN {srand(); print rand()}'")
+        assert result.exit_code == 0
+        val = float(result.stdout.strip())
+        assert 0 <= val < 1
+
+    @pytest.mark.asyncio
+    async def test_awk_rand_sampling(self):
+        """Test rand() for random sampling like the original use case."""
+        bash = Bash(files={"/data.txt": "\n".join([f"line{i}" for i in range(100)]) + "\n"})
+        result = await bash.exec("awk 'BEGIN{srand(123)} {if(rand() < 0.1) print}' /data.txt")
+        assert result.exit_code == 0
+        lines = [l for l in result.stdout.split("\n") if l]
+        # With 10% sampling of 100 lines, expect roughly 10 lines
+        assert 1 < len(lines) < 30
+
+
+class TestAwkSprintfFunction:
+    """Test awk sprintf() function."""
+
+    @pytest.mark.asyncio
+    async def test_awk_sprintf_basic(self):
+        """Test sprintf() returns formatted string."""
+        bash = Bash()
+        result = await bash.exec('awk \'BEGIN {s = sprintf("%d", 42); print s}\'')
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "42"
+
+    @pytest.mark.asyncio
+    async def test_awk_sprintf_string_format(self):
+        """Test sprintf() with string format."""
+        bash = Bash()
+        result = await bash.exec('awk \'BEGIN {s = sprintf("%s world", "hello"); print s}\'')
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "hello world"
+
+    @pytest.mark.asyncio
+    async def test_awk_sprintf_padding(self):
+        """Test sprintf() with padding."""
+        bash = Bash()
+        result = await bash.exec('awk \'BEGIN {s = sprintf("%05d", 7); print s}\'')
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "00007"
+
+    @pytest.mark.asyncio
+    async def test_awk_sprintf_float(self):
+        """Test sprintf() with float format."""
+        bash = Bash()
+        result = await bash.exec('awk \'BEGIN {s = sprintf("%.2f", 3.14159); print s}\'')
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "3.14"
+
+    @pytest.mark.asyncio
+    async def test_awk_sprintf_multiple_args(self):
+        """Test sprintf() with multiple arguments."""
+        bash = Bash()
+        result = await bash.exec('awk \'BEGIN {s = sprintf("%s=%d", "x", 10); print s}\'')
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "x=10"
+
+    @pytest.mark.asyncio
+    async def test_awk_sprintf_in_expression(self):
+        """Test sprintf() used in an expression."""
+        bash = Bash(files={"/data.txt": "5\n10\n15\n"})
+        result = await bash.exec('awk \'{print sprintf("val:%03d", $1)}\' /data.txt')
+        assert result.exit_code == 0
+        assert "val:005" in result.stdout
+        assert "val:010" in result.stdout
+        assert "val:015" in result.stdout
+
+
+class TestAwkMatchFunction:
+    """Test awk match() function."""
+
+    @pytest.mark.asyncio
+    async def test_awk_match_found(self):
+        """Test match() returns position when pattern found."""
+        bash = Bash()
+        result = await bash.exec('awk \'BEGIN {print match("hello world", /wor/)}\'')
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "7"
+
+    @pytest.mark.asyncio
+    async def test_awk_match_not_found(self):
+        """Test match() returns 0 when pattern not found."""
+        bash = Bash()
+        result = await bash.exec('awk \'BEGIN {print match("hello world", /xyz/)}\'')
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "0"
+
+    @pytest.mark.asyncio
+    async def test_awk_match_sets_rstart(self):
+        """Test match() sets RSTART variable."""
+        bash = Bash()
+        result = await bash.exec('awk \'BEGIN {match("hello world", /wor/); print RSTART}\'')
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "7"
+
+    @pytest.mark.asyncio
+    async def test_awk_match_sets_rlength(self):
+        """Test match() sets RLENGTH variable."""
+        bash = Bash()
+        result = await bash.exec('awk \'BEGIN {match("hello world", /wor/); print RLENGTH}\'')
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "3"
+
+    @pytest.mark.asyncio
+    async def test_awk_match_no_match_rlength(self):
+        """Test RLENGTH is -1 when no match."""
+        bash = Bash()
+        result = await bash.exec('awk \'BEGIN {match("hello", /xyz/); print RLENGTH}\'')
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "-1"
+
+    @pytest.mark.asyncio
+    async def test_awk_match_with_field(self):
+        """Test match() with field variable."""
+        bash = Bash(files={"/data.txt": "hello world\nfoo bar\n"})
+        result = await bash.exec('awk \'{print match($0, /o+/)}\' /data.txt')
+        assert result.exit_code == 0
+        lines = result.stdout.strip().split("\n")
+        assert lines[0] == "5"  # "hello" has 'o' at position 5
+        assert lines[1] == "2"  # "foo" has 'oo' at position 2
+
+    @pytest.mark.asyncio
+    async def test_awk_match_extract_substring(self):
+        """Test using match() with substr() to extract matched text."""
+        bash = Bash()
+        result = await bash.exec('awk \'BEGIN {s="hello123world"; match(s, /[0-9]+/); print substr(s, RSTART, RLENGTH)}\'')
+        assert result.exit_code == 0
+        assert result.stdout.strip() == "123"
+
+
+class TestAwkAtan2Function:
+    """Test awk atan2() function."""
+
+    @pytest.mark.asyncio
+    async def test_awk_atan2_basic(self):
+        """Test atan2() basic usage."""
+        bash = Bash()
+        result = await bash.exec("awk 'BEGIN {print atan2(1, 1)}'")
+        assert result.exit_code == 0
+        # atan2(1,1) = pi/4 ≈ 0.785398
+        val = float(result.stdout.strip())
+        assert abs(val - 0.785398) < 0.0001
+
+    @pytest.mark.asyncio
+    async def test_awk_atan2_quadrants(self):
+        """Test atan2() handles different quadrants."""
+        bash = Bash()
+        result = await bash.exec("awk 'BEGIN {print atan2(1, 0)}'")
+        assert result.exit_code == 0
+        # atan2(1,0) = pi/2 ≈ 1.5708
+        val = float(result.stdout.strip())
+        assert abs(val - 1.5708) < 0.001
+
+    @pytest.mark.asyncio
+    async def test_awk_atan2_negative(self):
+        """Test atan2() with negative values."""
+        bash = Bash()
+        result = await bash.exec("awk 'BEGIN {print atan2(-1, -1)}'")
+        assert result.exit_code == 0
+        # atan2(-1,-1) = -3*pi/4 ≈ -2.356
+        val = float(result.stdout.strip())
+        assert abs(val - (-2.356194)) < 0.001
+
+
+class TestAwkTimeFunctions:
+    """Test awk systime() and strftime() functions."""
+
+    @pytest.mark.asyncio
+    async def test_awk_systime_returns_epoch(self):
+        """Test systime() returns current epoch timestamp."""
+        import time
+        bash = Bash()
+        result = await bash.exec("awk 'BEGIN {print systime()}'")
+        assert result.exit_code == 0
+        timestamp = int(result.stdout.strip())
+        now = int(time.time())
+        # Should be within 5 seconds of current time
+        assert abs(timestamp - now) < 5
+
+    @pytest.mark.asyncio
+    async def test_awk_strftime_basic(self):
+        """Test strftime() formats timestamp."""
+        bash = Bash()
+        # Use a known timestamp: 2024-01-15 12:30:45 UTC = 1705322445
+        result = await bash.exec('awk \'BEGIN {print strftime("%Y-%m-%d", 1705322445)}\'')
+        assert result.exit_code == 0
+        # Note: output depends on timezone, just check format
+        assert "-" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_awk_strftime_time_format(self):
+        """Test strftime() with time format."""
+        bash = Bash()
+        result = await bash.exec('awk \'BEGIN {print strftime("%H:%M:%S", 1705322445)}\'')
+        assert result.exit_code == 0
+        assert ":" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_awk_strftime_full_format(self):
+        """Test strftime() with full date-time format."""
+        bash = Bash()
+        result = await bash.exec('awk \'BEGIN {print strftime("%Y-%m-%d %H:%M:%S", 0)}\'')
+        assert result.exit_code == 0
+        # Epoch 0 should give 1970-01-01 (in UTC)
+        assert "1970" in result.stdout or "1969" in result.stdout  # Depends on timezone
+
+    @pytest.mark.asyncio
+    async def test_awk_strftime_weekday(self):
+        """Test strftime() with weekday format."""
+        bash = Bash()
+        result = await bash.exec('awk \'BEGIN {print strftime("%A", 0)}\'')
+        assert result.exit_code == 0
+        # Should be a day name
+        assert len(result.stdout.strip()) > 0
+
+    @pytest.mark.asyncio
+    async def test_awk_systime_strftime_combined(self):
+        """Test using systime() with strftime()."""
+        bash = Bash()
+        result = await bash.exec('awk \'BEGIN {print strftime("%Y", systime())}\'')
+        assert result.exit_code == 0
+        year = int(result.stdout.strip())
+        # Should be current year (2024, 2025, or 2026)
+        assert 2024 <= year <= 2030
+
+
 class TestFindCommand:
     """Test find command."""
 
@@ -5905,3 +6180,204 @@ class TestSedReadLineCommand:
         # Should not error, just skip the R command
         assert result.exit_code == 0
         assert "line1" in result.stdout
+
+
+class TestInputRedirection:
+    """Test < input redirection."""
+
+    @pytest.mark.asyncio
+    async def test_input_redirect_basic(self):
+        """Test basic input redirection with cat."""
+        bash = Bash(files={"/input.txt": "hello\nworld\n"})
+        result = await bash.exec("cat < /input.txt")
+        assert result.stdout == "hello\nworld\n"
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_input_redirect_wc(self):
+        """Test input redirection with wc -l."""
+        bash = Bash(files={"/input.txt": "line1\nline2\nline3\n"})
+        result = await bash.exec("wc -l < /input.txt")
+        assert "3" in result.stdout
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_input_redirect_with_variable(self):
+        """Test input redirection with variable expansion."""
+        bash = Bash(files={"/data.txt": "content\n"})
+        result = await bash.exec('file=/data.txt; cat < $file')
+        assert result.stdout == "content\n"
+
+    @pytest.mark.asyncio
+    async def test_input_redirect_file_not_found(self):
+        """Test input redirection with nonexistent file."""
+        bash = Bash()
+        result = await bash.exec("cat < /nonexistent.txt")
+        assert "No such file" in result.stderr
+        assert result.exit_code == 1
+
+    @pytest.mark.asyncio
+    async def test_input_redirect_head(self):
+        """Test input redirection with head command."""
+        bash = Bash(files={"/input.txt": "a\nb\nc\nd\ne\n"})
+        result = await bash.exec("head -n 2 < /input.txt")
+        assert result.stdout == "a\nb\n"
+
+    @pytest.mark.asyncio
+    async def test_input_redirect_is_directory(self):
+        """Test input redirection with a directory."""
+        bash = Bash(files={"/dir/file.txt": "content"})
+        result = await bash.exec("cat < /dir")
+        assert "Is a directory" in result.stderr
+        assert result.exit_code == 1
+
+
+class TestShufCommand:
+    """Test shuf command."""
+
+    @pytest.mark.asyncio
+    async def test_shuf_basic(self):
+        """Test basic shuf shuffles lines."""
+        bash = Bash(files={"/input.txt": "a\nb\nc\nd\ne\n"})
+        result = await bash.exec("shuf /input.txt")
+        assert result.exit_code == 0
+        lines = sorted(result.stdout.strip().split("\n"))
+        assert lines == ["a", "b", "c", "d", "e"]
+
+    @pytest.mark.asyncio
+    async def test_shuf_stdin(self):
+        """Test shuf reads from stdin."""
+        bash = Bash()
+        result = await bash.exec("echo -e 'x\\ny\\nz' | shuf")
+        assert result.exit_code == 0
+        lines = sorted(result.stdout.strip().split("\n"))
+        assert lines == ["x", "y", "z"]
+
+    @pytest.mark.asyncio
+    async def test_shuf_n_limit(self):
+        """Test shuf -n limits output lines."""
+        bash = Bash(files={"/input.txt": "a\nb\nc\nd\ne\n"})
+        result = await bash.exec("shuf -n 2 /input.txt")
+        assert result.exit_code == 0
+        lines = result.stdout.strip().split("\n")
+        assert len(lines) == 2
+        # All output lines should be from input
+        for line in lines:
+            assert line in ["a", "b", "c", "d", "e"]
+
+    @pytest.mark.asyncio
+    async def test_shuf_n_greater_than_input(self):
+        """Test shuf -n with n greater than input lines."""
+        bash = Bash(files={"/input.txt": "a\nb\nc\n"})
+        result = await bash.exec("shuf -n 10 /input.txt")
+        assert result.exit_code == 0
+        lines = result.stdout.strip().split("\n")
+        assert len(lines) == 3
+
+    @pytest.mark.asyncio
+    async def test_shuf_e_args(self):
+        """Test shuf -e treats args as input lines."""
+        bash = Bash()
+        result = await bash.exec("shuf -e one two three")
+        assert result.exit_code == 0
+        lines = sorted(result.stdout.strip().split("\n"))
+        assert lines == ["one", "three", "two"]
+
+    @pytest.mark.asyncio
+    async def test_shuf_e_with_n(self):
+        """Test shuf -e with -n."""
+        bash = Bash()
+        result = await bash.exec("shuf -e -n 2 a b c d e")
+        assert result.exit_code == 0
+        lines = result.stdout.strip().split("\n")
+        assert len(lines) == 2
+
+    @pytest.mark.asyncio
+    async def test_shuf_i_range(self):
+        """Test shuf -i generates range."""
+        bash = Bash()
+        result = await bash.exec("shuf -i 1-5")
+        assert result.exit_code == 0
+        lines = sorted(result.stdout.strip().split("\n"), key=int)
+        assert lines == ["1", "2", "3", "4", "5"]
+
+    @pytest.mark.asyncio
+    async def test_shuf_i_with_n(self):
+        """Test shuf -i with -n."""
+        bash = Bash()
+        result = await bash.exec("shuf -i 1-100 -n 5")
+        assert result.exit_code == 0
+        lines = result.stdout.strip().split("\n")
+        assert len(lines) == 5
+        for line in lines:
+            assert 1 <= int(line) <= 100
+
+    @pytest.mark.asyncio
+    async def test_shuf_r_repeat(self):
+        """Test shuf -r allows repeats."""
+        bash = Bash()
+        result = await bash.exec("shuf -r -n 10 -e a b")
+        assert result.exit_code == 0
+        lines = result.stdout.strip().split("\n")
+        assert len(lines) == 10
+        for line in lines:
+            assert line in ["a", "b"]
+
+    @pytest.mark.asyncio
+    async def test_shuf_o_output_file(self):
+        """Test shuf -o writes to file."""
+        bash = Bash(files={"/input.txt": "a\nb\nc\n"})
+        result = await bash.exec("shuf /input.txt -o /output.txt")
+        assert result.exit_code == 0
+        assert result.stdout == ""
+        # Read output file
+        read_result = await bash.exec("cat /output.txt")
+        lines = sorted(read_result.stdout.strip().split("\n"))
+        assert lines == ["a", "b", "c"]
+
+    @pytest.mark.asyncio
+    async def test_shuf_random_source(self):
+        """Test shuf --random-source for reproducible output."""
+        bash = Bash(files={
+            "/input.txt": "a\nb\nc\nd\ne\n",
+            "/seed.txt": "deterministic seed data here"
+        })
+        result1 = await bash.exec("shuf --random-source=/seed.txt /input.txt")
+        result2 = await bash.exec("shuf --random-source=/seed.txt /input.txt")
+        assert result1.exit_code == 0
+        assert result2.exit_code == 0
+        assert result1.stdout == result2.stdout
+
+    @pytest.mark.asyncio
+    async def test_shuf_file_not_found(self):
+        """Test shuf with nonexistent file."""
+        bash = Bash()
+        result = await bash.exec("shuf /nonexistent.txt")
+        assert "No such file" in result.stderr
+        assert result.exit_code == 1
+
+    @pytest.mark.asyncio
+    async def test_shuf_empty_file(self):
+        """Test shuf with empty file."""
+        bash = Bash(files={"/empty.txt": ""})
+        result = await bash.exec("shuf /empty.txt")
+        assert result.exit_code == 0
+        assert result.stdout == ""
+
+    @pytest.mark.asyncio
+    async def test_shuf_i_invalid_range(self):
+        """Test shuf -i with invalid range."""
+        bash = Bash()
+        result = await bash.exec("shuf -i 5-1")
+        assert result.exit_code == 1
+        assert "invalid" in result.stderr.lower()
+
+    @pytest.mark.asyncio
+    async def test_shuf_preserves_content(self):
+        """Test shuf preserves line content exactly."""
+        bash = Bash(files={"/input.txt": "  spaces  \n\ttabs\t\nspecial!@#\n"})
+        result = await bash.exec("shuf /input.txt")
+        assert result.exit_code == 0
+        # Use rstrip to only remove trailing newline, not leading whitespace
+        lines = result.stdout.rstrip("\n").split("\n")
+        assert sorted(lines) == sorted(["  spaces  ", "\ttabs\t", "special!@#"])
