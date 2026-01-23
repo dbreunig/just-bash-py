@@ -9,6 +9,7 @@ from .lexer import (
     is_valid_name,
     is_valid_assignment_lhs,
     RESERVED_WORDS,
+    unescape_html_entities,
 )
 from .parser import (
     Parser,
@@ -29,6 +30,7 @@ __all__ = [
     "is_valid_name",
     "is_valid_assignment_lhs",
     "RESERVED_WORDS",
+    "unescape_html_entities",
     # Parser
     "Parser",
     "ParseException",

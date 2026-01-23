@@ -256,11 +256,7 @@ class Lexer:
                 break
 
             # Check for pending here-documents after newline
-            if (
-                self.pending_heredocs
-                and self.tokens
-                and self.tokens[-1].type == TokenType.NEWLINE
-            ):
+            if self.pending_heredocs and self.tokens and self.tokens[-1].type == TokenType.NEWLINE:
                 self._read_heredoc_content()
                 continue
 
@@ -292,11 +288,7 @@ class Lexer:
             if char == " " or char == "\t":
                 self.pos += 1
                 self.column += 1
-            elif (
-                char == "\\"
-                and self.pos + 1 < input_len
-                and input_text[self.pos + 1] == "\n"
-            ):
+            elif char == "\\" and self.pos + 1 < input_len and input_text[self.pos + 1] == "\n":
                 # Line continuation
                 self.pos += 2
                 self.line += 1
@@ -342,9 +334,7 @@ class Lexer:
             self.pos = pos + 3
             self.column = start_column + 3
             self._register_heredoc_from_lookahead(strip_tabs=True)
-            return self._make_token(
-                TokenType.DLESSDASH, "<<-", pos, start_line, start_column
-            )
+            return self._make_token(TokenType.DLESSDASH, "<<-", pos, start_line, start_column)
 
         # Check other three-char operators
         three_chars = c0 + c1 + c2
@@ -374,9 +364,7 @@ class Lexer:
         if c0 in SINGLE_CHAR_OPS:
             self.pos = pos + 1
             self.column = start_column + 1
-            return self._make_token(
-                SINGLE_CHAR_OPS[c0], c0, pos, start_line, start_column
-            )
+            return self._make_token(SINGLE_CHAR_OPS[c0], c0, pos, start_line, start_column)
 
         # Special handling for { and }
         if c0 == "{":
@@ -643,7 +631,7 @@ class Lexer:
                     continue
                 if in_double_quote:
                     # In double quotes, only certain escapes are special
-                    if next_char in "\"\\$`\n":
+                    if next_char in '"\\$`\n':
                         if next_char in "$`":
                             value += char + next_char
                         else:
@@ -737,9 +725,7 @@ class Lexer:
                 pos += 1
                 col += 1
                 # Read variable name
-                while pos < input_len and (
-                    input_text[pos].isalnum() or input_text[pos] == "_"
-                ):
+                while pos < input_len and (input_text[pos].isalnum() or input_text[pos] == "_"):
                     value += input_text[pos]
                     pos += 1
                     col += 1
@@ -946,3 +932,183 @@ def tokenize(input_text: str) -> list[Token]:
     """Convenience function to tokenize input."""
     lexer = Lexer(input_text)
     return lexer.tokenize()
+
+
+# HTML entity mappings
+HTML_ENTITIES: dict[str, str] = {
+    "&lt;": "<",
+    "&gt;": ">",
+    "&amp;": "&",
+    "&quot;": '"',
+    "&apos;": "'",
+}
+
+
+def unescape_html_entities(input_text: str) -> str:
+    """Unescape HTML entities in operator positions (outside quotes and heredocs).
+
+    This handles LLM-generated bash commands that contain HTML-escaped
+    operators like &lt; instead of <.
+
+    Only unescapes entities outside of:
+    - Single quotes
+    - Double quotes
+    - Heredoc content
+
+    Args:
+        input_text: The bash script that may contain HTML entities.
+
+    Returns:
+        The script with HTML entities unescaped in operator positions.
+    """
+    result: list[str] = []
+    i = 0
+    n = len(input_text)
+    in_single_quote = False
+    in_double_quote = False
+    heredoc_delimiter: str | None = None  # None means not in heredoc
+
+    while i < n:
+        char = input_text[i]
+
+        # If we're in a heredoc, look for the end delimiter
+        if heredoc_delimiter is not None:
+            # Check if this line matches the heredoc delimiter
+            line_start = i
+            line_end = input_text.find("\n", i)
+            if line_end == -1:
+                line_end = n
+
+            line = input_text[line_start:line_end]
+            # For <<- heredocs, delimiter may be preceded by tabs
+            stripped_line = line.lstrip("\t")
+
+            if stripped_line == heredoc_delimiter or line == heredoc_delimiter:
+                # End of heredoc - output the line and exit heredoc mode
+                if line_end < n:
+                    result.append(input_text[i : line_end + 1])
+                    i = line_end + 1
+                else:
+                    result.append(input_text[i:line_end])
+                    i = line_end
+                heredoc_delimiter = None
+                continue
+
+            # Still in heredoc - output the entire line as-is
+            if line_end < n:
+                result.append(input_text[i : line_end + 1])
+                i = line_end + 1
+            else:
+                result.append(input_text[i:line_end])
+                i = line_end
+            continue
+
+        # Handle quote state tracking
+        if char == "'" and not in_double_quote:
+            in_single_quote = not in_single_quote
+            result.append(char)
+            i += 1
+            continue
+
+        if char == '"' and not in_single_quote:
+            in_double_quote = not in_double_quote
+            result.append(char)
+            i += 1
+            continue
+
+        # Handle backslash escapes (only outside single quotes)
+        if char == "\\" and not in_single_quote and i + 1 < n:
+            # Keep the backslash and next character as-is
+            result.append(char)
+            result.append(input_text[i + 1])
+            i += 2
+            continue
+
+        # Detect heredoc start (only outside quotes)
+        if not in_single_quote and not in_double_quote and char == "<":
+            # Check for << or <<-
+            if i + 1 < n and input_text[i + 1] == "<":
+                strip_tabs = i + 2 < n and input_text[i + 2] == "-"
+                heredoc_op_len = 3 if strip_tabs else 2
+
+                # Output the << or <<-
+                result.append(input_text[i : i + heredoc_op_len])
+                i += heredoc_op_len
+
+                # Skip whitespace after operator
+                while i < n and input_text[i] in " \t":
+                    result.append(input_text[i])
+                    i += 1
+
+                if i >= n:
+                    continue
+
+                # Parse the delimiter
+                delimiter = ""
+
+                if input_text[i] == "'":
+                    # Single-quoted delimiter
+                    result.append("'")
+                    i += 1
+                    while i < n and input_text[i] != "'":
+                        delimiter += input_text[i]
+                        result.append(input_text[i])
+                        i += 1
+                    if i < n:
+                        result.append("'")
+                        i += 1
+                elif input_text[i] == '"':
+                    # Double-quoted delimiter
+                    result.append('"')
+                    i += 1
+                    while i < n and input_text[i] != '"':
+                        delimiter += input_text[i]
+                        result.append(input_text[i])
+                        i += 1
+                    if i < n:
+                        result.append('"')
+                        i += 1
+                else:
+                    # Unquoted delimiter
+                    while i < n and input_text[i] not in " \t\n;|&<>()":
+                        if input_text[i] == "\\" and i + 1 < n:
+                            # Backslash-escaped character in delimiter
+                            delimiter += input_text[i + 1]
+                            result.append(input_text[i : i + 2])
+                            i += 2
+                        else:
+                            delimiter += input_text[i]
+                            result.append(input_text[i])
+                            i += 1
+
+                # Find the end of this line (heredoc content starts on next line)
+                while i < n and input_text[i] != "\n":
+                    result.append(input_text[i])
+                    i += 1
+
+                if i < n:
+                    result.append("\n")
+                    i += 1
+                    # Now in heredoc mode
+                    heredoc_delimiter = delimiter
+
+                continue
+
+        # Only attempt HTML entity replacement outside quotes
+        if not in_single_quote and not in_double_quote and char == "&":
+            # Check for HTML entities
+            matched = False
+            for entity, replacement in HTML_ENTITIES.items():
+                if input_text[i:].startswith(entity):
+                    result.append(replacement)
+                    i += len(entity)
+                    matched = True
+                    break
+            if matched:
+                continue
+
+        # Regular character
+        result.append(char)
+        i += 1
+
+    return "".join(result)

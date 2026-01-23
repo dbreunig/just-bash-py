@@ -79,17 +79,67 @@ async def handle_set(ctx: "InterpreterContext", args: list[str]) -> "ExecResult"
                 return ExecResult(stdout=stdout, stderr="", exit_code=0)
 
         # Handle short options like -e, -u, -x, -v
+        # Also handle -euo pipefail where 'o' consumes the next argument
         elif arg.startswith("-") and len(arg) > 1 and arg[1] != "-":
-            for c in arg[1:]:
-                result = _set_short_option(ctx, c, True)
-                if result:
-                    return result
+            chars = arg[1:]
+            j = 0
+            while j < len(chars):
+                c = chars[j]
+                if c == "o":
+                    # -o requires an option name: either remaining chars or next arg
+                    if j + 1 < len(chars):
+                        # Option name is rest of this arg (e.g., -opipefail)
+                        opt_name = chars[j + 1:]
+                        result = _set_option(ctx, opt_name, True)
+                        if result:
+                            return result
+                        break  # Done with this arg
+                    elif i + 1 < len(args):
+                        # Option name is next arg (e.g., -euo pipefail)
+                        i += 1
+                        opt_name = args[i]
+                        result = _set_option(ctx, opt_name, True)
+                        if result:
+                            return result
+                        break  # Done with this arg
+                    else:
+                        # No option name provided, list options
+                        stdout = _list_options(ctx)
+                        return ExecResult(stdout=stdout, stderr="", exit_code=0)
+                else:
+                    result = _set_short_option(ctx, c, True)
+                    if result:
+                        return result
+                j += 1
 
         elif arg.startswith("+") and len(arg) > 1:
-            for c in arg[1:]:
-                result = _set_short_option(ctx, c, False)
-                if result:
-                    return result
+            chars = arg[1:]
+            j = 0
+            while j < len(chars):
+                c = chars[j]
+                if c == "o":
+                    # +o requires an option name
+                    if j + 1 < len(chars):
+                        opt_name = chars[j + 1:]
+                        result = _set_option(ctx, opt_name, False)
+                        if result:
+                            return result
+                        break
+                    elif i + 1 < len(args):
+                        i += 1
+                        opt_name = args[i]
+                        result = _set_option(ctx, opt_name, False)
+                        if result:
+                            return result
+                        break
+                    else:
+                        stdout = _list_options_script(ctx)
+                        return ExecResult(stdout=stdout, stderr="", exit_code=0)
+                else:
+                    result = _set_short_option(ctx, c, False)
+                    if result:
+                        return result
+                j += 1
 
         # Treat as positional parameter
         else:

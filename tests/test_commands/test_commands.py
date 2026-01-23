@@ -6504,3 +6504,132 @@ class TestShufCommand:
         # Use rstrip to only remove trailing newline, not leading whitespace
         lines = result.stdout.rstrip("\n").split("\n")
         assert sorted(lines) == sorted(["  spaces  ", "\ttabs\t", "special!@#"])
+
+
+class TestHtmlUnescape:
+    """Test HTML entity unescaping for LLM-generated commands."""
+
+    @pytest.mark.asyncio
+    async def test_unescape_redirect_input(self):
+        """Test &lt; is unescaped to < for input redirection."""
+        bash = Bash(files={"/f.txt": "hello\n"})
+        result = await bash.exec("cat &lt; /f.txt")
+        assert result.stdout == "hello\n"
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_unescape_redirect_output(self):
+        """Test &gt; is unescaped to > for output redirection."""
+        bash = Bash()
+        result = await bash.exec("echo hello &gt; /out.txt")
+        assert result.exit_code == 0
+        content = await bash.fs.read_file("/out.txt")
+        assert content in ("hello\n", b"hello\n")
+
+    @pytest.mark.asyncio
+    async def test_unescape_append(self):
+        """Test &gt;&gt; is unescaped to >> for append."""
+        bash = Bash(files={"/out.txt": "line1\n"})
+        result = await bash.exec("echo line2 &gt;&gt; /out.txt")
+        assert result.exit_code == 0
+        content = await bash.fs.read_file("/out.txt")
+        assert content in ("line1\nline2\n", b"line1\nline2\n")
+
+    @pytest.mark.asyncio
+    async def test_unescape_and_operator(self):
+        """Test &amp;&amp; is unescaped to && for AND operator."""
+        bash = Bash()
+        result = await bash.exec("true &amp;&amp; echo success")
+        assert result.stdout == "success\n"
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_unescape_or_operator(self):
+        """Test mixed operators with &amp;."""
+        bash = Bash()
+        result = await bash.exec("false || echo fallback")
+        # || shouldn't need unescaping, but ensure it still works
+        assert result.stdout == "fallback\n"
+
+    @pytest.mark.asyncio
+    async def test_unescape_background(self):
+        """Test &amp; at end is unescaped for background (though we don't truly background)."""
+        bash = Bash()
+        # Background jobs run but don't actually background in our interpreter
+        result = await bash.exec("echo bg &amp;")
+        # Should run without error
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_preserve_in_double_quotes(self):
+        """Test that HTML entities inside double quotes are preserved."""
+        bash = Bash()
+        result = await bash.exec('echo "&lt;"')
+        assert result.stdout == "&lt;\n"
+
+    @pytest.mark.asyncio
+    async def test_preserve_in_single_quotes(self):
+        """Test that HTML entities inside single quotes are preserved."""
+        bash = Bash()
+        result = await bash.exec("echo '&lt;'")
+        assert result.stdout == "&lt;\n"
+
+    @pytest.mark.asyncio
+    async def test_preserve_amp_in_quotes(self):
+        """Test &amp; inside quotes is preserved."""
+        bash = Bash()
+        result = await bash.exec('echo "&amp;"')
+        assert result.stdout == "&amp;\n"
+
+    @pytest.mark.asyncio
+    async def test_opt_out_unescape(self):
+        """Test unescape_html=False disables unescaping."""
+        bash = Bash(files={"/f.txt": "hello\n"}, unescape_html=False)
+        result = await bash.exec("cat &lt; /f.txt")
+        # Should fail because &lt; is treated as literal text, not redirect
+        assert result.exit_code != 0 or "&lt;" in result.stderr or "cat" in result.stderr
+
+    @pytest.mark.asyncio
+    async def test_mixed_real_and_escaped(self):
+        """Test that real operators still work alongside escaped ones."""
+        bash = Bash()
+        result = await bash.exec("echo a &amp;&amp; echo b && echo c")
+        assert result.stdout == "a\nb\nc\n"
+
+    @pytest.mark.asyncio
+    async def test_unescape_quot_outside_quotes(self):
+        """Test &quot; is unescaped to double quote outside quotes."""
+        bash = Bash()
+        result = await bash.exec("echo &quot;hello&quot;")
+        assert result.stdout == "hello\n"
+
+    @pytest.mark.asyncio
+    async def test_unescape_apos_outside_quotes(self):
+        """Test &apos; is unescaped to single quote outside quotes."""
+        bash = Bash()
+        result = await bash.exec("echo &apos;hello&apos;")
+        assert result.stdout == "hello\n"
+
+    @pytest.mark.asyncio
+    async def test_heredoc_preserved(self):
+        """Test that HTML entities in heredoc content are preserved."""
+        bash = Bash()
+        result = await bash.exec("""cat << 'EOF'
+&lt;tag&gt;
+EOF""")
+        assert result.stdout == "&lt;tag&gt;\n"
+
+    @pytest.mark.asyncio
+    async def test_unescape_pipe(self):
+        """Test pipeline still works (| shouldn't need escaping but verify)."""
+        bash = Bash()
+        result = await bash.exec("echo hello | cat")
+        assert result.stdout == "hello\n"
+
+    @pytest.mark.asyncio
+    async def test_complex_llm_command(self):
+        """Test a realistic LLM-generated command with HTML escaping."""
+        bash = Bash(files={"/input.txt": "line1\nline2\nline3\n"})
+        result = await bash.exec("wc -l &lt; /input.txt &amp;&amp; echo done")
+        assert "3" in result.stdout
+        assert "done" in result.stdout

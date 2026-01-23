@@ -29,7 +29,7 @@ import nest_asyncio  # type: ignore[import-untyped]
 from .commands import create_command_registry
 from .fs import InMemoryFs
 from .interpreter import Interpreter, InterpreterState, ShellOptions
-from .parser import parse
+from .parser import parse, unescape_html_entities
 from .types import (
     Command,
     ExecResult,
@@ -59,6 +59,7 @@ class Bash:
         errexit: bool = False,
         pipefail: bool = False,
         nounset: bool = False,
+        unescape_html: bool = True,
     ):
         """Initialize the Bash interpreter.
 
@@ -73,6 +74,9 @@ class Bash:
             errexit: Enable errexit (set -e) mode.
             pipefail: Enable pipefail mode.
             nounset: Enable nounset (set -u) mode.
+            unescape_html: Unescape HTML entities in operator positions (default True).
+                This helps LLM-generated commands work correctly when they contain
+                &lt; instead of <, &gt; instead of >, etc.
         """
         # Set up filesystem
         if fs is not None:
@@ -88,6 +92,9 @@ class Bash:
 
         # Set up network config
         self._network = network
+
+        # Set up HTML unescaping
+        self._unescape_html = unescape_html
 
         # Set up initial state
         default_env = {
@@ -152,6 +159,10 @@ class Bash:
         Returns:
             ExecResult with stdout, stderr, exit_code, and final env.
         """
+        # Preprocess HTML entities if enabled
+        if self._unescape_html:
+            script = unescape_html_entities(script)
+
         # Parse the script
         ast = parse(script)
 
