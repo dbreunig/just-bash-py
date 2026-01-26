@@ -41,7 +41,10 @@ class ReadCommand:
                 array_name = args[i]
             elif arg == "-d" and i + 1 < len(args):
                 i += 1
-                delimiter = args[i]
+                delimiter = args[i] if args[i] else "\0"
+            elif arg.startswith("-d") and len(arg) > 2:
+                # Combined -d<delim> syntax
+                delimiter = arg[2:]
             elif arg == "-n" and i + 1 < len(args):
                 i += 1
                 try:
@@ -52,6 +55,38 @@ class ReadCommand:
                         stderr=f"bash: read: {args[i]}: invalid number\n",
                         exit_code=1,
                     )
+            elif arg.startswith("-n") and len(arg) > 2:
+                # Combined -n<count> syntax
+                try:
+                    nchars = int(arg[2:])
+                except ValueError:
+                    return ExecResult(
+                        stdout="",
+                        stderr=f"bash: read: {arg[2:]}: invalid number\n",
+                        exit_code=1,
+                    )
+            elif arg == "-N" and i + 1 < len(args):
+                # -N nchars: read exactly N chars, ignoring delimiters
+                i += 1
+                try:
+                    nchars = int(args[i])
+                except ValueError:
+                    return ExecResult(
+                        stdout="",
+                        stderr=f"bash: read: {args[i]}: invalid number\n",
+                        exit_code=1,
+                    )
+                delimiter = ""  # -N ignores delimiters
+            elif arg.startswith("-N") and len(arg) > 2:
+                try:
+                    nchars = int(arg[2:])
+                except ValueError:
+                    return ExecResult(
+                        stdout="",
+                        stderr=f"bash: read: {arg[2:]}: invalid number\n",
+                        exit_code=1,
+                    )
+                delimiter = ""  # -N ignores delimiters
             elif arg == "-p" and i + 1 < len(args):
                 # Prompt option - we ignore it since we can't prompt
                 i += 1

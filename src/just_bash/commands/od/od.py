@@ -13,6 +13,8 @@ class OdCommand:
         format_type = "o"  # octal (default)
         address_format = "o"  # octal addresses
         suppress_address = False
+        skip_bytes = 0
+        read_count = -1  # -1 means read all
         files: list[str] = []
 
         i = 0
@@ -34,12 +36,97 @@ class OdCommand:
                 format_type = "d"  # decimal
             elif arg == "-An":
                 suppress_address = True
-            elif arg == "-Ad":
-                address_format = "d"
-            elif arg == "-Ao":
-                address_format = "o"
-            elif arg == "-Ax":
-                address_format = "x"
+            elif arg == "-A":
+                # -A RADIX: address radix
+                if i + 1 < len(args):
+                    i += 1
+                    radix = args[i]
+                    if radix == "n":
+                        suppress_address = True
+                    elif radix in ("d", "o", "x"):
+                        address_format = radix
+                else:
+                    return ExecResult(
+                        stdout="",
+                        stderr="od: option requires an argument -- 'A'\n",
+                        exit_code=1,
+                    )
+            elif arg.startswith("-A") and len(arg) == 3:
+                radix = arg[2]
+                if radix == "n":
+                    suppress_address = True
+                elif radix in ("d", "o", "x"):
+                    address_format = radix
+            elif arg == "-j":
+                # -j BYTES: skip bytes
+                if i + 1 < len(args):
+                    i += 1
+                    try:
+                        skip_bytes = int(args[i])
+                    except ValueError:
+                        return ExecResult(
+                            stdout="",
+                            stderr=f"od: invalid argument '{args[i]}' for skip\n",
+                            exit_code=1,
+                        )
+                else:
+                    return ExecResult(
+                        stdout="",
+                        stderr="od: option requires an argument -- 'j'\n",
+                        exit_code=1,
+                    )
+            elif arg.startswith("-j") and len(arg) > 2:
+                try:
+                    skip_bytes = int(arg[2:])
+                except ValueError:
+                    return ExecResult(
+                        stdout="",
+                        stderr=f"od: invalid argument '{arg[2:]}' for skip\n",
+                        exit_code=1,
+                    )
+            elif arg == "-N":
+                # -N BYTES: read count
+                if i + 1 < len(args):
+                    i += 1
+                    try:
+                        read_count = int(args[i])
+                    except ValueError:
+                        return ExecResult(
+                            stdout="",
+                            stderr=f"od: invalid argument '{args[i]}' for count\n",
+                            exit_code=1,
+                        )
+                else:
+                    return ExecResult(
+                        stdout="",
+                        stderr="od: option requires an argument -- 'N'\n",
+                        exit_code=1,
+                    )
+            elif arg.startswith("-N") and len(arg) > 2:
+                try:
+                    read_count = int(arg[2:])
+                except ValueError:
+                    return ExecResult(
+                        stdout="",
+                        stderr=f"od: invalid argument '{arg[2:]}' for count\n",
+                        exit_code=1,
+                    )
+            elif arg == "-t":
+                # -t TYPE: type specifier follows
+                if i + 1 < len(args):
+                    i += 1
+                    type_spec = args[i]
+                    format_type = self._parse_type_spec(type_spec)
+                else:
+                    return ExecResult(
+                        stdout="",
+                        stderr="od: option requires an argument -- 't'\n",
+                        exit_code=1,
+                    )
+            elif arg.startswith("-t"):
+                # -tTYPE: type specifier attached
+                type_spec = arg[2:]
+                format_type = self._parse_type_spec(type_spec)
             elif arg == "--":
                 files.extend(args[i + 1:])
                 break
@@ -56,6 +143,11 @@ class OdCommand:
         # Read from stdin if no files
         if not files:
             content = ctx.stdin.encode("utf-8", errors="replace")
+            # Apply skip and count
+            if skip_bytes > 0:
+                content = content[skip_bytes:]
+            if read_count >= 0:
+                content = content[:read_count]
             result = self._dump(content, format_type, address_format, suppress_address)
             return ExecResult(stdout=result, stderr="", exit_code=0)
 
@@ -71,6 +163,12 @@ class OdCommand:
                     path = ctx.fs.resolve_path(ctx.cwd, file)
                     content = await ctx.fs.read_file_bytes(path)
 
+                # Apply skip and count
+                if skip_bytes > 0:
+                    content = content[skip_bytes:]
+                if read_count >= 0:
+                    content = content[:read_count]
+
                 result = self._dump(content, format_type, address_format, suppress_address)
                 stdout_parts.append(result)
 
@@ -79,6 +177,22 @@ class OdCommand:
                 exit_code = 1
 
         return ExecResult(stdout="".join(stdout_parts), stderr=stderr, exit_code=exit_code)
+
+    def _parse_type_spec(self, spec: str) -> str:
+        """Parse a -t type specifier."""
+        if not spec:
+            return "o"
+        first_char = spec[0].lower()
+        if first_char == "c":
+            return "c"
+        elif first_char == "x":
+            return "x"
+        elif first_char == "o":
+            return "o"
+        elif first_char == "d" or first_char == "u":
+            return "d"
+        else:
+            return "o"
 
     def _dump(
         self, data: bytes, format_type: str, address_format: str, suppress_address: bool
@@ -101,44 +215,44 @@ class OdCommand:
                 else:
                     parts.append(f"{offset:07o}")
 
-            # Add data
+            # Add data with proper 4-char field formatting
             if format_type == "c":
-                # Character format
+                # Character format: each char in 4-char field
                 chars = []
                 for byte in line_data:
                     if byte == 0:
-                        chars.append("\\0")
+                        chars.append("  \\0")
                     elif byte == 7:
-                        chars.append("\\a")
+                        chars.append("  \\a")
                     elif byte == 8:
-                        chars.append("\\b")
+                        chars.append("  \\b")
                     elif byte == 9:
-                        chars.append("\\t")
+                        chars.append("  \\t")
                     elif byte == 10:
-                        chars.append("\\n")
+                        chars.append("  \\n")
                     elif byte == 11:
-                        chars.append("\\v")
+                        chars.append("  \\v")
                     elif byte == 12:
-                        chars.append("\\f")
+                        chars.append("  \\f")
                     elif byte == 13:
-                        chars.append("\\r")
+                        chars.append("  \\r")
                     elif 32 <= byte <= 126:
-                        chars.append(f"  {chr(byte)}")
+                        chars.append(f"   {chr(byte)}")
                     else:
-                        chars.append(f"{byte:03o}")
-                parts.append(" ".join(chars))
+                        chars.append(f" {byte:03o}")
+                parts.append("".join(chars))
             elif format_type == "x":
-                # Hexadecimal format
-                hex_vals = [f"{byte:02x}" for byte in line_data]
-                parts.append(" ".join(hex_vals))
+                # Hexadecimal format: 4-char fields
+                hex_vals = [f"  {byte:02x}" for byte in line_data]
+                parts.append("".join(hex_vals))
             elif format_type == "d":
-                # Decimal format
-                dec_vals = [f"{byte:3d}" for byte in line_data]
-                parts.append(" ".join(dec_vals))
+                # Decimal format: 4-char fields
+                dec_vals = [f" {byte:3d}" for byte in line_data]
+                parts.append("".join(dec_vals))
             else:
-                # Octal format (default)
-                oct_vals = [f"{byte:03o}" for byte in line_data]
-                parts.append(" ".join(oct_vals))
+                # Octal format (default): 4-char fields
+                oct_vals = [f" {byte:03o}" for byte in line_data]
+                parts.append("".join(oct_vals))
 
             result_lines.append(" ".join(parts))
             offset += bytes_per_line

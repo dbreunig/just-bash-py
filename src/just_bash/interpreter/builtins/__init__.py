@@ -20,6 +20,7 @@ from .let import handle_let
 from .readonly import handle_readonly
 from .shopt import handle_shopt
 from .alias import handle_alias, handle_unalias
+from .getopts import handle_getopts
 from .misc import (
     handle_colon,
     handle_true,
@@ -62,6 +63,7 @@ BUILTINS: dict[str, Callable[["InterpreterContext", list[str]], Awaitable["ExecR
     "shopt": handle_shopt,
     "alias": handle_alias,
     "unalias": handle_unalias,
+    "getopts": handle_getopts,
     ":": handle_colon,
     "true": handle_true,
     "false": handle_false,

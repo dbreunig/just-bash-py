@@ -27,11 +27,9 @@ async def handle_break(ctx: "InterpreterContext", args: list[str]) -> "ExecResul
             if levels < 1:
                 levels = 1
         except ValueError:
-            from ...types import ExecResult
-            return ExecResult(
-                stdout="",
+            raise ExitError(
+                128,
                 stderr=f"bash: break: {args[0]}: numeric argument required\n",
-                exit_code=1,
             )
 
     # Check if we're in a loop
@@ -61,11 +59,9 @@ async def handle_continue(ctx: "InterpreterContext", args: list[str]) -> "ExecRe
             if levels < 1:
                 levels = 1
         except ValueError:
-            from ...types import ExecResult
-            return ExecResult(
-                stdout="",
+            raise ExitError(
+                128,
                 stderr=f"bash: continue: {args[0]}: numeric argument required\n",
-                exit_code=1,
             )
 
     # Check if we're in a loop

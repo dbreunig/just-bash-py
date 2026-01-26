@@ -42,6 +42,7 @@ from ..ast import (
     IfNode,
     IfClause,
     ForNode,
+    CStyleForNode,
     WhileNode,
     UntilNode,
     CaseNode,
@@ -110,6 +111,124 @@ class ParseException(Exception):
         super().__init__(f"{message} at line {line}, column {column}")
 
 
+def _decode_ansi_c_escapes(s: str) -> str:
+    """Decode ANSI-C escape sequences from $'...' strings.
+
+    Supports: \\a \\b \\e \\E \\f \\n \\r \\t \\v \\\\ \\' \\" \\0NNN \\NNN \\xHH \\uNNNN \\UNNNNNNNN
+    """
+    result: list[str] = []
+    i = 0
+    while i < len(s):
+        if s[i] == "\\" and i + 1 < len(s):
+            c = s[i + 1]
+            if c == "a":
+                result.append("\a")
+                i += 2
+            elif c == "b":
+                result.append("\b")
+                i += 2
+            elif c in ("e", "E"):
+                result.append("\x1b")
+                i += 2
+            elif c == "f":
+                result.append("\f")
+                i += 2
+            elif c == "n":
+                result.append("\n")
+                i += 2
+            elif c == "r":
+                result.append("\r")
+                i += 2
+            elif c == "t":
+                result.append("\t")
+                i += 2
+            elif c == "v":
+                result.append("\v")
+                i += 2
+            elif c == "\\":
+                result.append("\\")
+                i += 2
+            elif c == "'":
+                result.append("'")
+                i += 2
+            elif c == '"':
+                result.append('"')
+                i += 2
+            elif c == "x":
+                # Hex escape: \xHH (1-2 hex digits)
+                j = i + 2
+                while j < len(s) and j < i + 4 and s[j] in "0123456789abcdefABCDEF":
+                    j += 1
+                if j > i + 2:
+                    val = int(s[i + 2 : j], 16)
+                    if val == 0:
+                        pass  # NUL bytes are stripped
+                    else:
+                        result.append(chr(val))
+                else:
+                    result.append("\\x")
+                i = j
+            elif c == "u":
+                # Unicode escape: \uNNNN (1-4 hex digits)
+                j = i + 2
+                while j < len(s) and j < i + 6 and s[j] in "0123456789abcdefABCDEF":
+                    j += 1
+                if j > i + 2:
+                    val = int(s[i + 2 : j], 16)
+                    if val == 0:
+                        pass  # NUL bytes are stripped
+                    else:
+                        result.append(chr(val))
+                else:
+                    result.append("\\u")
+                i = j
+            elif c == "U":
+                # Unicode escape: \UNNNNNNNN (1-8 hex digits)
+                j = i + 2
+                while j < len(s) and j < i + 10 and s[j] in "0123456789abcdefABCDEF":
+                    j += 1
+                if j > i + 2:
+                    val = int(s[i + 2 : j], 16)
+                    if val == 0:
+                        pass  # NUL bytes are stripped
+                    else:
+                        result.append(chr(val))
+                else:
+                    result.append("\\U")
+                i = j
+            elif c == "0":
+                # Octal escape: \0NNN (0-3 octal digits after the 0)
+                j = i + 2
+                while j < len(s) and j < i + 5 and s[j] in "01234567":
+                    j += 1
+                val = int(s[i + 1 : j], 8) if j > i + 1 else 0
+                if val == 0:
+                    pass  # NUL bytes are stripped
+                else:
+                    result.append(chr(val))
+                i = j
+            elif c in "1234567":
+                # Octal escape: \NNN (1-3 octal digits)
+                j = i + 1
+                while j < len(s) and j < i + 4 and s[j] in "01234567":
+                    j += 1
+                val = int(s[i + 1 : j], 8)
+                if val == 0:
+                    pass  # NUL bytes are stripped
+                else:
+                    result.append(chr(val))
+                i = j
+            else:
+                # Unknown escape: keep backslash + char
+                result.append("\\")
+                result.append(c)
+                i += 2
+        else:
+            result.append(s[i])
+            i += 1
+    return "".join(result)
+
+
 class Parser:
     """Parser class - transforms tokens into AST."""
 
@@ -118,6 +237,7 @@ class Parser:
         self.pos = 0
         self.pending_heredocs: list[dict] = []
         self.parse_iterations = 0
+        self._consumed_heredoc_positions: set[int] = set()
 
     def _check_iteration_limit(self) -> None:
         """Check parse iteration limit to prevent infinite loops."""
@@ -153,6 +273,7 @@ class Parser:
         self.pos = 0
         self.pending_heredocs = []
         self.parse_iterations = 0
+        self._consumed_heredoc_positions = set()
         return self._parse_script()
 
     def parse_tokens(self, tokens: list[Token]) -> ScriptNode:
@@ -161,6 +282,7 @@ class Parser:
         self.pos = 0
         self.pending_heredocs = []
         self.parse_iterations = 0
+        self._consumed_heredoc_positions = set()
         return self._parse_script()
 
     # =========================================================================
@@ -206,13 +328,21 @@ class Parser:
         return ParseException(message, token.line, token.column, token)
 
     def _skip_newlines(self) -> None:
-        """Skip newlines and comments."""
-        while self._check(TokenType.NEWLINE, TokenType.COMMENT):
+        """Skip newlines, comments, and consumed heredoc content."""
+        while True:
             if self._check(TokenType.NEWLINE):
                 self._advance()
                 self._process_heredocs()
-            else:
+                continue
+            if self._check(TokenType.COMMENT):
                 self._advance()
+                continue
+            # Skip heredoc content tokens already consumed by scan-ahead resolution
+            if (self._check(TokenType.HEREDOC_CONTENT)
+                    and self.pos in self._consumed_heredoc_positions):
+                self._advance()
+                continue
+            break
 
     def _skip_separators(self) -> None:
         """Skip statement separators (newlines, semicolons, comments)."""
@@ -222,6 +352,11 @@ class Parser:
                 self._process_heredocs()
                 continue
             if self._check(TokenType.SEMICOLON, TokenType.COMMENT):
+                self._advance()
+                continue
+            # Skip heredoc content tokens already consumed by scan-ahead resolution
+            if (self._check(TokenType.HEREDOC_CONTENT)
+                    and self.pos in self._consumed_heredoc_positions):
                 self._advance()
                 continue
             break
@@ -299,30 +434,36 @@ class Parser:
     def _resolve_pending_heredocs(
         self, redirections: list[RedirectionNode]
     ) -> list[RedirectionNode]:
-        """Resolve pending heredocs by reading their content and updating redirections."""
+        """Resolve pending heredocs by reading their content and updating redirections.
+
+        Scans ahead in the token stream without moving the parser position,
+        so this works even when called before the full pipeline is parsed
+        (e.g., for 'cat << EOF | grep hello').
+        """
         if not self.pending_heredocs:
             return redirections
 
-        # We need to skip past the current line to find heredoc content
-        # Save position and scan for heredoc content
-        saved_pos = self.pos
+        # Scan ahead to find HEREDOC_CONTENT tokens without moving self.pos
+        # They may be past pipes, semicolons, etc. on the same line
+        # Skip positions already consumed by earlier resolutions
+        content_tokens = []
+        content_positions = []
+        scan_pos = self.pos
+        while scan_pos < len(self.tokens) and len(content_tokens) < len(self.pending_heredocs):
+            if (self.tokens[scan_pos].type == TokenType.HEREDOC_CONTENT
+                    and scan_pos not in self._consumed_heredoc_positions):
+                content_tokens.append(self.tokens[scan_pos])
+                content_positions.append(scan_pos)
+            scan_pos += 1
 
-        # Skip to find HEREDOC_CONTENT tokens (they come after newline)
-        while self.pos < len(self.tokens):
-            token = self.tokens[self.pos]
-            if token.type == TokenType.HEREDOC_CONTENT:
-                break
-            elif token.type == TokenType.NEWLINE:
-                self.pos += 1
-            else:
-                break
+        # Mark these positions as consumed
+        self._consumed_heredoc_positions.update(content_positions)
 
         # Process each pending heredoc
         new_redirections = list(redirections)
-        heredoc_idx = 0
-        for heredoc_info in self.pending_heredocs:
-            if self._check(TokenType.HEREDOC_CONTENT):
-                content_token = self._advance()
+        for idx, heredoc_info in enumerate(self.pending_heredocs):
+            if idx < len(content_tokens):
+                content_token = content_tokens[idx]
                 # If delimiter was quoted, treat content as literal (no expansion)
                 content_word = self._parse_word_from_string(
                     content_token.value,
@@ -347,7 +488,6 @@ class Parser:
                                 redir.operator, heredoc_node, redir.fd
                             )
                             break
-                heredoc_idx += 1
 
         self.pending_heredocs = []
         return new_redirections
@@ -363,6 +503,13 @@ class Parser:
 
         while not self._check(TokenType.EOF):
             self._check_iteration_limit()
+
+            # Skip heredoc content tokens already consumed by scan-ahead resolution
+            if (self._check(TokenType.HEREDOC_CONTENT)
+                    and self.pos in self._consumed_heredoc_positions):
+                self._advance()
+                continue
+
             stmt = self._parse_statement()
             if stmt:
                 statements.append(stmt)
@@ -473,6 +620,7 @@ class Parser:
         name: Optional[WordNode] = None
         args: list[WordNode] = []
         redirections: list[RedirectionNode] = []
+        start_line = self._current().line
 
         # Parse leading redirections and assignments
         while True:
@@ -578,7 +726,7 @@ class Parser:
         if self.pending_heredocs:
             redirections = self._resolve_pending_heredocs(redirections)
 
-        return AST.simple_command(name, args, assignments, redirections)
+        return AST.simple_command(name, args, assignments, redirections, line=start_line)
 
     def _parse_assignment(self) -> AssignmentNode:
         """Parse a variable assignment."""
@@ -605,12 +753,12 @@ class Parser:
         if value_str.startswith("("):
             # TODO: Parse array assignment
             # For now, treat as simple value
-            value_word = self._parse_word_from_string(value_str, quoted=False)
+            value_word = self._parse_word_from_string(value_str, quoted=False, in_assignment=True)
             return AST.assignment(name, value_word, append)
 
         # Simple value
         if value_str:
-            value_word = self._parse_word_from_string(value_str, quoted=False)
+            value_word = self._parse_word_from_string(value_str, quoted=False, in_assignment=True)
         else:
             value_word = None
 
@@ -732,6 +880,16 @@ class Parser:
             delimiter = delimiter[1:-1]
             quoted = True
 
+        # Check for embedded quotes (e.g., E'O'F or E"O"F)
+        if not quoted and ("'" in delimiter or '"' in delimiter):
+            delimiter = delimiter.replace("'", "").replace('"', "")
+            quoted = True
+
+        # Check for backslash-escaped delimiter (e.g., \EOF)
+        # The lexer removes backslashes, so the token span is longer than the value
+        if not quoted and (delim_token.end - delim_token.start) > len(delimiter):
+            quoted = True
+
         # Create placeholder target (will be filled when heredoc content is read)
         placeholder = AST.word([AST.literal("")])
 
@@ -834,10 +992,14 @@ class Parser:
 
         return AST.if_node(clauses, else_body, redirections)
 
-    def _parse_for(self) -> ForNode:
-        """Parse a for loop."""
+    def _parse_for(self) -> "ForNode | CStyleForNode":
+        """Parse a for loop (standard or C-style)."""
         self._expect(TokenType.FOR)
         self._skip_newlines()
+
+        # Check for C-style for: for (( ... ))
+        if self._check(TokenType.DPAREN_START):
+            return self._parse_c_style_for()
 
         # Get variable name
         if not self._check(TokenType.NAME, TokenType.WORD):
@@ -883,6 +1045,98 @@ class Parser:
             redirections.append(redir)
 
         return AST.for_node(variable, words, body, redirections)
+
+    def _parse_c_style_for(self) -> CStyleForNode:
+        """Parse a C-style for loop: for (( init; cond; update )); do body; done."""
+        line = self._current().line
+        self._expect(TokenType.DPAREN_START)
+
+        # Collect everything between (( and )) as raw text
+        expr_text = ""
+        depth = 1
+
+        while depth > 0 and not self._check(TokenType.EOF):
+            if self._check(TokenType.DPAREN_START):
+                depth += 1
+                expr_text += "(("
+                self._advance()
+            elif self._check(TokenType.DPAREN_END):
+                depth -= 1
+                if depth > 0:
+                    expr_text += "))"
+                self._advance()
+            elif self._check(TokenType.LPAREN):
+                expr_text += "("
+                self._advance()
+            elif self._check(TokenType.RPAREN):
+                expr_text += ")"
+                self._advance()
+            else:
+                expr_text += self._current().value
+                self._advance()
+
+        # Split on semicolons to get init, condition, update
+        parts = expr_text.split(";")
+        init_text = parts[0].strip() if len(parts) > 0 else ""
+        cond_text = parts[1].strip() if len(parts) > 1 else ""
+        update_text = parts[2].strip() if len(parts) > 2 else ""
+
+        # Parse each part as an arithmetic expression
+        init_node = None
+        cond_node = None
+        update_node = None
+
+        if init_text:
+            try:
+                init_node = ArithmeticExpressionNode(
+                    expression=self._parse_arithmetic_expression(init_text)
+                )
+            except Exception:
+                pass
+
+        if cond_text:
+            try:
+                cond_node = ArithmeticExpressionNode(
+                    expression=self._parse_arithmetic_expression(cond_text)
+                )
+            except Exception:
+                pass
+
+        if update_text:
+            try:
+                update_node = ArithmeticExpressionNode(
+                    expression=self._parse_arithmetic_expression(update_text)
+                )
+            except Exception:
+                pass
+
+        # Skip to 'do'
+        self._skip_separators()
+        self._expect(TokenType.DO, "Expected 'do' in for loop")
+        self._skip_newlines()
+
+        # Parse body
+        body = self._parse_compound_list()
+
+        self._skip_newlines()
+        self._expect(TokenType.DONE, "Expected 'done' to close for loop")
+
+        # Parse optional redirections
+        redirections: list[RedirectionNode] = []
+        while True:
+            redir = self._try_parse_redirection()
+            if not redir:
+                break
+            redirections.append(redir)
+
+        return CStyleForNode(
+            init=init_node,
+            condition=cond_node,
+            update=update_node,
+            body=tuple(body),
+            redirections=tuple(redirections),
+            line=line,
+        )
 
     def _parse_while(self) -> WhileNode:
         """Parse a while loop."""
@@ -1030,7 +1284,21 @@ class Parser:
         body = self._parse_compound_list()
 
         self._skip_newlines()
-        self._expect(TokenType.RPAREN, "Expected ')' to close subshell")
+        # Handle )) being tokenized as DPAREN_END instead of two RPARENs
+        if self._check(TokenType.DPAREN_END):
+            tok = self._advance()
+            # Insert a synthetic RPAREN token for the outer parser
+            synthetic = Token(
+                type=TokenType.RPAREN,
+                value=")",
+                start=tok.start + 1,
+                end=tok.end,
+                line=tok.line,
+                column=tok.column + 1,
+            )
+            self.tokens.insert(self.pos, synthetic)
+        else:
+            self._expect(TokenType.RPAREN, "Expected ')' to close subshell")
 
         # Parse optional redirections
         redirections: list[RedirectionNode] = []
@@ -1358,24 +1626,47 @@ class Parser:
     def _parse_word(self) -> WordNode:
         """Parse a word token into a WordNode with parts."""
         token = self._advance()
+        # Use segments for mixed-quoting words (e.g., "pre"{a,b}"suf")
+        if token.segments:
+            return self._parse_word_from_segments(token.segments)
         return self._parse_word_from_string(
             token.value,
             quoted=token.quoted,
             single_quoted=token.single_quoted,
         )
 
-    def _parse_word_from_string(self, value: str, quoted: bool = False, single_quoted: bool = False) -> WordNode:
+    def _parse_word_from_segments(self, segments: list[tuple[str, str]]) -> WordNode:
+        """Parse a word from lexer segments with mixed quoting.
+
+        Each segment is (text, mode) where mode is 'unquoted', 'double', or 'single'.
+        """
+        all_parts: list = []
+        for text, mode in segments:
+            if mode == "single":
+                all_parts.append(SingleQuotedPart(value=text))
+            elif mode == "double":
+                inner_parts = self._parse_word_parts(text, quoted=True)
+                all_parts.append(DoubleQuotedPart(parts=tuple(inner_parts)))
+            else:  # unquoted
+                inner_parts = self._parse_word_parts(text, quoted=False)
+                all_parts.extend(inner_parts)
+        return AST.word(all_parts)
+
+    def _parse_word_from_string(self, value: str, quoted: bool = False, single_quoted: bool = False, in_assignment: bool = False) -> WordNode:
         """Parse a string into a WordNode with appropriate parts."""
-        parts = self._parse_word_parts(value, quoted, single_quoted)
+        parts = self._parse_word_parts(value, quoted, single_quoted, in_assignment=in_assignment)
         # Wrap double-quoted content in DoubleQuotedPart to preserve quote context
         if quoted and not single_quoted:
             return AST.word([DoubleQuotedPart(parts=tuple(parts))])
         # Wrap single-quoted content in SingleQuotedPart
-        if single_quoted and len(parts) == 1 and isinstance(parts[0], LiteralPart):
-            return AST.word([SingleQuotedPart(value=parts[0].value)])
+        if single_quoted:
+            if len(parts) == 1 and isinstance(parts[0], LiteralPart):
+                return AST.word([SingleQuotedPart(value=parts[0].value)])
+            elif len(parts) == 0:
+                return AST.word([SingleQuotedPart(value="")])
         return AST.word(parts)
 
-    def _parse_word_parts(self, value: str, quoted: bool = False, single_quoted: bool = False) -> list[WordPart]:
+    def _parse_word_parts(self, value: str, quoted: bool = False, single_quoted: bool = False, in_assignment: bool = False) -> list[WordPart]:
         """Parse word parts from a string value."""
         # Single-quoted strings are completely literal - no expansions
         if single_quoted:
@@ -1477,6 +1768,24 @@ class Parser:
                 i = j
                 continue
 
+            # Handle $'...' ANSI-C quoting
+            if c == "$" and i + 1 < len(value) and value[i + 1] == "'" and not quoted:
+                flush_literal()
+                # Find closing single quote, respecting backslash escapes
+                j = i + 2
+                while j < len(value):
+                    if value[j] == "\\" and j + 1 < len(value):
+                        j += 2  # Skip escaped character
+                    elif value[j] == "'":
+                        break
+                    else:
+                        j += 1
+                raw_content = value[i + 2 : j]
+                decoded = _decode_ansi_c_escapes(raw_content)
+                parts.append(SingleQuotedPart(value=decoded))
+                i = j + 1 if j < len(value) else j
+                continue
+
             # Handle simple $VAR expansion
             if c == "$" and i + 1 < len(value):
                 next_c = value[i + 1]
@@ -1573,19 +1882,24 @@ class Parser:
                 i += 1
                 continue
 
-            # Handle tilde expansion at start
-            if c == "~" and i == 0 and not quoted:
+            # Handle tilde expansion at start or after : in assignments
+            if c == "~" and not quoted and (i == 0 or (in_assignment and i > 0 and value[i - 1] == ":")):
                 flush_literal()
-                # Check for ~user
-                j = 1
-                while j < len(value) and (value[j].isalnum() or value[j] == "_"):
-                    j += 1
-                if j > 1:
-                    user = value[1:j]
-                    parts.append(TildeExpansionPart(user=user))
+                # Check for ~user, ~+, ~-
+                j = i + 1
+                if j < len(value) and value[j] in "+-":
+                    # ~+ or ~-
+                    parts.append(TildeExpansionPart(user=value[j]))
+                    i = j + 1
                 else:
-                    parts.append(TildeExpansionPart(user=None))
-                i = j
+                    while j < len(value) and (value[j].isalnum() or value[j] == "_"):
+                        j += 1
+                    if j > i + 1:
+                        user = value[i + 1:j]
+                        parts.append(TildeExpansionPart(user=user))
+                    else:
+                        parts.append(TildeExpansionPart(user=None))
+                    i = j
                 continue
 
             # Handle escape sequences (only in unquoted context - lexer already handled quoted escapes)
@@ -1642,6 +1956,16 @@ class Parser:
             # Regular variable name
             while i < len(content) and (content[i].isalnum() or content[i] == "_"):
                 i += 1
+            # Handle array subscript: name[subscript]
+            if i < len(content) and content[i] == "[":
+                bracket_depth = 1
+                i += 1
+                while i < len(content) and bracket_depth > 0:
+                    if content[i] == "[":
+                        bracket_depth += 1
+                    elif content[i] == "]":
+                        bracket_depth -= 1
+                    i += 1
             param = content[:i]
 
         # If no operation follows, return simple expansion
@@ -1754,6 +2078,7 @@ class Parser:
             )
 
         # Handle pattern replacement ${VAR/pattern/replacement} ${VAR//pattern/replacement}
+        # Also handle anchored patterns: ${VAR/#pattern/repl} (start) ${VAR/%pattern/repl} (end)
         if rest.startswith("//"):
             slash_pos = rest.find("/", 2)
             if slash_pos >= 0:
@@ -1765,7 +2090,37 @@ class Parser:
             return ParameterExpansionPart(
                 parameter=param,
                 operation=PatternReplacementOp(
-                    pattern=pattern, replacement=replacement, replace_all=True
+                    pattern=pattern, replacement=replacement, all=True
+                ),
+            )
+        if rest.startswith("/#"):
+            # Anchored at start (prefix)
+            slash_pos = rest.find("/", 2)
+            if slash_pos >= 0:
+                pattern = self._parse_word_from_string(rest[2:slash_pos])
+                replacement = self._parse_word_from_string(rest[slash_pos + 1:])
+            else:
+                pattern = self._parse_word_from_string(rest[2:])
+                replacement = self._parse_word_from_string("")
+            return ParameterExpansionPart(
+                parameter=param,
+                operation=PatternReplacementOp(
+                    pattern=pattern, replacement=replacement, all=False, anchor="start"
+                ),
+            )
+        if rest.startswith("/%"):
+            # Anchored at end (suffix)
+            slash_pos = rest.find("/", 2)
+            if slash_pos >= 0:
+                pattern = self._parse_word_from_string(rest[2:slash_pos])
+                replacement = self._parse_word_from_string(rest[slash_pos + 1:])
+            else:
+                pattern = self._parse_word_from_string(rest[2:])
+                replacement = self._parse_word_from_string("")
+            return ParameterExpansionPart(
+                parameter=param,
+                operation=PatternReplacementOp(
+                    pattern=pattern, replacement=replacement, all=False, anchor="end"
                 ),
             )
         if rest.startswith("/"):
@@ -1779,7 +2134,7 @@ class Parser:
             return ParameterExpansionPart(
                 parameter=param,
                 operation=PatternReplacementOp(
-                    pattern=pattern, replacement=replacement, replace_all=False
+                    pattern=pattern, replacement=replacement, all=False
                 ),
             )
 
@@ -1974,6 +2329,10 @@ class Parser:
         ops = sorted(operators, key=len, reverse=True)
         exclude = exclude or []
 
+        # Characters that indicate the preceding context is an operator (not a value)
+        # Used to distinguish binary +/- from unary +/-
+        _op_chars = frozenset('+-*/%=<>!&|^~(,?:')
+
         # Scan for operator (right-to-left for left-assoc, left-to-right for right-assoc)
         positions = []
         i = 0
@@ -1999,6 +2358,20 @@ class Parser:
                 matched = False
                 for op in ops:
                     if expr[i:i+len(op)] == op:
+                        # For single-char + or -, check if this is a binary or unary operator.
+                        # It's unary if preceded by nothing or by an operator character.
+                        if op in ('+', '-') and len(op) == 1:
+                            # Find the last non-whitespace char before this position
+                            prev_nonws = ''
+                            for k in range(i - 1, -1, -1):
+                                if expr[k] not in ' \t':
+                                    prev_nonws = expr[k]
+                                    break
+                            if not prev_nonws or prev_nonws in _op_chars:
+                                # This is a unary operator, not binary - skip it
+                                i += 1
+                                matched = True
+                                break
                         positions.append((i, op))
                         matched = True
                         i += len(op)
@@ -2067,11 +2440,7 @@ class Parser:
         # Parenthesized expression
         if expr.startswith('(') and expr.endswith(')'):
             inner = expr[1:-1].strip()
-            return ArithGroupNode(expression=self._parse_arith_ternary(inner))
-
-        # Number
-        if expr.isdigit() or (expr.startswith('-') and expr[1:].isdigit()):
-            return ArithNumberNode(value=int(expr))
+            return ArithGroupNode(expression=self._parse_arith_comma(inner))
 
         # Hex number
         if expr.startswith('0x') or expr.startswith('0X'):
@@ -2080,12 +2449,16 @@ class Parser:
             except ValueError:
                 pass
 
-        # Octal number
+        # Octal number (starts with 0, more than one digit)
         if expr.startswith('0') and len(expr) > 1 and expr[1:].isdigit():
             try:
                 return ArithNumberNode(value=int(expr, 8))
             except ValueError:
                 pass
+
+        # Number
+        if expr.isdigit() or (expr.startswith('-') and expr[1:].isdigit()):
+            return ArithNumberNode(value=int(expr))
 
         # Base N constant: base#value (e.g., 2#101, 16#ff, 36#z)
         base_match = re.match(r'^(\d+)#([a-zA-Z0-9@_]+)$', expr)

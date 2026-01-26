@@ -19,5 +19,35 @@ class PwdCommand:
 
     async def execute(self, args: list[str], ctx: CommandContext) -> ExecResult:
         """Execute the pwd command."""
-        # For now, just return cwd (ignore -L/-P options in virtual fs)
-        return ExecResult(stdout=f"{ctx.cwd}\n", stderr="", exit_code=0)
+        physical = False
+
+        # Parse arguments
+        for arg in args:
+            if arg == "-P":
+                physical = True
+            elif arg == "-L":
+                physical = False
+            elif arg.startswith("-"):
+                # Check for combined flags like -LP or -PL
+                for c in arg[1:]:
+                    if c == "P":
+                        physical = True
+                    elif c == "L":
+                        physical = False
+                    else:
+                        return ExecResult(
+                            stdout="",
+                            stderr=f"pwd: invalid option -- '{c}'\n",
+                            exit_code=1,
+                        )
+
+        if physical:
+            # Resolve symlinks in cwd
+            try:
+                resolved = await ctx.fs.realpath(ctx.cwd)
+                return ExecResult(stdout=f"{resolved}\n", stderr="", exit_code=0)
+            except (FileNotFoundError, OSError):
+                return ExecResult(stdout=f"{ctx.cwd}\n", stderr="", exit_code=0)
+        else:
+            # Return logical path (cwd as-is)
+            return ExecResult(stdout=f"{ctx.cwd}\n", stderr="", exit_code=0)

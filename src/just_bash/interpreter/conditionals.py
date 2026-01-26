@@ -164,9 +164,17 @@ def compare_strings(op: str, left: str, right: str, allow_pattern: bool = False)
 def match_pattern(value: str, pattern: str) -> bool:
     """Match a value against a glob-style pattern.
 
-    Converts glob pattern to regex for matching.
+    Supports standard globs and extended glob patterns.
     """
-    # Use fnmatch for glob-style matching
+    import re as _re
+    # Use regex for extglob patterns, fnmatch for standard globs
+    if _re.search(r'[@?*+!]\(', pattern):
+        from .expansion import glob_to_regex
+        regex_pat = "^" + glob_to_regex(pattern) + "$"
+        try:
+            return bool(_re.match(regex_pat, value))
+        except _re.error:
+            pass
     return fnmatch.fnmatch(value, pattern)
 
 

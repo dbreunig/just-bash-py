@@ -609,6 +609,28 @@ class InMemoryFs:
 
         return entry.target
 
+    async def utimes(self, path: str, atime: float, mtime: float) -> None:
+        """Set access and modification times for a file."""
+        resolved = self._resolve_path_with_symlinks(path)
+        entry = self._data.get(resolved)
+        if entry is None:
+            raise FileNotFoundError(f"No such file or directory: {path}")
+        # Update mtime (we only track mtime, atime is ignored)
+        if entry.type == "file":
+            self._data[resolved] = FileEntry(
+                content=entry.content, mode=entry.mode, mtime=mtime
+            )
+        elif entry.type == "directory":
+            self._data[resolved] = DirectoryEntry(mode=entry.mode, mtime=mtime)
+        elif entry.type == "symlink":
+            self._data[resolved] = SymlinkEntry(
+                target=entry.target, mode=entry.mode, mtime=mtime
+            )
+
+    async def realpath(self, path: str) -> str:
+        """Resolve path to absolute canonical path (resolve all symlinks)."""
+        return self._resolve_path_with_symlinks(path)
+
     def resolve_path(self, base: str, path: str) -> str:
         """Resolve a path relative to a base."""
         if path.startswith("/"):

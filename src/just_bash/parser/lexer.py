@@ -116,7 +116,7 @@ RESERVED_WORDS: dict[str, TokenType] = {
     "in": TokenType.IN,
     "function": TokenType.FUNCTION,
     "select": TokenType.SELECT,
-    "time": TokenType.TIME,
+    # "time" is handled as a regular command, not a reserved keyword
     "coproc": TokenType.COPROC,
 }
 
@@ -133,6 +133,7 @@ class Token:
     column: int
     quoted: bool = False
     single_quoted: bool = False
+    segments: list | None = None  # list of (text, mode) tuples for mixed quoting
 
 
 @dataclass
@@ -458,9 +459,17 @@ class Lexer:
             pos += 1
 
         # If we consumed characters and hit a simple delimiter
+        _use_fast_path = False
         if pos > fast_start:
             c = input_text[pos] if pos < input_len else ""
             if c == "" or c in WORD_BREAK_CHARS:
+                # Don't use fast path if we're at an extglob pattern: @( ?( *( +( !(
+                if c == "(" and pos > fast_start and input_text[pos - 1] in "@?*+!":
+                    _use_fast_path = False  # Fall through to slow path
+                else:
+                    _use_fast_path = True
+
+        if _use_fast_path:
                 value = input_text[fast_start:pos]
                 self.pos = pos
                 self.column = column + (pos - fast_start)
@@ -535,12 +544,34 @@ class Lexer:
         in_double_quote = False
         starts_with_quote = input_text[pos] in "\"'" if pos < input_len else False
 
+        # Segment boundary tracking for mixed quoting (e.g., "pre"{a,b}"suf")
+        # Records (value_offset, mode) at each quoting transition
+        seg_boundaries: list[tuple[int, str]] = []
+        seg_mode = "unquoted"
+
         while pos < input_len:
             char = input_text[pos]
 
             # Check for word boundaries
             if not in_single_quote and not in_double_quote:
                 if char in WORD_BREAK_CHARS:
+                    # Handle extglob patterns: @( ?( *( +( !(
+                    if char == "(" and value and value[-1] in "@?*+!":
+                        # Read balanced paren group as part of word
+                        value += char
+                        pos += 1
+                        col += 1
+                        depth = 1
+                        while pos < input_len and depth > 0:
+                            ec = input_text[pos]
+                            if ec == "(":
+                                depth += 1
+                            elif ec == ")":
+                                depth -= 1
+                            value += ec
+                            pos += 1
+                            col += 1
+                        continue
                     break
 
             # Handle $'' ANSI-C quoting
@@ -592,13 +623,20 @@ class Lexer:
             if char == "'" and not in_double_quote:
                 if in_single_quote:
                     in_single_quote = False
-                    if not starts_with_quote:
+                    if starts_with_quote:
+                        # Record transition: single → unquoted
+                        seg_boundaries.append((len(value), seg_mode))
+                        seg_mode = "unquoted"
+                    else:
                         value += char
                 else:
                     in_single_quote = True
                     if starts_with_quote:
                         single_quoted = True
                         quoted = True
+                        # Record transition: current → single
+                        seg_boundaries.append((len(value), seg_mode))
+                        seg_mode = "single"
                     else:
                         value += char
                 pos += 1
@@ -608,12 +646,19 @@ class Lexer:
             if char == '"' and not in_single_quote:
                 if in_double_quote:
                     in_double_quote = False
-                    if not starts_with_quote:
+                    if starts_with_quote:
+                        # Record transition: double → unquoted
+                        seg_boundaries.append((len(value), seg_mode))
+                        seg_mode = "unquoted"
+                    else:
                         value += char
                 else:
                     in_double_quote = True
                     if starts_with_quote:
                         quoted = True
+                        # Record transition: current → double
+                        seg_boundaries.append((len(value), seg_mode))
+                        seg_mode = "double"
                     else:
                         value += char
                 pos += 1
@@ -641,7 +686,9 @@ class Lexer:
                         continue
                 else:
                     # Outside quotes, backslash escapes next character
-                    if next_char in "\"'":
+                    if next_char in "\"'{}":
+                        # Preserve backslash for quotes and braces so parser
+                        # can create EscapedPart (prevents brace expansion)
                         value += char + next_char
                     else:
                         value += next_char
@@ -797,6 +844,24 @@ class Lexer:
                     column=column,
                 )
 
+        # Build segments from boundaries if we had quoting transitions
+        final_segments = None
+        if seg_boundaries:
+            final_segments = []
+            prev_offset = 0
+            for offset, mode in seg_boundaries:
+                text = value[prev_offset:offset]
+                if text:
+                    final_segments.append((text, mode))
+                prev_offset = offset
+            # Add final segment
+            final_text = value[prev_offset:]
+            if final_text:
+                final_segments.append((final_text, seg_mode))
+            # Only use segments if there are multiple (mixed quoting)
+            if len(final_segments) <= 1:
+                final_segments = None
+
         return Token(
             type=TokenType.WORD,
             value=value,
@@ -806,6 +871,7 @@ class Lexer:
             column=column,
             quoted=quoted,
             single_quoted=single_quoted,
+            segments=final_segments,
         )
 
     def _register_heredoc_from_lookahead(self, strip_tabs: bool) -> None:
@@ -842,13 +908,15 @@ class Lexer:
 
             if in_single_quote:
                 if c == "'":
+                    in_single_quote = False
                     pos += 1
-                    break
+                    continue
                 delimiter += c
             elif in_double_quote:
                 if c == '"':
+                    in_double_quote = False
                     pos += 1
-                    break
+                    continue
                 delimiter += c
             else:
                 if c in " \t\n;|&<>()":
@@ -858,6 +926,17 @@ class Lexer:
                     delimiter += input_text[pos + 1]
                     pos += 2
                     quoted = True  # Backslash makes it quoted
+                    continue
+                # Handle embedded quotes (e.g., E'O'F)
+                if c == "'":
+                    in_single_quote = True
+                    quoted = True
+                    pos += 1
+                    continue
+                if c == '"':
+                    in_double_quote = True
+                    quoted = True
+                    pos += 1
                     continue
                 delimiter += c
 

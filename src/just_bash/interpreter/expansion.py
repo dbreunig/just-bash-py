@@ -51,9 +51,25 @@ def get_variable(ctx: "InterpreterContext", name: str, check_nounset: bool = Tru
         # Handle arr[@] and arr[*] - all elements
         if subscript in ("@", "*"):
             elements = get_array_elements(ctx, arr_name)
+            if subscript == "*":
+                # $* / ${arr[*]} joins with first char of IFS
+                ifs = env.get("IFS", " \t\n")
+                sep = ifs[0] if ifs else ""
+                return sep.join(val for _, val in elements)
             return " ".join(val for _, val in elements)
 
-        # Handle numeric or variable subscript
+        # Check if this is an associative array
+        is_assoc = env.get(f"{arr_name}__is_array") == "assoc"
+        if is_assoc:
+            # For associative arrays, use subscript as string key directly
+            key = f"{arr_name}_{subscript}"
+            if key in env:
+                return env[key]
+            elif check_nounset and ctx.state.options.nounset:
+                raise NounsetError(name)
+            return ""
+
+        # Handle numeric or variable subscript for indexed arrays
         try:
             # Try to evaluate subscript as arithmetic expression
             idx = _eval_array_subscript(ctx, subscript)
@@ -82,14 +98,24 @@ def get_variable(ctx: "InterpreterContext", name: str, check_nounset: bool = Tru
         while str(count + 1) in env:
             count += 1
         return str(count)
-    elif name == "@" or name == "*":
-        # All positional parameters
+    elif name == "@":
+        # All positional parameters (space-separated for unquoted)
         params = []
         i = 1
         while str(i) in env:
             params.append(env[str(i)])
             i += 1
         return " ".join(params)
+    elif name == "*":
+        # All positional parameters (joined with first char of IFS)
+        params = []
+        i = 1
+        while str(i) in env:
+            params.append(env[str(i)])
+            i += 1
+        ifs = env.get("IFS", " \t\n")
+        sep = ifs[0] if ifs else ""
+        return sep.join(params)
     elif name == "0":
         return env.get("0", "bash")
     elif name == "$":
@@ -99,39 +125,43 @@ def get_variable(ctx: "InterpreterContext", name: str, check_nounset: bool = Tru
     elif name == "_":
         return ctx.state.last_arg
     elif name == "LINENO":
-        return str(ctx.state.current_line)
+        return str(ctx.state.current_line or 1)
     elif name == "RANDOM":
-        import random
-        return str(random.randint(0, 32767))
+        import random as _random
+        # Check if RANDOM has been assigned (seed value)
+        seed_val = env.get("RANDOM")
+        if seed_val is not None:
+            try:
+                seed = int(seed_val)
+                ctx.state.random_generator = _random.Random(seed)
+            except ValueError:
+                pass
+            # Remove seed from env so it doesn't re-seed on next read
+            del env["RANDOM"]
+        # Use seeded generator if available, else global random
+        if ctx.state.random_generator is not None:
+            return str(ctx.state.random_generator.randint(0, 32767))
+        return str(_random.randint(0, 32767))
     elif name == "SECONDS":
         import time
+        # Check if SECONDS was reset (seconds_reset_time is set)
+        if hasattr(ctx.state, 'seconds_reset_time') and ctx.state.seconds_reset_time is not None:
+            return str(int(time.time() - ctx.state.seconds_reset_time))
         return str(int(time.time() - ctx.state.start_time))
-
-    # Check for array subscript: arr[idx]
-    array_match = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\[(.+)\]$', name)
-    if array_match:
-        array_name, subscript = array_match.groups()
-        if subscript == "@" or subscript == "*":
-            # Get all array elements
-            elements = get_array_elements(ctx, array_name)
-            return " ".join(v for _, v in elements)
-        else:
-            # Single element
-            try:
-                idx = int(subscript)
-            except ValueError:
-                # Try to evaluate as variable
-                idx_val = env.get(subscript, "0")
-                try:
-                    idx = int(idx_val)
-                except ValueError:
-                    idx = 0
-            return env.get(f"{array_name}_{idx}", "")
+    elif name == "SHLVL":
+        return env.get("SHLVL", "1")
+    elif name == "BASH_VERSION":
+        return env.get("BASH_VERSION", "5.0.0(1)-release")
+    elif name == "BASHPID":
+        return str(env.get("$", "1"))
 
     # Regular variable
     value = env.get(name)
 
     if value is None:
+        # Check if this is an array name without subscript - return element 0
+        if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', name) and f"{name}__is_array" in env:
+            return env.get(f"{name}_0", "")
         # Check nounset (set -u)
         if check_nounset and ctx.state.options.nounset:
             raise NounsetError(name, "", f"bash: {name}: unbound variable\n")
@@ -141,22 +171,34 @@ def get_variable(ctx: "InterpreterContext", name: str, check_nounset: bool = Tru
 
 
 def get_array_elements(ctx: "InterpreterContext", name: str) -> list[tuple[int, str]]:
-    """Get all elements of an array as (index, value) pairs."""
+    """Get all elements of an array as (index, value) pairs.
+
+    For associative arrays, the index is a synthetic sequential number.
+    Use get_array_elements_raw() for the actual key-value pairs.
+    """
     elements = []
     env = ctx.state.env
+    is_assoc = env.get(f"{name}__is_array") == "assoc"
 
-    # Look for name_0, name_1, etc.
+    # Look for name_KEY entries
     prefix = f"{name}_"
     for key, value in env.items():
-        if key.startswith(prefix) and not key.endswith("__length"):
-            try:
-                idx = int(key[len(prefix):])
-                elements.append((idx, value))
-            except ValueError:
-                pass
+        if key.startswith(prefix) and not key.startswith(f"{name}__"):
+            idx_part = key[len(prefix):]
+            if is_assoc:
+                # For assoc arrays, use synthetic index
+                elements.append((len(elements), value))
+            else:
+                try:
+                    idx = int(idx_part)
+                    elements.append((idx, value))
+                except ValueError:
+                    # Non-numeric key in indexed array context - skip
+                    pass
 
-    # Sort by index
-    elements.sort(key=lambda x: x[0])
+    # Sort by index for indexed arrays
+    if not is_assoc:
+        elements.sort(key=lambda x: x[0])
     return elements
 
 
@@ -319,6 +361,10 @@ def expand_part_sync(ctx: "InterpreterContext", part: WordPart, in_double_quotes
             return "~" if part.user is None else f"~{part.user}"
         if part.user is None:
             return ctx.state.env.get("HOME", "/home/user")
+        elif part.user == "+":
+            return ctx.state.env.get("PWD", ctx.state.cwd)
+        elif part.user == "-":
+            return ctx.state.env.get("OLDPWD", "")
         elif part.user == "root":
             return "/root"
         else:
@@ -329,7 +375,10 @@ def expand_part_sync(ctx: "InterpreterContext", part: WordPart, in_double_quotes
         # Evaluate arithmetic synchronously
         # Unwrap ArithmeticExpressionNode to get the actual ArithExpr
         expr = part.expression.expression if part.expression else None
-        return str(evaluate_arithmetic_sync(ctx, expr))
+        try:
+            return str(evaluate_arithmetic_sync(ctx, expr))
+        except (ValueError, ZeroDivisionError) as e:
+            raise ExitError(1, "", f"bash: {e}\n")
     elif isinstance(part, BraceExpansionPart):
         # Expand brace items
         results = []
@@ -367,6 +416,10 @@ async def expand_part(ctx: "InterpreterContext", part: WordPart, in_double_quote
             return "~" if part.user is None else f"~{part.user}"
         if part.user is None:
             return ctx.state.env.get("HOME", "/home/user")
+        elif part.user == "+":
+            return ctx.state.env.get("PWD", ctx.state.cwd)
+        elif part.user == "-":
+            return ctx.state.env.get("OLDPWD", "")
         elif part.user == "root":
             return "/root"
         else:
@@ -376,7 +429,10 @@ async def expand_part(ctx: "InterpreterContext", part: WordPart, in_double_quote
     elif isinstance(part, ArithmeticExpansionPart):
         # Unwrap ArithmeticExpressionNode to get the actual ArithExpr
         expr = part.expression.expression if part.expression else None
-        return str(await evaluate_arithmetic(ctx, expr))
+        try:
+            return str(await evaluate_arithmetic(ctx, expr))
+        except (ValueError, ZeroDivisionError) as e:
+            raise ExitError(1, "", f"bash: {e}\n")
     elif isinstance(part, BraceExpansionPart):
         results = []
         for item in part.items:
@@ -444,7 +500,18 @@ def expand_parameter(ctx: "InterpreterContext", part: ParameterExpansionPart, in
     if not operation:
         return value
 
-    is_unset = parameter not in ctx.state.env
+    # Check if variable is unset - handle array subscript parameters
+    array_param_match = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\[[@*]\]$', parameter)
+    if array_param_match:
+        arr_name = array_param_match.group(1)
+        elements = get_array_elements(ctx, arr_name)
+        is_unset = len(elements) == 0
+    elif re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', parameter) and f"{parameter}__is_array" in ctx.state.env:
+        # Bare array name - check if any elements exist
+        elements = get_array_elements(ctx, parameter)
+        is_unset = len(elements) == 0
+    else:
+        is_unset = parameter not in ctx.state.env
     is_empty = value == ""
 
     if operation.type == "DefaultValue":
@@ -480,11 +547,33 @@ def expand_parameter(ctx: "InterpreterContext", part: ParameterExpansionPart, in
         if array_match:
             elements = get_array_elements(ctx, array_match.group(1))
             return str(len(elements))
+        # ${#a} for arrays should return length of a[0]
+        if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', parameter) and f"{parameter}__is_array" in ctx.state.env:
+            first_val = ctx.state.env.get(f"{parameter}_0", "")
+            return str(len(first_val))
         return str(len(value))
 
     elif operation.type == "Substring":
         offset = operation.offset if hasattr(operation, 'offset') else 0
         length = operation.length if hasattr(operation, 'length') else None
+
+        # Check for array slicing: ${a[@]:offset:length}
+        array_match = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\[[@*]\]$', parameter)
+        if array_match:
+            elements = get_array_elements(ctx, array_match.group(1))
+            values = [v for _, v in elements]
+            # Handle negative offset
+            if offset < 0:
+                offset = max(0, len(values) + offset)
+            if length is not None:
+                if length < 0:
+                    end_pos = len(values) + length
+                    sliced = values[offset:max(offset, end_pos)]
+                else:
+                    sliced = values[offset:offset + length]
+            else:
+                sliced = values[offset:]
+            return " ".join(sliced)
 
         # Handle negative offset
         if offset < 0:
@@ -502,29 +591,84 @@ def expand_parameter(ctx: "InterpreterContext", part: ParameterExpansionPart, in
         greedy = operation.greedy
         from_end = operation.side == "suffix"
 
+        # Check for array per-element operation: ${a[@]#pattern}
+        array_match = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\[[@*]\]$', parameter)
+        if array_match:
+            elements = get_array_elements(ctx, array_match.group(1))
+            regex_pat = glob_to_regex(pattern, greedy=True, from_end=from_end)
+            results = []
+            for _, elem_val in elements:
+                results.append(_apply_pattern_removal(elem_val, regex_pat, pattern, greedy, from_end))
+            return " ".join(results)
+
         # Convert glob pattern to regex
-        regex_pattern = glob_to_regex(pattern, greedy, from_end)
+        regex_pattern = glob_to_regex(pattern, greedy=True, from_end=from_end)
 
         if from_end:
             # Remove from end: ${var%pattern} or ${var%%pattern}
-            match = re.search(regex_pattern + "$", value)
-            if match:
-                return value[:match.start()]
+            if greedy:
+                # ${var%%pattern}: remove longest matching suffix
+                match = re.search(regex_pattern + "$", value)
+                if match:
+                    return value[:match.start()]
+            else:
+                # ${var%pattern}: remove shortest matching suffix
+                # Try matching from the end, starting with the shortest suffix
+                for start in range(len(value) - 1, -1, -1):
+                    suffix = value[start:]
+                    if re.fullmatch(regex_pattern, suffix):
+                        return value[:start]
+                # Also check empty suffix
+                if re.fullmatch(regex_pattern, ""):
+                    return value
         else:
             # Remove from start: ${var#pattern} or ${var##pattern}
-            match = re.match(regex_pattern, value)
-            if match:
-                return value[match.end():]
+            if greedy:
+                # ${var##pattern}: remove longest matching prefix
+                regex_greedy = glob_to_regex(pattern, greedy=True, from_end=False)
+                match = re.match(regex_greedy, value)
+                if match:
+                    return value[match.end():]
+            else:
+                # ${var#pattern}: remove shortest matching prefix
+                regex_nongreedy = glob_to_regex(pattern, greedy=False, from_end=False)
+                match = re.match(regex_nongreedy, value)
+                if match:
+                    return value[match.end():]
         return value
 
-    elif operation.type == "PatternReplace":
+    elif operation.type == "PatternReplacement":
         pattern = expand_word(ctx, operation.pattern) if operation.pattern else ""
         replacement = expand_word(ctx, operation.replacement) if operation.replacement else ""
-        replace_all = operation.replace_all
+        replace_all = operation.all
+        anchor = getattr(operation, 'anchor', None)
 
         regex_pattern = glob_to_regex(pattern, greedy=False)
 
-        if replace_all:
+        # Check for array per-element operation: ${a[@]/pat/rep}
+        array_match = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\[[@*]\]$', parameter)
+        if array_match:
+            elements = get_array_elements(ctx, array_match.group(1))
+            results = []
+            for _, elem_val in elements:
+                results.append(_apply_pattern_replacement(elem_val, regex_pattern, pattern, replacement, replace_all, anchor))
+            return " ".join(results)
+
+        if anchor == "start":
+            # Anchored at start - only match at beginning
+            if pattern == "":
+                # Empty pattern at start means insert at beginning
+                return replacement + value
+            anchored_pattern = "^" + regex_pattern
+            return re.sub(anchored_pattern, replacement, value, count=1)
+        elif anchor == "end":
+            # Anchored at end - only match at end
+            if pattern == "":
+                # Empty pattern at end means append
+                return value + replacement
+            anchored_pattern = regex_pattern + "$"
+            return re.sub(anchored_pattern, replacement, value, count=1)
+        elif replace_all:
             return re.sub(regex_pattern, replacement, value)
         else:
             return re.sub(regex_pattern, replacement, value, count=1)
@@ -609,6 +753,52 @@ def expand_parameter(ctx: "InterpreterContext", part: ParameterExpansionPart, in
     return value
 
 
+def _apply_pattern_removal(value: str, regex_pattern: str, pattern: str, greedy: bool, from_end: bool) -> str:
+    """Apply pattern removal to a single string value."""
+    if from_end:
+        if greedy:
+            match = re.search(regex_pattern + "$", value)
+            if match:
+                return value[:match.start()]
+        else:
+            for start in range(len(value) - 1, -1, -1):
+                suffix = value[start:]
+                if re.fullmatch(regex_pattern, suffix):
+                    return value[:start]
+            if re.fullmatch(regex_pattern, ""):
+                return value
+    else:
+        if greedy:
+            regex_greedy = glob_to_regex(pattern, greedy=True, from_end=False)
+            match = re.match(regex_greedy, value)
+            if match:
+                return value[match.end():]
+        else:
+            regex_nongreedy = glob_to_regex(pattern, greedy=False, from_end=False)
+            match = re.match(regex_nongreedy, value)
+            if match:
+                return value[match.end():]
+    return value
+
+
+def _apply_pattern_replacement(value: str, regex_pattern: str, pattern: str, replacement: str, replace_all: bool, anchor) -> str:
+    """Apply pattern replacement to a single string value."""
+    if anchor == "start":
+        if pattern == "":
+            return replacement + value
+        anchored = "^" + regex_pattern
+        return re.sub(anchored, replacement, value, count=1)
+    elif anchor == "end":
+        if pattern == "":
+            return value + replacement
+        anchored = regex_pattern + "$"
+        return re.sub(anchored, replacement, value, count=1)
+    elif replace_all:
+        return re.sub(regex_pattern, replacement, value)
+    else:
+        return re.sub(regex_pattern, replacement, value, count=1)
+
+
 def _shell_quote(s: str) -> str:
     """Quote a string for shell use."""
     if not s:
@@ -645,12 +835,254 @@ def expand_brace_range(start: int, end: int, step: int = 1) -> list[str]:
     return results
 
 
+def expand_braces(s: str) -> list[str]:
+    """Expand brace patterns in a string.
+
+    Handles:
+    - Comma lists: {a,b,c} -> a b c
+    - Numeric sequences: {1..5} -> 1 2 3 4 5
+    - Alpha sequences: {a..e} -> a b c d e
+    - Step sequences: {1..10..2} -> 1 3 5 7 9
+    - Zero padding: {01..05} -> 01 02 03 04 05
+    - Prefix/suffix: pre{a,b}suf -> preasuf prebsuf
+    - Nested braces: {a,{b,c}} -> a b c
+    """
+    # Find the first valid brace expansion pattern
+    # Must have { and } with , or .. inside, and not be quoted
+    i = 0
+    while i < len(s):
+        if s[i] == '\\' and i + 1 < len(s):
+            # Skip escaped character
+            i += 2
+            continue
+        if s[i] == '{':
+            # Find matching closing brace
+            depth = 1
+            j = i + 1
+            has_comma = False
+            has_dotdot = False
+            while j < len(s) and depth > 0:
+                if s[j] == '\\' and j + 1 < len(s):
+                    j += 2
+                    continue
+                if s[j] == '{':
+                    depth += 1
+                elif s[j] == '}':
+                    depth -= 1
+                elif depth == 1 and s[j] == ',':
+                    has_comma = True
+                elif depth == 1 and s[j:j+2] == '..':
+                    has_dotdot = True
+                j += 1
+
+            if depth == 0 and (has_comma or has_dotdot):
+                # Found a valid brace expansion
+                prefix = s[:i]
+                suffix = s[j:]
+                brace_content = s[i+1:j-1]
+
+                # Expand this brace pattern
+                expansions = _expand_brace_content(brace_content)
+
+                # Combine with prefix/suffix and recursively expand
+                result = []
+                for exp in expansions:
+                    combined = prefix + exp + suffix
+                    # Recursively expand any remaining braces
+                    result.extend(expand_braces(combined))
+                return result
+        i += 1
+
+    # No brace expansion found
+    return [s]
+
+
+def _expand_brace_content(content: str) -> list[str]:
+    """Expand the content inside braces.
+
+    Handles comma-separated lists and sequences.
+    """
+    # Check for sequence pattern (..): a..z, 1..10, 1..10..2
+    if '..' in content and ',' not in content:
+        return _expand_sequence(content)
+
+    # Handle comma-separated list, respecting nested braces
+    items = []
+    current = []
+    depth = 0
+    i = 0
+    while i < len(content):
+        c = content[i]
+        if c == '\\' and i + 1 < len(content):
+            current.append(c)
+            current.append(content[i + 1])
+            i += 2
+            continue
+        if c == '{':
+            depth += 1
+            current.append(c)
+        elif c == '}':
+            depth -= 1
+            current.append(c)
+        elif c == ',' and depth == 0:
+            items.append(''.join(current))
+            current = []
+        else:
+            current.append(c)
+        i += 1
+    items.append(''.join(current))
+
+    # Recursively expand nested braces in each item
+    result = []
+    for item in items:
+        result.extend(expand_braces(item))
+    return result
+
+
+def _expand_sequence(content: str) -> list[str]:
+    """Expand a sequence like 1..10, a..z, or 1..10..2."""
+    parts = content.split('..')
+    if len(parts) < 2 or len(parts) > 3:
+        return ['{' + content + '}']  # Not a valid sequence
+
+    start_str = parts[0]
+    end_str = parts[1]
+    step = 1
+    if len(parts) == 3:
+        try:
+            step = int(parts[2])
+            if step == 0:
+                step = 1
+        except ValueError:
+            return ['{' + content + '}']  # Invalid step
+
+    # Determine padding width
+    pad_width = 0
+    if start_str.startswith('0') and len(start_str) > 1:
+        pad_width = max(pad_width, len(start_str))
+    if end_str.startswith('0') and len(end_str) > 1:
+        pad_width = max(pad_width, len(end_str))
+
+    # Try numeric sequence
+    try:
+        start_num = int(start_str)
+        end_num = int(end_str)
+        results = []
+        if start_num <= end_num:
+            i = start_num
+            while i <= end_num:
+                if pad_width:
+                    results.append(str(i).zfill(pad_width))
+                else:
+                    results.append(str(i))
+                i += abs(step)
+        else:
+            i = start_num
+            while i >= end_num:
+                if pad_width:
+                    results.append(str(i).zfill(pad_width))
+                else:
+                    results.append(str(i))
+                i -= abs(step)
+        return results
+    except ValueError:
+        pass
+
+    # Try alpha sequence (single characters)
+    if len(start_str) == 1 and len(end_str) == 1:
+        start_ord = ord(start_str)
+        end_ord = ord(end_str)
+        results = []
+        if start_ord <= end_ord:
+            i = start_ord
+            while i <= end_ord:
+                results.append(chr(i))
+                i += abs(step)
+        else:
+            i = start_ord
+            while i >= end_ord:
+                results.append(chr(i))
+                i -= abs(step)
+        return results
+
+    # Not a valid sequence
+    return ['{' + content + '}']
+
+
 def glob_to_regex(pattern: str, greedy: bool = True, from_end: bool = False) -> str:
-    """Convert a glob pattern to a regex pattern."""
+    """Convert a glob pattern to a regex pattern.
+
+    Supports standard globs (*, ?, [...]) and extended globs (@, ?, *, +, !)(pat|pat).
+    """
+    # POSIX character class mappings
+    posix_classes = {
+        "[:alpha:]": "a-zA-Z",
+        "[:digit:]": "0-9",
+        "[:alnum:]": "a-zA-Z0-9",
+        "[:upper:]": "A-Z",
+        "[:lower:]": "a-z",
+        "[:space:]": " \\t\\n\\r\\f\\v",
+        "[:blank:]": " \\t",
+        "[:punct:]": r"!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~",
+        "[:graph:]": "!-~",
+        "[:print:]": " -~",
+        "[:cntrl:]": "\\x00-\\x1f\\x7f",
+        "[:xdigit:]": "0-9a-fA-F",
+    }
+
+    def _convert_extglob_body(body: str) -> str:
+        """Convert the body of an extglob (between parens), handling nested patterns."""
+        # Split on | but respect nesting
+        parts = []
+        current = []
+        depth = 0
+        for ch in body:
+            if ch == "(" and current and current[-1] in "@?*+!":
+                depth += 1
+                current.append(ch)
+            elif ch == ")" and depth > 0:
+                depth -= 1
+                current.append(ch)
+            elif ch == "|" and depth == 0:
+                parts.append("".join(current))
+                current = []
+            else:
+                current.append(ch)
+        parts.append("".join(current))
+        # Convert each alternative
+        return "|".join(glob_to_regex(p, greedy, from_end) for p in parts)
+
     result = []
     i = 0
     while i < len(pattern):
         c = pattern[i]
+        # Check for extglob patterns: @( ?( *( +( !(
+        if c in "@?*+!" and i + 1 < len(pattern) and pattern[i + 1] == "(":
+            # Find matching closing paren
+            depth = 1
+            j = i + 2
+            while j < len(pattern) and depth > 0:
+                if pattern[j] == "(":
+                    depth += 1
+                elif pattern[j] == ")":
+                    depth -= 1
+                j += 1
+            body = pattern[i + 2:j - 1]  # Content between parens
+            converted_body = _convert_extglob_body(body)
+            if c == "@":
+                result.append(f"(?:{converted_body})")
+            elif c == "?":
+                result.append(f"(?:{converted_body})?")
+            elif c == "*":
+                result.append(f"(?:{converted_body})*")
+            elif c == "+":
+                result.append(f"(?:{converted_body})+")
+            elif c == "!":
+                # !(pat) - match anything that doesn't match
+                # Use negative lookahead anchored to end
+                result.append(f"(?!(?:{converted_body})$).*")
+            i = j
+            continue
         if c == "*":
             if greedy:
                 result.append(".*")
@@ -667,6 +1099,16 @@ def glob_to_regex(pattern: str, greedy: bool = True, from_end: bool = False) -> 
             else:
                 result.append("[")
             while j < len(pattern) and pattern[j] != "]":
+                # Check for POSIX character classes like [:alpha:]
+                if pattern[j] == "[" and j + 1 < len(pattern) and pattern[j + 1] == ":":
+                    # Find the closing :]
+                    end = pattern.find(":]", j + 2)
+                    if end != -1:
+                        posix_name = pattern[j:end + 2]
+                        if posix_name in posix_classes:
+                            result.append(posix_classes[posix_name])
+                            j = end + 2
+                            continue
                 result.append(pattern[j])
                 j += 1
             result.append("]")
@@ -677,6 +1119,45 @@ def glob_to_regex(pattern: str, greedy: bool = True, from_end: bool = False) -> 
             result.append(c)
         i += 1
     return "".join(result)
+
+
+def _find_brace_in_literal_parts(parts: list) -> tuple[int, int, int, str] | None:
+    """Find a valid brace expansion pattern within LiteralPart nodes.
+
+    Returns (part_index, brace_start, brace_end, content) or None.
+    Only finds patterns entirely within a single LiteralPart.
+    """
+    for idx, part in enumerate(parts):
+        if not isinstance(part, LiteralPart):
+            continue
+        text = part.value
+        i = 0
+        while i < len(text):
+            if text[i] == '\\' and i + 1 < len(text):
+                i += 2
+                continue
+            if text[i] == '{':
+                depth = 1
+                j = i + 1
+                has_comma = False
+                has_dotdot = False
+                while j < len(text) and depth > 0:
+                    if text[j] == '\\' and j + 1 < len(text):
+                        j += 2
+                        continue
+                    if text[j] == '{':
+                        depth += 1
+                    elif text[j] == '}':
+                        depth -= 1
+                    elif depth == 1 and text[j] == ',':
+                        has_comma = True
+                    elif depth == 1 and j + 1 < len(text) and text[j:j+2] == '..':
+                        has_dotdot = True
+                    j += 1
+                if depth == 0 and (has_comma or has_dotdot):
+                    return (idx, i, j, text[i+1:j-1])
+            i += 1
+    return None
 
 
 async def expand_word_with_glob(
@@ -692,6 +1173,50 @@ async def expand_word_with_glob(
         isinstance(p, (SingleQuotedPart, DoubleQuotedPart, EscapedPart))
         for p in word.parts
     )
+
+    # Parts-level brace expansion: only expand braces in LiteralPart nodes
+    brace_info = _find_brace_in_literal_parts(word.parts)
+    if brace_info is not None:
+        part_idx, brace_start, brace_end, content = brace_info
+        lit_part = word.parts[part_idx]
+        prefix_text = lit_part.value[:brace_start]
+        suffix_text = lit_part.value[brace_end:]
+
+        before_parts = list(word.parts[:part_idx])
+        after_parts = list(word.parts[part_idx + 1:])
+        if prefix_text:
+            before_parts.append(LiteralPart(value=prefix_text))
+        if suffix_text:
+            after_parts.insert(0, LiteralPart(value=suffix_text))
+
+        expansions = _expand_brace_content(content)
+
+        all_results = []
+        for exp_text in expansions:
+            new_parts = before_parts + [LiteralPart(value=exp_text)] + after_parts
+            new_word = WordNode(parts=tuple(new_parts))
+            sub_result = await expand_word_with_glob(ctx, new_word)
+            all_results.extend(sub_result["values"])
+        return {"values": all_results, "quoted": False}
+
+    # String-level brace expansion fallback for unquoted words where braces
+    # span across multiple parts (e.g., {$x,other} where $x is a ParameterExpansionPart)
+    expanded_text: str | None = None
+    if not has_quoted:
+        expanded_text = await expand_word_async(ctx, word)
+        if '{' in expanded_text and '}' in expanded_text:
+            brace_expanded = expand_braces(expanded_text)
+            if len(brace_expanded) > 1 or (len(brace_expanded) == 1 and brace_expanded[0] != expanded_text):
+                all_results = []
+                for exp_text in brace_expanded:
+                    if any(c in exp_text for c in "*?["):
+                        matches = await glob_expand(ctx, exp_text)
+                        if matches:
+                            all_results.extend(matches)
+                            continue
+                    if exp_text:
+                        all_results.append(exp_text)
+                return {"values": all_results, "quoted": False}
 
     # Special handling for "$@" and "$*" in double quotes
     # "$@" expands to multiple words (one per positional parameter)
@@ -713,22 +1238,66 @@ async def expand_word_with_glob(
                 sep = ifs[0] if ifs else ""
                 return {"values": [sep.join(params)] if params else [""], "quoted": True}
 
+            # "${arr[@]}" - return each array element as separate word
+            array_at_match = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\[@\]$', param_part.parameter)
+            if array_at_match and param_part.operation is None:
+                arr_name = array_at_match.group(1)
+                elements = get_array_elements(ctx, arr_name)
+                if not elements:
+                    return {"values": [], "quoted": True}
+                return {"values": [val for _, val in elements], "quoted": True}
+
+            # "${arr[*]}" - join with first char of IFS
+            array_star_match = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\[\*\]$', param_part.parameter)
+            if array_star_match and param_part.operation is None:
+                arr_name = array_star_match.group(1)
+                elements = get_array_elements(ctx, arr_name)
+                ifs = ctx.state.env.get("IFS", " \t\n")
+                sep = ifs[0] if ifs else ""
+                return {"values": [sep.join(val for _, val in elements)] if elements else [""], "quoted": True}
+
+            # "${!arr[@]}" / "${!arr[*]}" - return array keys as separate words or joined
+            if param_part.parameter.startswith("!") and param_part.operation is None:
+                indirect = param_part.parameter[1:]
+                array_keys_at = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\[@\]$', indirect)
+                if array_keys_at:
+                    arr_name = array_keys_at.group(1)
+                    keys = get_array_keys(ctx, arr_name)
+                    if not keys:
+                        return {"values": [], "quoted": True}
+                    return {"values": keys, "quoted": True}
+                array_keys_star = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\[\*\]$', indirect)
+                if array_keys_star:
+                    arr_name = array_keys_star.group(1)
+                    keys = get_array_keys(ctx, arr_name)
+                    ifs = ctx.state.env.get("IFS", " \t\n")
+                    sep = ifs[0] if ifs else ""
+                    return {"values": [sep.join(keys)] if keys else [""], "quoted": True}
+
     # Handle more complex cases with "$@" embedded in other content
     # e.g., "prefix$@suffix" -> ["prefix$1", "$2", ..., "$nsuffix"]
     values = await _expand_word_with_at(ctx, word)
     if values is not None:
         return {"values": values, "quoted": True}
 
-    # Expand the word
-    value = await expand_word_async(ctx, word)
+    # Expand the word (reuse if already expanded to avoid double side effects)
+    value = expanded_text if expanded_text is not None else await expand_word_async(ctx, word)
 
     # For unquoted words, perform IFS word splitting
     if not has_quoted:
-        # Check for glob patterns first
-        if any(c in value for c in "*?["):
+        # Check for glob patterns first (including extglob)
+        if any(c in value for c in "*?[") or re.search(r'[@?*+!]\(', value):
             matches = await glob_expand(ctx, value)
             if matches:
                 return {"values": matches, "quoted": False}
+            # No matches - check nullglob/failglob
+            env = ctx.state.env
+            if env.get("__shopt_nullglob__") == "1":
+                return {"values": [], "quoted": False}
+            if env.get("__shopt_failglob__") == "1":
+                ctx.state.expansion_stderr = f"bash: no match: {value}\n"
+                ctx.state.expansion_exit_code = 1
+                return {"values": [], "quoted": False}
 
         # Perform IFS word splitting
         if value == "":
@@ -795,6 +1364,94 @@ def _split_on_ifs(value: str, ifs: str) -> list[str]:
         result.append("".join(current))
 
     return result
+
+
+def _get_word_raw_text(word: WordNode) -> str:
+    """Get the raw text of a word (for brace expansion detection).
+
+    Returns the literal text from all unquoted literal parts.
+    """
+    result = []
+    for part in word.parts:
+        if isinstance(part, LiteralPart):
+            result.append(part.value)
+        elif isinstance(part, SingleQuotedPart):
+            # Quoted content doesn't participate in brace expansion
+            result.append("'" + part.value + "'")
+        elif isinstance(part, DoubleQuotedPart):
+            # Quoted content doesn't participate in brace expansion
+            result.append('"' + _get_parts_raw_text(part.parts) + '"')
+        elif isinstance(part, EscapedPart):
+            result.append('\\' + part.value)
+        elif isinstance(part, ParameterExpansionPart):
+            # Keep parameter expansion as-is for later expansion
+            if part.operation:
+                result.append("${" + part.parameter + "}")
+            else:
+                result.append("$" + part.parameter)
+        elif isinstance(part, CommandSubstitutionPart):
+            result.append("$()")  # Placeholder
+        elif isinstance(part, ArithmeticExpansionPart):
+            result.append("$(())")  # Placeholder
+        else:
+            # For other parts, use empty string
+            pass
+    return "".join(result)
+
+
+def _get_parts_raw_text(parts: tuple) -> str:
+    """Get raw text from a tuple of parts."""
+    result = []
+    for part in parts:
+        if isinstance(part, LiteralPart):
+            result.append(part.value)
+        elif isinstance(part, ParameterExpansionPart):
+            if part.operation:
+                result.append("${" + part.parameter + "}")
+            else:
+                result.append("$" + part.parameter)
+    return "".join(result)
+
+
+async def _expand_word_without_braces(
+    ctx: "InterpreterContext",
+    word: WordNode,
+) -> dict:
+    """Expand a word without brace expansion (to avoid infinite recursion)."""
+    # Check if word contains any quoted parts
+    has_quoted = any(
+        isinstance(p, (SingleQuotedPart, DoubleQuotedPart, EscapedPart))
+        for p in word.parts
+    )
+
+    # Expand the word
+    value = await expand_word_async(ctx, word)
+
+    # For unquoted words, perform IFS word splitting and glob expansion
+    if not has_quoted:
+        # Check for glob patterns first (including extglob)
+        if any(c in value for c in "*?[") or re.search(r'[@?*+!]\(', value):
+            matches = await glob_expand(ctx, value)
+            if matches:
+                return {"values": matches, "quoted": False}
+
+        # Perform IFS word splitting
+        if value == "":
+            return {"values": [], "quoted": False}
+
+        # Check if the word contained parameter/command expansion that should be split
+        has_expansion = any(
+            isinstance(p, (ParameterExpansionPart, CommandSubstitutionPart, ArithmeticExpansionPart))
+            for p in word.parts
+        )
+        if has_expansion:
+            ifs = ctx.state.env.get("IFS", " \t\n")
+            if ifs:
+                # Split on IFS characters
+                words = _split_on_ifs(value, ifs)
+                return {"values": words, "quoted": False}
+
+    return {"values": [value], "quoted": has_quoted}
 
 
 def _get_positional_params(ctx: "InterpreterContext") -> list[str]:
@@ -886,8 +1543,14 @@ async def glob_expand(ctx: "InterpreterContext", pattern: str) -> list[str]:
 
     cwd = ctx.state.cwd
     fs = ctx.fs
+    env = ctx.state.env
+
+    # Check shopt options
+    dotglob = env.get("__shopt_dotglob__") == "1"
+    globstar = env.get("__shopt_globstar__") == "1"
 
     # Handle absolute vs relative paths
+    original_pattern = pattern
     if pattern.startswith("/"):
         base_dir = "/"
         pattern = pattern[1:]
@@ -897,6 +1560,29 @@ async def glob_expand(ctx: "InterpreterContext", pattern: str) -> list[str]:
     # Split pattern into parts
     parts = pattern.split("/")
 
+    def _should_include(entry: str, pattern_part: str) -> bool:
+        """Check if an entry should be included (dotfile filtering)."""
+        if entry.startswith("."):
+            # Dotfiles only match if: dotglob is on, or pattern starts with '.'
+            if not dotglob and not pattern_part.startswith("."):
+                return False
+        return True
+
+    async def _recurse_dirs(current_dir: str) -> list[str]:
+        """Recursively list all directories for globstar."""
+        dirs = [current_dir]
+        try:
+            entries = await fs.readdir(current_dir)
+        except (FileNotFoundError, NotADirectoryError):
+            return dirs
+        for entry in entries:
+            if entry.startswith(".") and not dotglob:
+                continue
+            path = os.path.join(current_dir, entry)
+            if await fs.is_directory(path):
+                dirs.extend(await _recurse_dirs(path))
+        return dirs
+
     async def expand_parts(current_dir: str, remaining_parts: list[str]) -> list[str]:
         if not remaining_parts:
             return [current_dir]
@@ -904,8 +1590,29 @@ async def glob_expand(ctx: "InterpreterContext", pattern: str) -> list[str]:
         part = remaining_parts[0]
         rest = remaining_parts[1:]
 
-        # Check if this part has glob characters
-        if not any(c in part for c in "*?["):
+        # Handle globstar (**)
+        if part == "**" and globstar:
+            all_dirs = await _recurse_dirs(current_dir)
+            results = []
+            for d in all_dirs:
+                if rest:
+                    results.extend(await expand_parts(d, rest))
+                else:
+                    # ** alone matches everything recursively
+                    try:
+                        entries = await fs.readdir(d)
+                        for entry in entries:
+                            if _should_include(entry, "*"):
+                                results.append(os.path.join(d, entry))
+                    except (FileNotFoundError, NotADirectoryError):
+                        pass
+                    results.append(d)
+            return sorted(set(results))
+
+        # Check if this part has glob characters (including extglob)
+        has_glob = any(c in part for c in "*?[")
+        has_extglob = bool(re.search(r'[@?*+!]\(', part))
+        if not has_glob and not has_extglob:
             # No glob - just check if path exists
             new_path = os.path.join(current_dir, part)
             if await fs.exists(new_path):
@@ -918,9 +1625,25 @@ async def glob_expand(ctx: "InterpreterContext", pattern: str) -> list[str]:
         except (FileNotFoundError, NotADirectoryError):
             return []
 
+        # Use regex matching for extglob patterns, fnmatch for standard globs
+        if has_extglob:
+            regex_pat = "^" + glob_to_regex(part) + "$"
+            try:
+                compiled = re.compile(regex_pat)
+            except re.error:
+                compiled = None
+        else:
+            compiled = None
+
         matches = []
         for entry in entries:
-            if fnmatch.fnmatch(entry, part):
+            if not _should_include(entry, part):
+                continue
+            if compiled:
+                matched = compiled.match(entry) is not None
+            else:
+                matched = fnmatch.fnmatch(entry, part)
+            if matched:
                 new_path = os.path.join(current_dir, entry)
                 if rest:
                     # More parts to match - entry must be a directory
@@ -934,7 +1657,7 @@ async def glob_expand(ctx: "InterpreterContext", pattern: str) -> list[str]:
     results = await expand_parts(base_dir, parts)
 
     # Return relative paths if pattern was relative
-    if not pattern.startswith("/") and results:
+    if not original_pattern.startswith("/") and results:
         results = [os.path.relpath(r, cwd) if r.startswith(cwd) else r for r in results]
 
     return results
@@ -976,6 +1699,46 @@ def _parse_base_n_value(value_str: str, base: int) -> int:
     return result
 
 
+def _parse_arith_value(val: str) -> int:
+    """Parse a string value as an arithmetic integer.
+
+    Handles octal (0NNN), hex (0xNNN), and base-N (N#NNN) constants
+    like bash does when evaluating variable values in arithmetic context.
+    """
+    if not val:
+        return 0
+    val = val.strip()
+    if not val:
+        return 0
+    # Hex
+    if val.startswith("0x") or val.startswith("0X"):
+        try:
+            return int(val, 16)
+        except ValueError:
+            return 0
+    # Base-N: N#value
+    if "#" in val:
+        parts = val.split("#", 1)
+        try:
+            base = int(parts[0])
+            if 2 <= base <= 64:
+                return _parse_base_n_value(parts[1], base)
+        except (ValueError, TypeError):
+            pass
+        return 0
+    # Octal (starts with 0 and has more digits)
+    if val.startswith("0") and len(val) > 1 and val[1:].isdigit():
+        try:
+            return int(val, 8)
+        except ValueError:
+            return 0
+    # Regular integer
+    try:
+        return int(val)
+    except ValueError:
+        return 0
+
+
 def evaluate_arithmetic_sync(ctx: "InterpreterContext", expr) -> int:
     """Evaluate an arithmetic expression synchronously."""
     # Simple implementation for basic arithmetic
@@ -1008,14 +1771,29 @@ def evaluate_arithmetic_sync(ctx: "InterpreterContext", expr) -> int:
                 except (ValueError, TypeError):
                     pass
             val = get_variable(ctx, name, False)
-            try:
-                return int(val) if val else 0
-            except ValueError:
-                return 0
+            return _parse_arith_value(val)
         elif expr.type == "ArithBinary":
-            left = evaluate_arithmetic_sync(ctx, expr.left)
-            right = evaluate_arithmetic_sync(ctx, expr.right)
             op = expr.operator
+            # Short-circuit for && and ||
+            if op == "&&":
+                left = evaluate_arithmetic_sync(ctx, expr.left)
+                if not left:
+                    return 0
+                right = evaluate_arithmetic_sync(ctx, expr.right)
+                return 1 if right else 0
+            elif op == "||":
+                left = evaluate_arithmetic_sync(ctx, expr.left)
+                if left:
+                    return 1
+                right = evaluate_arithmetic_sync(ctx, expr.right)
+                return 1 if right else 0
+            elif op == ",":
+                # Comma operator: evaluate both, return right
+                evaluate_arithmetic_sync(ctx, expr.left)
+                return evaluate_arithmetic_sync(ctx, expr.right)
+            else:
+                left = evaluate_arithmetic_sync(ctx, expr.left)
+                right = evaluate_arithmetic_sync(ctx, expr.right)
             if op == "+":
                 return left + right
             elif op == "-":
@@ -1023,10 +1801,18 @@ def evaluate_arithmetic_sync(ctx: "InterpreterContext", expr) -> int:
             elif op == "*":
                 return left * right
             elif op == "/":
-                return left // right if right != 0 else 0
+                if right == 0:
+                    raise ValueError("division by 0")
+                # C-style truncation toward zero (not Python floor division)
+                return int(left / right)
             elif op == "%":
-                return left % right if right != 0 else 0
+                if right == 0:
+                    raise ValueError("division by 0")
+                # C-style modulo: sign follows dividend
+                return int(left - int(left / right) * right)
             elif op == "**":
+                if right < 0:
+                    raise ValueError("exponent less than 0")
                 return left ** right
             elif op == "<":
                 return 1 if left < right else 0
@@ -1040,10 +1826,6 @@ def evaluate_arithmetic_sync(ctx: "InterpreterContext", expr) -> int:
                 return 1 if left == right else 0
             elif op == "!=":
                 return 1 if left != right else 0
-            elif op == "&&":
-                return 1 if left and right else 0
-            elif op == "||":
-                return 1 if left or right else 0
             elif op == "&":
                 return left & right
             elif op == "|":
@@ -1054,9 +1836,6 @@ def evaluate_arithmetic_sync(ctx: "InterpreterContext", expr) -> int:
                 return left << right
             elif op == ">>":
                 return left >> right
-            elif op == ",":
-                # Comma operator: evaluate both, return right
-                return right
         elif expr.type == "ArithUnary":
             op = expr.operator
             # Handle increment/decrement specially (need variable name)
@@ -1126,9 +1905,13 @@ def evaluate_arithmetic_sync(ctx: "InterpreterContext", expr) -> int:
                 elif op == '*=':
                     value = current * rhs
                 elif op == '/=':
-                    value = current // rhs if rhs != 0 else 0
+                    if rhs == 0:
+                        raise ValueError("division by 0")
+                    value = int(current / rhs)
                 elif op == '%=':
-                    value = current % rhs if rhs != 0 else 0
+                    if rhs == 0:
+                        raise ValueError("division by 0")
+                    value = int(current - int(current / rhs) * rhs)
                 elif op == '<<=':
                     value = current << rhs
                 elif op == '>>=':

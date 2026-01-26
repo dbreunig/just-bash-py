@@ -48,6 +48,7 @@ class SedCommand_:
 
     cmd: str  # s, d, p, a, i, y, q, h, H, g, G, x, n, N, etc.
     address: SedAddress | None = None
+    negate: bool = False  # ! address negation
     pattern: re.Pattern | None = None
     replacement: str | None = None
     flags: str = ""
@@ -258,17 +259,54 @@ class SedCommand:
         commands: list[SedCommand_] = []
 
         for script in scripts:
-            # Handle multiple commands separated by semicolons or newlines
-            for cmd_str in re.split(r"[;\n]", script):
+            # Split respecting brace nesting
+            for cmd_str in self._split_script(script):
                 cmd_str = cmd_str.strip()
                 if not cmd_str:
                     continue
 
-                cmd = self._parse_command(cmd_str, extended_regex)
-                if cmd:
-                    commands.append(cmd)
+                # Handle grouped commands: addr{cmd1;cmd2}
+                brace_pos = cmd_str.find("{")
+                if brace_pos != -1 and cmd_str.endswith("}"):
+                    addr_prefix = cmd_str[:brace_pos]
+                    inner = cmd_str[brace_pos + 1 : -1]
+                    for inner_cmd in inner.split(";"):
+                        inner_cmd = inner_cmd.strip()
+                        if inner_cmd:
+                            full_cmd = addr_prefix + inner_cmd
+                            cmd = self._parse_command(full_cmd, extended_regex)
+                            if cmd:
+                                commands.append(cmd)
+                else:
+                    cmd = self._parse_command(cmd_str, extended_regex)
+                    if cmd:
+                        commands.append(cmd)
 
         return commands
+
+    def _split_script(self, script: str) -> list[str]:
+        """Split a script on semicolons and newlines, respecting brace nesting."""
+        parts: list[str] = []
+        current: list[str] = []
+        depth = 0
+
+        for ch in script:
+            if ch == "{":
+                depth += 1
+                current.append(ch)
+            elif ch == "}":
+                depth -= 1
+                current.append(ch)
+            elif ch in ";\n" and depth == 0:
+                parts.append("".join(current))
+                current = []
+            else:
+                current.append(ch)
+
+        if current:
+            parts.append("".join(current))
+
+        return parts
 
     def _parse_command(self, cmd_str: str, extended_regex: bool) -> SedCommand_ | None:
         """Parse a single sed command."""
@@ -334,11 +372,21 @@ class SedCommand:
         while pos < len(cmd_str) and cmd_str[pos] in " \t":
             pos += 1
 
+        # Check for negation
+        negate = False
+        if pos < len(cmd_str) and cmd_str[pos] == "!":
+            negate = True
+            pos += 1
+            # Skip whitespace after !
+            while pos < len(cmd_str) and cmd_str[pos] in " \t":
+                pos += 1
+
         if pos >= len(cmd_str):
             return None
 
         cmd_char = cmd_str[pos]
         pos += 1
+        result = None
 
         if cmd_char == "s":
             # Substitution
@@ -374,7 +422,7 @@ class SedCommand:
             except re.error as e:
                 raise ValueError(f"invalid regex: {e}")
 
-            return SedCommand_(
+            result = SedCommand_(
                 cmd="s",
                 address=address,
                 pattern=compiled,
@@ -404,7 +452,7 @@ class SedCommand:
             if len(source) != len(dest):
                 raise ValueError("y command requires equal length strings")
 
-            return SedCommand_(
+            result = SedCommand_(
                 cmd="y",
                 address=address,
                 source=source,
@@ -412,90 +460,94 @@ class SedCommand:
             )
 
         elif cmd_char == "d":
-            return SedCommand_(cmd="d", address=address)
+            result = SedCommand_(cmd="d", address=address)
 
         elif cmd_char == "=":
             # Print line number
-            return SedCommand_(cmd="=", address=address)
+            result = SedCommand_(cmd="=", address=address)
 
         elif cmd_char == "p":
-            return SedCommand_(cmd="p", address=address)
+            result = SedCommand_(cmd="p", address=address)
 
         elif cmd_char == "l":
             # List pattern space with escapes
-            return SedCommand_(cmd="l", address=address)
+            result = SedCommand_(cmd="l", address=address)
 
         elif cmd_char == "F":
             # Print filename
-            return SedCommand_(cmd="F", address=address)
+            result = SedCommand_(cmd="F", address=address)
 
         elif cmd_char == "q":
-            return SedCommand_(cmd="q", address=address)
+            result = SedCommand_(cmd="q", address=address)
 
         elif cmd_char in ("a", "i", "c"):
             # Append, insert, or change
             text = cmd_str[pos:].lstrip()
             if text.startswith("\\"):
                 text = text[1:].lstrip()
-            return SedCommand_(cmd=cmd_char, address=address, text=text)
+            result = SedCommand_(cmd=cmd_char, address=address, text=text)
 
         elif cmd_char in ("h", "H", "g", "G", "x"):
             # Hold space commands
-            return SedCommand_(cmd=cmd_char, address=address)
+            result = SedCommand_(cmd=cmd_char, address=address)
 
         elif cmd_char in ("n", "N"):
             # Next line commands
-            return SedCommand_(cmd=cmd_char, address=address)
+            result = SedCommand_(cmd=cmd_char, address=address)
 
         elif cmd_char in ("P", "D"):
             # Print/delete first line of pattern space
-            return SedCommand_(cmd=cmd_char, address=address)
+            result = SedCommand_(cmd=cmd_char, address=address)
 
         elif cmd_char == "b":
             # Branch to label
             label = cmd_str[pos:].strip()
-            return SedCommand_(cmd="b", address=address, label=label)
+            result = SedCommand_(cmd="b", address=address, label=label)
 
         elif cmd_char == "t":
             # Branch on successful substitute
             label = cmd_str[pos:].strip()
-            return SedCommand_(cmd="t", address=address, label=label)
+            result = SedCommand_(cmd="t", address=address, label=label)
 
         elif cmd_char == "T":
             # Branch on failed substitute
             label = cmd_str[pos:].strip()
-            return SedCommand_(cmd="T", address=address, label=label)
+            result = SedCommand_(cmd="T", address=address, label=label)
 
         elif cmd_char == ":":
             # Label definition
             label = cmd_str[pos:].strip()
-            return SedCommand_(cmd=":", label=label)
+            result = SedCommand_(cmd=":", label=label)
 
         elif cmd_char == "r":
             # Read file
             filename = cmd_str[pos:].strip()
-            return SedCommand_(cmd="r", address=address, filename=filename)
+            result = SedCommand_(cmd="r", address=address, filename=filename)
 
         elif cmd_char == "w":
             # Write to file
             filename = cmd_str[pos:].strip()
-            return SedCommand_(cmd="w", address=address, filename=filename)
+            result = SedCommand_(cmd="w", address=address, filename=filename)
 
         elif cmd_char == "R":
             # Read single line from file
             filename = cmd_str[pos:].strip()
-            return SedCommand_(cmd="R", address=address, filename=filename)
+            result = SedCommand_(cmd="R", address=address, filename=filename)
 
         elif cmd_char == "{":
             # Start of block (handled in parsing)
-            return None
+            pass
 
         elif cmd_char == "}":
             # End of block (handled in parsing)
-            return None
+            pass
 
         else:
             raise ValueError(f"unknown command: {cmd_char}")
+
+        if result is not None and negate:
+            result.negate = True
+        return result
 
     def _find_delimiter(self, s: str, start: int, delim: str) -> int:
         """Find the next unescaped delimiter."""
@@ -570,8 +622,11 @@ class SedCommand:
                     cmd_idx += 1
                     continue
 
-                # Check if address matches
-                if not self._address_matches(cmd.address, line_num, total_lines, pattern_space, in_range, cmd_idx):
+                # Check if address matches (with negation support)
+                matches = self._address_matches(cmd.address, line_num, total_lines, pattern_space, in_range, cmd_idx)
+                if cmd.negate:
+                    matches = not matches
+                if not matches:
                     cmd_idx += 1
                     continue
 

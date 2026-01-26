@@ -74,6 +74,7 @@ class AwkRule:
     action: str
     is_regex: bool = False
     regex: re.Pattern | None = None
+    negate: bool = False  # ! pattern negation
 
 
 @dataclass
@@ -287,12 +288,27 @@ class AwkCommand:
             is_regex = False
             regex = None
 
+            negate_pattern = False
+
             if program[pos:].startswith("BEGIN"):
                 pattern = "BEGIN"
                 pos += 5
             elif program[pos:].startswith("END"):
                 pattern = "END"
                 pos += 3
+            elif program[pos] == "!" and pos + 1 < len(program) and program[pos + 1] == "/":
+                # Negated regex pattern
+                negate_pattern = True
+                pos += 1  # skip '!', now pos is at '/'
+                end = self._find_regex_end(program, pos + 1)
+                if end != -1:
+                    pattern = program[pos + 1:end]
+                    is_regex = True
+                    try:
+                        regex = re.compile(pattern)
+                    except re.error as e:
+                        raise ValueError(f"invalid regex: {e}")
+                    pos = end + 1
             elif program[pos] == "/":
                 # Regex pattern
                 end = self._find_regex_end(program, pos + 1)
@@ -349,10 +365,10 @@ class AwkCommand:
                     pos += 1
 
                 action = program[start:pos - 1].strip()
-                rules.append(AwkRule(pattern=pattern, action=action, is_regex=is_regex, regex=regex))
+                rules.append(AwkRule(pattern=pattern, action=action, is_regex=is_regex, regex=regex, negate=negate_pattern))
             else:
                 # Default action is print $0
-                rules.append(AwkRule(pattern=pattern, action="print", is_regex=is_regex, regex=regex))
+                rules.append(AwkRule(pattern=pattern, action="print", is_regex=is_regex, regex=regex, negate=negate_pattern))
 
         return rules
 
@@ -374,7 +390,8 @@ class AwkCommand:
             return True
 
         if rule.is_regex and rule.regex:
-            return bool(rule.regex.search(line))
+            result = bool(rule.regex.search(line))
+            return not result if rule.negate else result
 
         # Expression pattern
         pattern = rule.pattern
@@ -493,7 +510,15 @@ class AwkCommand:
         if current.strip():
             statements.append(current.strip())
 
-        return statements
+        # Merge 'else' parts back into their preceding 'if' statement
+        merged = []
+        for stmt in statements:
+            if stmt.startswith("else") and merged and merged[-1].lstrip().startswith("if"):
+                merged[-1] = merged[-1] + "; " + stmt
+            else:
+                merged.append(stmt)
+
+        return merged
 
     def _execute_statement(
         self, stmt: str, state: AwkState, fields: list[str], line: str
@@ -621,6 +646,17 @@ class AwkCommand:
                         pass
             return
 
+        # Handle delete statement
+        if stmt.startswith("delete "):
+            target = stmt[7:].strip()
+            match = re.match(r"(\w+)\[(.+)\]", target)
+            if match:
+                arr_name = match.group(1)
+                idx = self._eval_expr(match.group(2).strip(), state, line, fields)
+                key = f"{arr_name}[{idx}]"
+                state.variables.pop(key, None)
+            return
+
         # Handle match() as a statement (for side effects on RSTART/RLENGTH)
         if stmt.startswith("match("):
             # Just evaluate it - _eval_expr will set RSTART/RLENGTH
@@ -657,6 +693,16 @@ class AwkCommand:
                         state.variables[var] = current / val if val != 0 else 0
                     return
 
+            # Array element assignment: arr[idx] = val
+            match = re.match(r"(\w+)\[(.+?)\]\s*=\s*(.+)", stmt)
+            if match:
+                arr_name = match.group(1)
+                idx = self._eval_expr(match.group(2).strip(), state, line, fields)
+                val = self._eval_expr(match.group(3).strip(), state, line, fields)
+                key = f"{arr_name}[{idx}]"
+                state.variables[key] = val
+                return
+
             # Simple assignment
             match = re.match(r"(\w+)\s*=\s*(.+)", stmt)
             if match:
@@ -675,6 +721,10 @@ class AwkCommand:
                     fields.append("")
                 if field_num > 0:
                     fields[field_num - 1] = str(val)
+                # Reconstruct $0 from modified fields
+                ofs = state.variables.get("OFS", " ")
+                state.variables["__line__"] = ofs.join(fields)
+                state.variables["NF"] = len(fields)
                 return
 
         # Handle increment/decrement
@@ -1200,21 +1250,76 @@ class AwkCommand:
             elif else_action:
                 self._execute_action(else_action, state, fields, line)
         else:
-            # No braces - rest is the statement
+            # No braces - check for else clause separated by ;
+            then_action = rest
+            else_action = None
+
+            # Look for "; else" pattern (not inside strings)
+            else_idx = -1
+            in_str = False
+            esc = False
+            for ci in range(len(rest)):
+                if esc:
+                    esc = False
+                    continue
+                if rest[ci] == "\\":
+                    esc = True
+                    continue
+                if rest[ci] == '"':
+                    in_str = not in_str
+                    continue
+                if not in_str and rest[ci] == ";" and rest[ci + 1:].lstrip().startswith("else"):
+                    else_idx = ci
+                    break
+
+            if else_idx != -1:
+                then_action = rest[:else_idx].strip()
+                else_part = rest[else_idx + 1:].strip()
+                if else_part.startswith("else"):
+                    else_action = else_part[4:].strip()
+
             if self._eval_condition(condition, state, fields, line):
-                self._execute_statement(rest, state, fields, line)
+                self._execute_statement(then_action, state, fields, line)
+            elif else_action:
+                self._execute_statement(else_action, state, fields, line)
 
     def _execute_for(
         self, stmt: str, state: AwkState, fields: list[str], line: str
     ) -> None:
         """Execute a for statement."""
+        # Parse: for (var in array) body
+        match = re.match(r"for\s*\(\s*(\w+)\s+in\s+(\w+)\s*\)\s*(.*)", stmt, re.DOTALL)
+        if match:
+            var = match.group(1)
+            arr_name = match.group(2)
+            body = match.group(3).strip()
+            if body.startswith("{") and body.endswith("}"):
+                body = body[1:-1]
+
+            # Find all keys for this array
+            keys = []
+            prefix = f"{arr_name}["
+            for k in state.variables:
+                if isinstance(k, str) and k.startswith(prefix) and k.endswith("]"):
+                    keys.append(k[len(prefix):-1])
+
+            for key in keys:
+                state.variables[var] = key
+                self._execute_action(body, state, fields, line)
+            return
+
         # Parse: for (init; condition; update) { action }
         match = re.match(r"for\s*\((.+?);(.+?);(.+?)\)\s*\{(.+?)\}", stmt, re.DOTALL)
+        if not match:
+            # Try without braces: for (init; condition; update) statement
+            match = re.match(r"for\s*\((.+?);(.+?);(.+?)\)\s*(.*)", stmt, re.DOTALL)
         if match:
             init = match.group(1).strip()
             condition = match.group(2).strip()
             update = match.group(3).strip()
-            action = match.group(4)
+            action = match.group(4).strip()
+            if action.startswith("{") and action.endswith("}"):
+                action = action[1:-1]
 
             # Execute init
             self._execute_statement(init, state, fields, line)

@@ -860,6 +860,20 @@ class OverlayFs:
             )
 
         target = real_path.readlink()
+        # Convert absolute real paths back to virtual paths to prevent leaking
+        if target.is_absolute():
+            # Resolve the target to handle symlinks in the path
+            # (e.g., macOS /var -> /private/var)
+            import os
+            resolved_target = Path(os.path.realpath(str(target)))
+            try:
+                relative = resolved_target.relative_to(self._root)
+                if self._mount_point == "/":
+                    return f"/{relative}"
+                return f"{self._mount_point}/{relative}"
+            except ValueError:
+                # Target is outside the overlay root
+                pass
         return str(target)
 
     def resolve_path(self, base: str, path: str) -> str:

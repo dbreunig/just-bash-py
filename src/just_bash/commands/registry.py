@@ -127,6 +127,9 @@ COMMAND_NAMES = [
     "tac",
     "hostname",
     "od",
+    "rmdir",
+    "time",
+    "whoami",
     # Testing utilities
     "argv.py",
     # Builtins
@@ -243,6 +246,9 @@ _command_loaders: list[LazyCommandDef] = [
     LazyCommandDef(name="comm", load=lambda: _load_comm()),
     LazyCommandDef(name="strings", load=lambda: _load_strings()),
     LazyCommandDef(name="od", load=lambda: _load_od()),
+    LazyCommandDef(name="rmdir", load=lambda: _load_rmdir()),
+    LazyCommandDef(name="time", load=lambda: _load_time()),
+    LazyCommandDef(name="whoami", load=lambda: _load_whoami()),
     # Testing utilities
     LazyCommandDef(name="argv.py", load=lambda: _load_argv()),
     # Builtins
@@ -695,6 +701,24 @@ async def _load_od() -> Command:
     """Load the od command."""
     from .od.od import OdCommand
     return OdCommand()
+
+
+async def _load_rmdir() -> Command:
+    """Load the rmdir command."""
+    from .rmdir.rmdir import RmdirCommand
+    return RmdirCommand()
+
+
+async def _load_time() -> Command:
+    """Load the time command."""
+    from .time.time import TimeCommand
+    return TimeCommand()
+
+
+async def _load_whoami() -> Command:
+    """Load the whoami command."""
+    from .whoami.whoami import WhoamiCommand
+    return WhoamiCommand()
 
 
 async def _load_argv() -> Command:

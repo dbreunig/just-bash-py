@@ -78,6 +78,7 @@ def simple_command(
     args: Sequence[WordNode] | None = None,
     assignments: Sequence[AssignmentNode] | None = None,
     redirections: Sequence[RedirectionNode] | None = None,
+    line: int | None = None,
 ) -> SimpleCommandNode:
     """Create a simple command node."""
     return SimpleCommandNode(
@@ -85,6 +86,7 @@ def simple_command(
         args=tuple(args) if args else (),
         assignments=tuple(assignments) if assignments else (),
         redirections=tuple(redirections) if redirections else (),
+        line=line,
     )
 
 

@@ -21,7 +21,7 @@ from ..ast.types import (
     CaseNode,
 )
 from ..types import ExecResult
-from .errors import BreakError, ContinueError, ExecutionLimitError
+from .errors import BreakError, ContinueError, ExecutionLimitError, ExitError
 from .expansion import expand_word_async, expand_word_with_glob, evaluate_arithmetic
 
 if TYPE_CHECKING:
@@ -121,6 +121,9 @@ async def execute_for(ctx: "InterpreterContext", node: ForNode) -> ExecResult:
                     e.stderr = stderr
                     raise
                 continue
+            except ExitError as e:
+                e.prepend_output(stdout, stderr)
+                raise
     finally:
         ctx.state.loop_depth -= 1
 
@@ -177,6 +180,9 @@ async def execute_c_style_for(ctx: "InterpreterContext", node: CStyleForNode) ->
                 if node.update:
                     await evaluate_arithmetic(ctx, node.update.expression)
                 continue
+            except ExitError as e:
+                e.prepend_output(stdout, stderr)
+                raise
 
             # Execute update
             if node.update:
@@ -237,6 +243,9 @@ async def execute_while(ctx: "InterpreterContext", node: WhileNode, stdin: str =
                     e.levels -= 1
                     raise
                 continue
+            except ExitError as e:
+                e.prepend_output(stdout, stderr)
+                raise
     finally:
         ctx.state.loop_depth -= 1
 
@@ -293,6 +302,9 @@ async def execute_until(ctx: "InterpreterContext", node: UntilNode) -> ExecResul
                     e.levels -= 1
                     raise
                 continue
+            except ExitError as e:
+                e.prepend_output(stdout, stderr)
+                raise
     finally:
         ctx.state.loop_depth -= 1
 
@@ -302,6 +314,8 @@ async def execute_until(ctx: "InterpreterContext", node: UntilNode) -> ExecResul
 async def execute_case(ctx: "InterpreterContext", node: CaseNode) -> ExecResult:
     """Execute a case statement."""
     import fnmatch
+    import re as _re
+    from .expansion import glob_to_regex
 
     stdout = ""
     stderr = ""
@@ -310,14 +324,30 @@ async def execute_case(ctx: "InterpreterContext", node: CaseNode) -> ExecResult:
     # Expand the word to match against
     word_value = await expand_word_async(ctx, node.word)
 
+    def _case_match(value: str, pattern: str) -> bool:
+        """Match value against case pattern (supports extglob)."""
+        if _re.search(r'[@?*+!]\(', pattern):
+            regex_pat = "^" + glob_to_regex(pattern) + "$"
+            try:
+                return bool(_re.match(regex_pat, value))
+            except _re.error:
+                pass
+        return fnmatch.fnmatch(value, pattern)
+
+    fall_through = False
     for case_item in node.items:
-        # Check each pattern
-        matched = False
-        for pattern in case_item.patterns:
-            pattern_value = await expand_word_async(ctx, pattern)
-            if fnmatch.fnmatch(word_value, pattern_value):
-                matched = True
-                break
+        if not fall_through:
+            # Check each pattern
+            matched = False
+            for pattern in case_item.patterns:
+                pattern_value = await expand_word_async(ctx, pattern)
+                if _case_match(word_value, pattern_value):
+                    matched = True
+                    break
+        else:
+            # ;& fall-through: execute without pattern check
+            matched = True
+            fall_through = False
 
         if matched:
             # Execute the body for this case
@@ -333,6 +363,7 @@ async def execute_case(ctx: "InterpreterContext", node: CaseNode) -> ExecResult:
                 break
             elif case_item.terminator == ";&":
                 # Fall through to next case body (without pattern check)
+                fall_through = True
                 continue
             elif case_item.terminator == ";;&":
                 # Continue checking patterns
