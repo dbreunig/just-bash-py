@@ -95,8 +95,15 @@ async def handle_type(
         "{", "}", "!", "[[", "]]"
     }
 
-    # Get builtins
+    # Get builtins (includes commands that bash treats as builtins)
     from . import BUILTINS
+    # Commands that are implemented externally but should be reported as builtins
+    _builtin_command_names = {
+        "echo", "printf", "read", "pwd", "test", "[", "kill", "enable",
+        "help", "hash", "ulimit", "umask", "jobs", "fg", "bg", "disown",
+        "suspend", "logout", "dirs", "pushd", "popd", "times", "trap",
+        "caller", "complete", "compgen", "compopt",
+    }
 
     # Get aliases
     aliases = get_aliases(ctx)
@@ -143,7 +150,7 @@ async def handle_type(
                 continue
 
         # Check builtin (unless -P)
-        if not force_path and name in BUILTINS:
+        if not force_path and (name in BUILTINS or name in _builtin_command_names):
             found = True
             if type_only:
                 output.append("builtin")
@@ -154,7 +161,7 @@ async def handle_type(
 
         # Check command registry
         from ...commands import COMMAND_NAMES
-        if name in COMMAND_NAMES:
+        if name in COMMAND_NAMES and name not in _builtin_command_names:
             found = True
             if type_only:
                 output.append("file")
@@ -167,7 +174,7 @@ async def handle_type(
 
         if not found:
             if type_only:
-                output.append("")
+                pass  # bash outputs nothing for type -t on not-found commands
             else:
                 output.append(f"bash: type: {name}: not found")
             exit_code = 1
@@ -228,7 +235,14 @@ async def handle_command(
         from . import BUILTINS
         from ...commands import COMMAND_NAMES
 
-        if cmd_name in BUILTINS:
+        functions = getattr(ctx.state, 'functions', {})
+
+        if cmd_name in functions:
+            if verbose:
+                return _result(f"{cmd_name} is a function\n", "", 0)
+            else:
+                return _result(f"{cmd_name}\n", "", 0)
+        elif cmd_name in BUILTINS:
             if verbose:
                 return _result(f"{cmd_name} is a shell builtin\n", "", 0)
             else:

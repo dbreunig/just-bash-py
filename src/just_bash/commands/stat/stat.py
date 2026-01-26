@@ -113,6 +113,15 @@ class StatCommand:
         # %G - group name (hardcoded for virtual FS)
         result = result.replace("%G", "group")
 
+        # %Y - modification time as seconds since Epoch
+        result = result.replace("%Y", str(int(stat.mtime)))
+
+        # %X - access time as seconds since Epoch (same as mtime for our FS)
+        result = result.replace("%X", str(int(stat.mtime)))
+
+        # %Z - change time as seconds since Epoch (same as mtime for our FS)
+        result = result.replace("%Z", str(int(stat.mtime)))
+
         return result + "\n"
 
     def _default_format(self, path: str, stat) -> str:

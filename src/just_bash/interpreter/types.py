@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional, Awaitable
 
 if TYPE_CHECKING:
+    import random
     from ..ast.types import FunctionDefNode, ScriptNode, StatementNode, CommandNode
     from ..types import ExecResult, IFileSystem, Command, ExecutionLimits
 
@@ -65,6 +66,9 @@ class InterpreterState:
     start_time: float = 0.0
     """Time when shell started (for $SECONDS)."""
 
+    seconds_reset_time: Optional[float] = None
+    """Time when SECONDS was reset (for SECONDS=n assignment)."""
+
     last_background_pid: int = 0
     """PID of last background job (for $!)."""
 
@@ -97,6 +101,9 @@ class InterpreterState:
 
     associative_arrays: set[str] = field(default_factory=set)
     """Set of associative array variable names."""
+
+    random_generator: Optional["random.Random"] = field(default=None, repr=False)
+    """Random number generator for $RANDOM (seeded when RANDOM=n is assigned)."""
 
 
 @dataclass

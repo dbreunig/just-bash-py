@@ -392,6 +392,17 @@ curl      (disabled by default)
 bash      sh
 ```
 
+## Test Results
+
+Test suite history per commit (spec_tests excluded). Each `█` ≈ 53 tests.
+
+```
+Commit   Date         Passed  Failed  Skipped  Graph
+c816182  2026-01-25     2641       3        2  ████████████████████████████████████████████████▒░
+```
+
+`█` passed · `▒` failed · `░` skipped
+
 ## License
 
 Apache 2.0

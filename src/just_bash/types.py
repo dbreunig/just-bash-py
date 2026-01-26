@@ -109,6 +109,14 @@ class IFileSystem(Protocol):
         """Read symbolic link target."""
         ...
 
+    async def utimes(self, path: str, atime: float, mtime: float) -> None:
+        """Set access and modification times for a file."""
+        ...
+
+    async def realpath(self, path: str) -> str:
+        """Resolve path to absolute canonical path (resolve all symlinks)."""
+        ...
+
     def resolve_path(self, base: str, path: str) -> str:
         """Resolve path relative to base."""
         ...

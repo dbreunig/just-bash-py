@@ -271,8 +271,10 @@ def _parse_array_assignment(ctx: "InterpreterContext", name: str, inner: str, is
 
 
 def _eval_integer(expr: str, ctx: "InterpreterContext") -> int:
-    """Evaluate a simple integer expression."""
-    # Handle variable references
+    """Evaluate an integer expression for declare -i."""
+    from ..expansion import evaluate_arithmetic_sync
+    from ...parser.parser import Parser
+
     expr = expr.strip()
 
     # Try direct integer
@@ -288,6 +290,14 @@ def _eval_integer(expr: str, ctx: "InterpreterContext") -> int:
             return int(val)
         except ValueError:
             return 0
+
+    # Try arithmetic expression evaluation
+    try:
+        parser = Parser()
+        arith_expr = parser._parse_arith_comma(expr)
+        return evaluate_arithmetic_sync(ctx, arith_expr)
+    except Exception:
+        pass
 
     return 0
 

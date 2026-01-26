@@ -152,7 +152,10 @@ class GrepCommand:
                     elif arg == "-e":
                         patterns.append(val)
                 else:
-                    for c in arg[1:]:
+                    chars = arg[1:]
+                    ci = 0
+                    while ci < len(chars):
+                        c = chars[ci]
                         if c == 'i':
                             ignore_case = True
                         elif c == 'v':
@@ -186,12 +189,38 @@ class GrepCommand:
                             word_regexp = True
                         elif c == 'x':
                             line_regexp = True
+                        elif c in ('A', 'B', 'C', 'm', 'e'):
+                            # These flags take a value: rest of string or next arg
+                            rest = chars[ci + 1:]
+                            if rest:
+                                val = rest
+                            elif i + 1 < len(args):
+                                i += 1
+                                val = args[i]
+                            else:
+                                return ExecResult(
+                                    stdout="",
+                                    stderr=f"grep: option requires an argument -- '{c}'\n",
+                                    exit_code=2,
+                                )
+                            if c == 'A':
+                                after_context = int(val)
+                            elif c == 'B':
+                                before_context = int(val)
+                            elif c == 'C':
+                                before_context = after_context = int(val)
+                            elif c == 'm':
+                                max_count = int(val)
+                            elif c == 'e':
+                                patterns.append(val)
+                            break  # Rest of chars consumed as value
                         else:
                             return ExecResult(
                                 stdout="",
                                 stderr=f"grep: invalid option -- '{c}'\n",
                                 exit_code=2,
                             )
+                        ci += 1
             elif pattern is None and not patterns:
                 pattern = arg
             else:

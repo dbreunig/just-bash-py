@@ -300,7 +300,10 @@ class Interpreter:
 
     async def execute_pipeline(self, node: PipelineNode) -> ExecResult:
         """Execute a pipeline AST node."""
-        stdin = ""
+        # Use group_stdin for the first command if we're inside a group
+        stdin = self._state.group_stdin or ""
+        # Clear group_stdin after first use so it's not reused
+        self._state.group_stdin = ""
         last_result = _ok()
         pipefail_exit_code = 0
         pipestatus_exit_codes: list[int] = []
@@ -427,13 +430,25 @@ class Interpreter:
         stdout = ""
         stderr = ""
         exit_code = 0
-        for stmt in node.body:
-            result = await sub_interpreter.execute_statement(stmt)
-            stdout += result.stdout
-            stderr += result.stderr
-            exit_code = result.exit_code
+        try:
+            for stmt in node.body:
+                result = await sub_interpreter.execute_statement(stmt)
+                stdout += result.stdout
+                stderr += result.stderr
+                exit_code = result.exit_code
+        except ExitError as e:
+            # exit inside a subshell only exits the subshell
+            stdout += e.stdout
+            stderr += e.stderr
+            exit_code = e.exit_code
 
-        return _result(stdout, stderr, exit_code)
+        result = _result(stdout, stderr, exit_code)
+
+        # Process output redirections on the subshell
+        if node.redirections:
+            result = await self._process_output_redirections(node.redirections, result)
+
+        return result
 
     async def _execute_group(self, node: GroupNode, stdin: str) -> ExecResult:
         """Execute a command group { ... }."""
@@ -456,7 +471,13 @@ class Interpreter:
         finally:
             self._state.group_stdin = saved_group_stdin
 
-        return _result(stdout, stderr, exit_code)
+        result = _result(stdout, stderr, exit_code)
+
+        # Process output redirections on the group
+        if node.redirections:
+            result = await self._process_output_redirections(node.redirections, result)
+
+        return result
 
     async def _execute_function_def(self, node: FunctionDefNode) -> ExecResult:
         """Execute a function definition."""
@@ -495,8 +516,9 @@ class Interpreter:
         if node.line is not None:
             self._state.current_line = node.line
 
-        # Clear expansion stderr
+        # Clear expansion state
         self._state.expansion_stderr = ""
+        self._state.expansion_exit_code = None
 
         # Temporary assignments for command environment
         temp_assignments: dict[str, str | None] = {}
@@ -505,21 +527,55 @@ class Interpreter:
         for assignment in node.assignments:
             name = assignment.name
 
+            # Check for array subscript in name: a[idx]=value
+            import re as _re
+            _array_lhs = _re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\[(.+)\]$', name)
+
             # Check for array assignment
             if assignment.array:
-                # Clear existing array elements
-                prefix = f"{name}_"
-                to_remove = [k for k in self._state.env if k.startswith(prefix) and not k.startswith(f"{name}__")]
-                for k in to_remove:
-                    del self._state.env[k]
+                if assignment.append:
+                    # a+=(2 3) - append to existing array
+                    # Find next available index
+                    from .expansion import get_array_elements as _get_elems
+                    existing_elems = _get_elems(self._ctx, name)
+                    next_idx = (max(i for i, _ in existing_elems) + 1) if existing_elems else 0
 
-                # Mark as array
-                self._state.env[f"{name}__is_array"] = "indexed"
+                    # Mark as array if not already
+                    if f"{name}__is_array" not in self._state.env:
+                        self._state.env[f"{name}__is_array"] = "indexed"
 
-                # Expand and store each element
-                for idx, elem in enumerate(assignment.array):
-                    elem_value = await expand_word_async(self._ctx, elem)
-                    self._state.env[f"{name}_{idx}"] = elem_value
+                    # Expand and store each new element
+                    for i, elem in enumerate(assignment.array):
+                        elem_value = await expand_word_async(self._ctx, elem)
+                        self._state.env[f"{name}_{next_idx + i}"] = elem_value
+                else:
+                    # a=(1 2 3) - replace array
+                    # Clear existing array elements
+                    prefix = f"{name}_"
+                    to_remove = [k for k in self._state.env if k.startswith(prefix) and not k.startswith(f"{name}__")]
+                    for k in to_remove:
+                        del self._state.env[k]
+
+                    # Mark as array
+                    self._state.env[f"{name}__is_array"] = "indexed"
+
+                    # Expand and store each element, handling [idx]=value syntax
+                    auto_idx = 0
+                    for elem in assignment.array:
+                        elem_value = await expand_word_async(self._ctx, elem)
+                        # Check for [idx]=value syntax (from GlobPart + LiteralPart)
+                        bracket_match = _re.match(r'^\[([^\]]+)\]=(.*)$', elem_value)
+                        if bracket_match:
+                            key = bracket_match.group(1)
+                            val = bracket_match.group(2)
+                            self._state.env[f"{name}_{key}"] = val
+                            try:
+                                auto_idx = int(key) + 1
+                            except ValueError:
+                                pass  # assoc array key
+                        else:
+                            self._state.env[f"{name}_{auto_idx}"] = elem_value
+                            auto_idx += 1
                 continue
 
             # Expand assignment value
@@ -529,10 +585,30 @@ class Interpreter:
 
             if node.name is None:
                 # Assignment-only command - set in environment
-                if assignment.append:
+                if _array_lhs:
+                    # a[idx]=value or a[idx]+=value
+                    arr_name = _array_lhs.group(1)
+                    subscript = _array_lhs.group(2)
+                    # Mark as array if not already
+                    if f"{arr_name}__is_array" not in self._state.env:
+                        self._state.env[f"{arr_name}__is_array"] = "indexed"
+                    if assignment.append:
+                        existing = self._state.env.get(f"{arr_name}_{subscript}", "")
+                        self._state.env[f"{arr_name}_{subscript}"] = existing + value
+                    else:
+                        self._state.env[f"{arr_name}_{subscript}"] = value
+                elif assignment.append:
                     existing = self._state.env.get(name, "")
                     self._state.env[name] = existing + value
                 else:
+                    # Special handling for SECONDS - reset timer
+                    if name == "SECONDS":
+                        import time
+                        try:
+                            offset = int(value)
+                            self._state.seconds_reset_time = time.time() - offset
+                        except (ValueError, TypeError):
+                            self._state.seconds_reset_time = time.time()
                     self._state.env[name] = value
             else:
                 # Temporary assignment for command
@@ -559,6 +635,11 @@ class Interpreter:
                         lines = heredoc_content.split("\n")
                         heredoc_content = "\n".join(line.lstrip("\t") for line in lines)
                     stdin = heredoc_content
+            elif redir.operator == "<<<":
+                # Here-string: expand the word and use as stdin with trailing newline
+                if redir.target is not None and isinstance(redir.target, WordNode):
+                    herestring_content = await expand_word_async(self._ctx, redir.target)
+                    stdin = herestring_content + "\n"
             elif redir.operator == "<":
                 # Input redirection: read file content into stdin
                 if redir.target is not None and isinstance(redir.target, WordNode):
@@ -606,6 +687,14 @@ class Interpreter:
                 expanded = await expand_word_with_glob(self._ctx, arg)
                 args.extend(expanded["values"])
 
+            # Check for expansion errors (e.g., failglob)
+            if self._state.expansion_exit_code is not None:
+                exit_code = self._state.expansion_exit_code
+                stderr = self._state.expansion_stderr
+                self._state.expansion_exit_code = None
+                self._state.expansion_stderr = ""
+                return _result("", stderr, exit_code)
+
             # Update last arg for $_
             if args:
                 self._state.last_arg = args[-1]
@@ -652,12 +741,25 @@ class Interpreter:
         stdout = result.stdout
         stderr = result.stderr
 
-        for redir in redirections:
+        # Pre-process: find the last file redirect index per fd for "last wins" semantics
+        # For > or >>, last redirect per fd gets the content; earlier ones just create/truncate
+        last_file_redir_for_fd: dict[int, int] = {}
+        for idx, redir in enumerate(redirections):
+            if not isinstance(redir, RedirectionNode):
+                continue
+            if redir.operator in (">", ">>"):
+                fd = redir.fd if redir.fd is not None else 1
+                last_file_redir_for_fd[fd] = idx
+            elif redir.operator == "&>":
+                last_file_redir_for_fd[1] = idx
+                last_file_redir_for_fd[2] = idx
+
+        for idx, redir in enumerate(redirections):
             if not isinstance(redir, RedirectionNode):
                 continue
 
-            # Skip heredocs - already handled
-            if redir.operator in ("<<", "<<-"):
+            # Skip heredocs and input redirections - already handled
+            if redir.operator in ("<<", "<<-", "<<<", "<"):
                 continue
 
             # Get the target path
@@ -670,20 +772,44 @@ class Interpreter:
             else:
                 continue
 
-            # Resolve to absolute path
-            target_path = self._fs.resolve_path(self._state.cwd, target_path)
-
             try:
                 fd = redir.fd if redir.fd is not None else 1  # Default to stdout
 
-                if redir.operator == ">":
-                    # Overwrite file
-                    if fd == 1:
-                        await self._fs.write_file(target_path, stdout)
+                # Check for FD duplication operators - don't resolve as path
+                is_fd_dup = redir.operator in (">&", "<&")
+                is_fd_target = is_fd_dup and target_path in ("0", "1", "2", "-")
+
+                # Handle /dev/null and special device files
+                if target_path in ("/dev/null", "/dev/zero"):
+                    if redir.operator in (">", ">>"):
+                        if fd == 1:
+                            stdout = ""
+                        elif fd == 2:
+                            stderr = ""
+                    elif redir.operator == "&>":
                         stdout = ""
-                    elif fd == 2:
-                        await self._fs.write_file(target_path, stderr)
                         stderr = ""
+                    continue
+                elif target_path in ("/dev/stdout", "/dev/stderr", "/dev/stdin"):
+                    continue
+
+                # Resolve to absolute path for file operations
+                if not is_fd_target:
+                    target_path = self._fs.resolve_path(self._state.cwd, target_path)
+
+                if redir.operator == ">":
+                    is_last_for_fd = last_file_redir_for_fd.get(fd) == idx
+                    if is_last_for_fd:
+                        # Last redirect for this fd - write content
+                        if fd == 1:
+                            await self._fs.write_file(target_path, stdout)
+                            stdout = ""
+                        elif fd == 2:
+                            await self._fs.write_file(target_path, stderr)
+                            stderr = ""
+                    else:
+                        # Not the last redirect - just create/truncate the file
+                        await self._fs.write_file(target_path, "")
 
                 elif redir.operator == ">>":
                     # Append to file
@@ -691,12 +817,18 @@ class Interpreter:
                         existing = await self._fs.read_file(target_path)
                     except FileNotFoundError:
                         existing = ""
-                    if fd == 1:
-                        await self._fs.write_file(target_path, existing + stdout)
-                        stdout = ""
-                    elif fd == 2:
-                        await self._fs.write_file(target_path, existing + stderr)
-                        stderr = ""
+                    is_last_for_fd = last_file_redir_for_fd.get(fd) == idx
+                    if is_last_for_fd:
+                        if fd == 1:
+                            await self._fs.write_file(target_path, existing + stdout)
+                            stdout = ""
+                        elif fd == 2:
+                            await self._fs.write_file(target_path, existing + stderr)
+                            stderr = ""
+                    else:
+                        # Not last - ensure file exists but don't write content
+                        if not existing:
+                            await self._fs.write_file(target_path, "")
 
                 elif redir.operator == "&>":
                     # Redirect both stdout and stderr to file
@@ -705,16 +837,29 @@ class Interpreter:
                     stderr = ""
 
                 elif redir.operator == ">&":
-                    # Redirect stdout to stderr or fd duplication
+                    # FD duplication
                     if target_path == "2":
-                        stderr = stderr + stdout
-                        stdout = ""
+                        # stdout to stderr: e.g., echo foo >&2
+                        if fd == 1:
+                            stderr = stderr + stdout
+                            stdout = ""
                     elif target_path == "1":
-                        stdout = stdout + stderr
-                        stderr = ""
+                        # stderr to stdout: e.g., cmd 2>&1
+                        if fd == 2:
+                            stdout = stdout + stderr
+                            stderr = ""
+                        else:
+                            # fd>&1 - redirect fd to stdout
+                            pass
+                    elif target_path == "-":
+                        # Close FD - just discard
+                        pass
                     else:
-                        await self._fs.write_file(target_path, stdout)
-                        stdout = ""
+                        # >&file is same as &> for fd 1
+                        if fd == 1:
+                            await self._fs.write_file(target_path, stdout + stderr)
+                            stdout = ""
+                            stderr = ""
 
                 elif redir.operator == "2>&1":
                     # Redirect stderr to stdout
@@ -768,6 +913,10 @@ class Interpreter:
             self._state.env[str(i + 1)] = arg
         self._state.env["#"] = str(len(expanded_args))
 
+        # Save and set FUNCNAME
+        saved_funcname = self._state.env.get("FUNCNAME")
+        self._state.env["FUNCNAME"] = name
+
         # Create local scope
         self._state.local_scopes.append({})
 
@@ -779,6 +928,34 @@ class Interpreter:
             except ReturnError as e:
                 return _result(e.stdout, e.stderr, e.exit_code)
         finally:
+            # Pop local scope and restore saved variables
+            scope = self._state.local_scopes.pop()
+            # First pass: identify arrays that need element cleanup
+            # If __is_array is restored to None, the array didn't exist before
+            # and we need to clean up all element keys created inside the function
+            arrays_to_clean = []
+            for var_name, original_value in scope.items():
+                if var_name.endswith("__is_array") and original_value is None:
+                    arr_name = var_name[:-len("__is_array")]
+                    arrays_to_clean.append(arr_name)
+
+            # Clean up array element keys created inside the function
+            for arr_name in arrays_to_clean:
+                prefix = f"{arr_name}_"
+                to_remove = [
+                    k for k in self._state.env
+                    if k.startswith(prefix) and not k.startswith(f"{arr_name}__")
+                ]
+                for k in to_remove:
+                    del self._state.env[k]
+
+            # Second pass: restore all saved variables
+            for var_name, original_value in scope.items():
+                if original_value is None:
+                    self._state.env.pop(var_name, None)
+                else:
+                    self._state.env[var_name] = original_value
+
             # Restore positional parameters
             i = 1
             while str(i) in self._state.env:
@@ -788,8 +965,12 @@ class Interpreter:
                 self._state.env[k] = v
             self._state.env["#"] = saved_count
 
-            # Pop local scope
-            self._state.local_scopes.pop()
+            # Restore FUNCNAME
+            if saved_funcname is None:
+                self._state.env.pop("FUNCNAME", None)
+            else:
+                self._state.env["FUNCNAME"] = saved_funcname
+
             self._state.call_depth -= 1
 
     async def _execute_builtin(

@@ -142,6 +142,19 @@ class NewCommand:
 - Use `ctx.fs` for all filesystem operations
 - Handle errors gracefully with appropriate exit codes
 - Verify with `pytest tests/ --ignore=tests/spec_tests/ -v` before finishing
+- Do not opt for simplified or incomplete implementations unless explicitly granted permission to do so.
+
+## README Test Results Visualization
+
+**IMPORTANT: Whenever committing to GitHub, update the Test Results section in `README.md`.**
+
+Before committing, run `pytest tests/ --ignore=tests/spec_tests/ -q` and add a new row to the stacked bar graph in the `## Test Results` section of `README.md`. Use the commit hash (short SHA), current date, and test counts. The graph bar is 50 characters wide using:
+
+- `█` for passed (proportional, minimum 1 if non-zero)
+- `▒` for failed (minimum 1 if non-zero)
+- `░` for skipped (minimum 1 if non-zero)
+
+Scale: divide total tests by 50 to get the "tests per block" value. Adjust the passed count to keep the total bar width at 50 characters after applying minimums for failed/skipped. Update the "Each `█` ≈ N tests" note in the section header if the scale changes.
 
 ## Known Issues
 

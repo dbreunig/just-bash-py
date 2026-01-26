@@ -55,15 +55,9 @@ class ReadlinkCommand:
                 stat = await ctx.fs.lstat(resolved)
 
                 if canonicalize:
-                    # Return the canonical path
-                    if stat.is_symbolic_link:
-                        target = await ctx.fs.readlink(resolved)
-                        if not target.startswith("/"):
-                            import os
-                            target = ctx.fs.resolve_path(os.path.dirname(resolved), target)
-                        stdout_parts.append(target)
-                    else:
-                        stdout_parts.append(resolved)
+                    # Return the canonical path (fully resolved)
+                    canonical = await ctx.fs.realpath(resolved)
+                    stdout_parts.append(canonical)
                 else:
                     # Only works on symlinks
                     if stat.is_symbolic_link:

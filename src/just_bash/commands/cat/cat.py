@@ -117,8 +117,12 @@ class CatCommand:
 
         for file in files:
             try:
-                if file == "-":
+                if file == "-" or file == "/dev/stdin":
                     content = ctx.stdin
+                elif file == "/dev/stdout":
+                    content = ""
+                elif file == "/dev/stderr":
+                    content = ""
                 else:
                     # Resolve path
                     path = ctx.fs.resolve_path(ctx.cwd, file)

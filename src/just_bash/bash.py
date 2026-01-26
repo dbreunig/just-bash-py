@@ -28,7 +28,7 @@ import nest_asyncio  # type: ignore[import-untyped]
 
 from .commands import create_command_registry
 from .fs import InMemoryFs
-from .interpreter import Interpreter, InterpreterState, ShellOptions
+from .interpreter import ExitError, Interpreter, InterpreterState, ShellOptions
 from .parser import parse, unescape_html_entities
 from .types import (
     Command,
@@ -104,6 +104,8 @@ class Bash:
             "SHELL": "/bin/bash",
             "PWD": cwd,
             "?": "0",
+            "SHLVL": "1",
+            "BASH_VERSION": "5.0.0(1)-release",
         }
         if env:
             default_env.update(env)
@@ -174,7 +176,15 @@ class Bash:
             self._interpreter.state.env["PWD"] = cwd
 
         # Execute
-        return await self._interpreter.execute_script(ast)
+        try:
+            return await self._interpreter.execute_script(ast)
+        except ExitError as error:
+            return ExecResult(
+                stdout=error.stdout,
+                stderr=error.stderr,
+                exit_code=error.exit_code,
+                env=dict(self._interpreter.state.env),
+            )
 
     def run(
         self,
