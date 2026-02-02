@@ -53,7 +53,7 @@ def _process_escapes(s: str) -> str:
                     octal += s[j]
                     j += 1
                 if octal:
-                    result.append(chr(int(octal, 8)))
+                    result.append(chr(int(octal, 8) & 0xFF))
                 else:
                     result.append("\0")
                 i = j
@@ -70,6 +70,38 @@ def _process_escapes(s: str) -> str:
                 else:
                     result.append(s[i])
                     i += 1
+            elif next_char == "u":
+                # Unicode escape: \uHHHH (4 hex digits)
+                hex_digits = ""
+                j = i + 2
+                while j < len(s) and len(hex_digits) < 4 and s[j] in "0123456789abcdefABCDEF":
+                    hex_digits += s[j]
+                    j += 1
+                if hex_digits:
+                    try:
+                        result.append(chr(int(hex_digits, 16)))
+                    except (ValueError, OverflowError):
+                        result.append("\\u" + hex_digits)
+                    i = j
+                else:
+                    result.append("\\u")
+                    i += 2
+            elif next_char == "U":
+                # Unicode escape: \UHHHHHHHH (8 hex digits)
+                hex_digits = ""
+                j = i + 2
+                while j < len(s) and len(hex_digits) < 8 and s[j] in "0123456789abcdefABCDEF":
+                    hex_digits += s[j]
+                    j += 1
+                if hex_digits:
+                    try:
+                        result.append(chr(int(hex_digits, 16)))
+                    except (ValueError, OverflowError):
+                        result.append("\\U" + hex_digits)
+                    i = j
+                else:
+                    result.append("\\U")
+                    i += 2
             elif next_char == "c":
                 # \c stops output
                 return "".join(result)

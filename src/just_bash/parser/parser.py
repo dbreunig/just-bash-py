@@ -1001,8 +1001,8 @@ class Parser:
         if self._check(TokenType.DPAREN_START):
             return self._parse_c_style_for()
 
-        # Get variable name
-        if not self._check(TokenType.NAME, TokenType.WORD):
+        # Get variable name (bash allows 'in' and other keywords as variable names here)
+        if not self._check(TokenType.NAME, TokenType.WORD, TokenType.IN):
             raise self._error("Expected variable name after 'for'")
         variable = self._advance().value
 
@@ -1720,6 +1720,29 @@ class Parser:
                 i = j
                 continue
 
+            # Handle $[...] legacy arithmetic expansion (equivalent to $((...)))
+            if c == "$" and i + 1 < len(value) and value[i + 1] == "[":
+                flush_literal()
+                # Find matching closing ]
+                depth = 1
+                start = i + 2
+                j = start
+                while j < len(value) and depth > 0:
+                    if value[j] == "[":
+                        depth += 1
+                    elif value[j] == "]":
+                        depth -= 1
+                    j += 1
+                arith_expr = value[start : j - 1]
+                arith_node = self._parse_arithmetic_expression(arith_expr)
+                parts.append(
+                    ArithmeticExpansionPart(
+                        expression=ArithmeticExpressionNode(expression=arith_node),
+                    )
+                )
+                i = j
+                continue
+
             # Handle $(...) command substitution
             if c == "$" and i + 1 < len(value) and value[i + 1] == "(":
                 flush_literal()
@@ -1729,6 +1752,7 @@ class Parser:
                 j = start
                 while j < len(value) and depth > 0:
                     if value[j] == "(":
+
                         depth += 1
                     elif value[j] == ")":
                         depth -= 1
@@ -2200,13 +2224,23 @@ class Parser:
 
         # Scan right-to-left for assignment operator (right-associative)
         depth = 0
+        brace_depth = 0
+        bracket_depth = 0
         for i in range(len(expr) - 1, -1, -1):
             c = expr[i]
             if c == ')':
                 depth += 1
             elif c == '(':
                 depth -= 1
-            elif depth == 0:
+            elif c == '}':
+                brace_depth += 1
+            elif c == '{' and brace_depth > 0:
+                brace_depth -= 1
+            elif c == ']':
+                bracket_depth += 1
+            elif c == '[' and bracket_depth > 0:
+                bracket_depth -= 1
+            elif depth == 0 and brace_depth == 0 and bracket_depth == 0:
                 for op in assign_ops:
                     op_start = i - len(op) + 1
                     if op_start >= 0 and expr[op_start:i + 1] == op:
@@ -2237,30 +2271,65 @@ class Parser:
         """Parse ternary: cond ? a : b"""
         # Find unquoted ? and : for ternary
         depth = 0
+        brace_depth = 0
+        bracket_depth = 0
         question_pos = -1
-        for i, c in enumerate(expr):
-            if c == '(':
+        i = 0
+        while i < len(expr):
+            c = expr[i]
+            if c == '$' and i + 1 < len(expr) and expr[i + 1] == '{':
+                brace_depth += 1
+                i += 2
+                continue
+            elif c == '{' and brace_depth > 0:
+                brace_depth += 1
+            elif c == '}' and brace_depth > 0:
+                brace_depth -= 1
+            elif brace_depth > 0:
+                i += 1
+                continue
+            elif c == '[':
+                bracket_depth += 1
+            elif c == ']' and bracket_depth > 0:
+                bracket_depth -= 1
+            elif c == '(':
                 depth += 1
             elif c == ')':
                 depth -= 1
-            elif c == '?' and depth == 0:
+            elif c == '?' and depth == 0 and bracket_depth == 0:
                 question_pos = i
+                i += 1
                 break
+            i += 1
 
         if question_pos > 0:
             # Find the matching : (must track nested ternary depth)
             colon_pos = -1
             ternary_depth = 0
             paren_depth = 0
+            brace_depth2 = 0
+            bracket_depth2 = 0
             for i in range(question_pos + 1, len(expr)):
                 c = expr[i]
-                if c == '(':
+                if c == '$' and i + 1 < len(expr) and expr[i + 1] == '{':
+                    brace_depth2 += 1
+                elif c == '{' and brace_depth2 > 0:
+                    brace_depth2 += 1
+                elif c == '}' and brace_depth2 > 0:
+                    brace_depth2 -= 1
+                elif brace_depth2 > 0:
+                    continue
+                elif c == '[':
+                    bracket_depth2 += 1
+                elif c == ']' and bracket_depth2 > 0:
+                    bracket_depth2 -= 1
+                elif c == '(':
                     paren_depth += 1
                 elif c == ')':
                     paren_depth -= 1
-                elif c == '?' and paren_depth == 0:
+                elif c == '?' and paren_depth == 0 and bracket_depth2 == 0:
                     ternary_depth += 1  # Nested ternary
-                elif c == ':' and paren_depth == 0:
+                elif c == ':' and paren_depth == 0 and bracket_depth2 == 0:
                     if ternary_depth > 0:
                         ternary_depth -= 1  # Close nested ternary
                     else:
@@ -2324,6 +2393,8 @@ class Parser:
         """Parse binary operators at a given precedence level."""
         expr = expr.strip()
         depth = 0
+        brace_depth = 0  # Track ${...} depth
+        bracket_depth = 0  # Track [...] depth
 
         # Sort operators by length (longest first) to match ** before *
         ops = sorted(operators, key=len, reverse=True)
@@ -2338,13 +2409,28 @@ class Parser:
         i = 0
         while i < len(expr):
             c = expr[i]
-            if c == '(':
+            if c == '(' and brace_depth == 0:
                 depth += 1
                 i += 1
-            elif c == ')':
+            elif c == ')' and brace_depth == 0:
                 depth -= 1
                 i += 1
-            elif depth == 0:
+            elif c == '$' and i + 1 < len(expr) and expr[i + 1] == '{':
+                brace_depth += 1
+                i += 2
+            elif c == '{' and brace_depth > 0:
+                brace_depth += 1
+                i += 1
+            elif c == '}' and brace_depth > 0:
+                brace_depth -= 1
+                i += 1
+            elif c == '[' and depth == 0 and brace_depth == 0:
+                bracket_depth += 1
+                i += 1
+            elif c == ']' and bracket_depth > 0:
+                bracket_depth -= 1
+                i += 1
+            elif depth == 0 and brace_depth == 0 and bracket_depth == 0:
                 # First check exclusions - skip past them entirely
                 skip_len = 0
                 for ex in exclude:

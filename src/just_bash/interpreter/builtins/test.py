@@ -95,12 +95,17 @@ async def _evaluate(ctx: "InterpreterContext", args: list[str]) -> bool:
     if not args:
         return False
 
+    # Single argument: non-empty string is true (POSIX rule)
+    # Must come before operator checks since operators are valid strings
+    if len(args) == 1:
+        return args[0] != ""
+
     # Handle negation
-    if args[0] == "!":
+    if args[0] == "!" and len(args) > 1:
         return not await _evaluate(ctx, args[1:])
 
-    # Handle parentheses
-    if args[0] == "(":
+    # Handle parentheses (only when there are enough args)
+    if args[0] == "(" and len(args) > 1:
         # Find matching )
         depth = 1
         end_idx = 1
@@ -133,26 +138,30 @@ async def _evaluate(ctx: "InterpreterContext", args: list[str]) -> bool:
             right = await _evaluate(ctx, args[i + 1:])
             return left or right
 
-    # Single argument: non-empty string is true, but check for misused operators
-    if len(args) == 1:
-        arg = args[0]
-        # If it looks like an operator (starts with -) but isn't followed by
-        # an operand, it could be a misused unary operator
-        if arg.startswith("-") and len(arg) > 1:
-            # Check if this looks like an operator that needs an operand
-            if arg in _UNARY_OPS:
-                raise ValueError(f"{arg}: unary operator expected")
-        return arg != ""
-
     # Two arguments: unary operators
     if len(args) == 2:
         return await _unary_test(ctx, args[0], args[1])
 
     # Three arguments: binary operators
     if len(args) == 3:
-        return await _binary_test(ctx, args[0], args[1], args[2])
+        # Special case: if middle arg is a known binary operator, use binary test
+        if args[1] in ("=", "==", "!=", "<", ">",
+                        "-eq", "-ne", "-lt", "-le", "-gt", "-ge",
+                        "-nt", "-ot", "-ef"):
+            return await _binary_test(ctx, args[0], args[1], args[2])
+        # Otherwise handle as compound (e.g., [ ! -f file ])
+        if args[0] == "!":
+            return not await _evaluate(ctx, args[1:])
+        raise ValueError(f"unknown binary operator '{args[1]}'")
 
-    # More than 3 args should be handled by -a/-o above
+    # Four arguments: could be ! with 3-arg expression, or compound
+    if len(args) == 4:
+        if args[0] == "!":
+            return not await _evaluate(ctx, args[1:])
+        # Otherwise handled by -a/-o above
+        raise ValueError("too many arguments")
+
+    # More than 4 args should be handled by -a/-o above
     raise ValueError("too many arguments")
 
 
@@ -185,7 +194,7 @@ async def _unary_test(ctx: "InterpreterContext", op: str, arg: str) -> bool:
         return await _file_test(ctx, arg, "file")
     if op == "-d":
         return await _file_test(ctx, arg, "directory")
-    if op == "-e":
+    if op in ("-e", "-a"):
         return await _file_test(ctx, arg, "exists")
     if op == "-s":
         return await _file_test(ctx, arg, "size")
@@ -197,6 +206,26 @@ async def _unary_test(ctx: "InterpreterContext", op: str, arg: str) -> bool:
         return await _file_test(ctx, arg, "executable")
     if op in ("-h", "-L"):
         return await _file_test(ctx, arg, "symlink")
+    if op == "-b":
+        return False  # block special - not in virtual fs
+    if op == "-c":
+        return False  # character special - not in virtual fs
+    if op == "-p":
+        return False  # named pipe - not in virtual fs
+    if op == "-S":
+        return False  # socket - not in virtual fs
+    if op == "-g":
+        return False  # setgid - not in virtual fs
+    if op == "-G":
+        return await _file_test(ctx, arg, "exists")  # owned by effective group
+    if op == "-k":
+        return False  # sticky bit - not in virtual fs
+    if op == "-O":
+        return await _file_test(ctx, arg, "exists")  # owned by effective user
+    if op == "-u":
+        return False  # setuid - not in virtual fs
+    if op == "-N":
+        return await _file_test(ctx, arg, "exists")  # modified since last read
 
     # String tests
     if op == "-z":
@@ -204,7 +233,44 @@ async def _unary_test(ctx: "InterpreterContext", op: str, arg: str) -> bool:
     if op == "-n":
         return arg != ""
 
-    # Default: two non-operator args means binary comparison
+    # Variable test: -v checks if a variable is set
+    if op == "-v":
+        # Check if variable is set (even to empty string)
+        from ..types import VariableStore
+        env = ctx.state.env
+        # Handle array subscripts: var[idx]
+        if "[" in arg and arg.endswith("]"):
+            bracket_idx = arg.index("[")
+            base_name = arg[:bracket_idx]
+            subscript = arg[bracket_idx + 1:-1]
+            if subscript in ("@", "*"):
+                # Check if array has any elements
+                prefix = f"{base_name}_"
+                return any(k.startswith(prefix) and not k.startswith(f"{base_name}__")
+                          for k in env.keys())
+            key = f"{base_name}_{subscript}"
+            return key in env
+        return arg in env
+
+    # Shell option test: -o checks if an option is enabled
+    if op == "-o":
+        if arg == "errexit":
+            return getattr(ctx.state.options, 'errexit', False)
+        elif arg == "nounset":
+            return getattr(ctx.state.options, 'nounset', False)
+        elif arg == "xtrace":
+            return getattr(ctx.state.options, 'xtrace', False)
+        elif arg == "pipefail":
+            return getattr(ctx.state.options, 'pipefail', False)
+        return False
+
+    # Terminal test: -t checks if fd is a terminal (always false in virtual env)
+    if op == "-t":
+        return False
+
+    # If op is not a known operator, treat as 2-arg string test
+    # e.g., [ "str1" = "str2" ] should be handled by _binary_test,
+    # but [ "str1" "str2" ] is an error
     raise ValueError(f"unknown unary operator '{op}'")
 
 
@@ -245,7 +311,58 @@ async def _binary_test(
         if op == "-ge":
             return left_num >= right_num
 
+    # File comparison operators
+    if op == "-nt":
+        # FILE1 is newer than FILE2
+        return await _file_compare(ctx, left, right, "newer")
+    if op == "-ot":
+        # FILE1 is older than FILE2
+        return await _file_compare(ctx, left, right, "older")
+    if op == "-ef":
+        # FILE1 and FILE2 refer to same file (same device and inode)
+        full_left = ctx.fs.resolve_path(ctx.state.cwd, left)
+        full_right = ctx.fs.resolve_path(ctx.state.cwd, right)
+        try:
+            return (await ctx.fs.exists(full_left)
+                    and await ctx.fs.exists(full_right)
+                    and full_left == full_right)
+        except Exception:
+            return False
+
     raise ValueError(f"unknown binary operator '{op}'")
+
+
+async def _file_compare(ctx: "InterpreterContext", file1: str, file2: str, comparison: str) -> bool:
+    """Compare two files by modification time."""
+    full1 = ctx.fs.resolve_path(ctx.state.cwd, file1)
+    full2 = ctx.fs.resolve_path(ctx.state.cwd, file2)
+    try:
+        exists1 = await ctx.fs.exists(full1)
+        exists2 = await ctx.fs.exists(full2)
+
+        if not exists1 and not exists2:
+            return False
+        if not exists1:
+            return comparison == "older"
+        if not exists2:
+            return comparison == "newer"
+
+        # In virtual filesystem, try to get stat info
+        try:
+            stat1 = await ctx.fs.stat(full1)
+            stat2 = await ctx.fs.stat(full2)
+            if hasattr(stat1, 'mtime') and hasattr(stat2, 'mtime'):
+                if comparison == "newer":
+                    return stat1.mtime > stat2.mtime
+                else:
+                    return stat1.mtime < stat2.mtime
+        except (AttributeError, Exception):
+            pass
+
+        # Without mtime, files that exist are considered equal
+        return False
+    except Exception:
+        return False
 
 
 async def _file_test(ctx: "InterpreterContext", path: str, test_type: str) -> bool:

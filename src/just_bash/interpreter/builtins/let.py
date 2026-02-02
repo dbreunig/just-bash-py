@@ -23,7 +23,7 @@ async def handle_let(
     ctx: "InterpreterContext", args: list[str]
 ) -> "ExecResult":
     """Execute the let builtin."""
-    from ..expansion import evaluate_arithmetic_sync
+    from ..expansion import evaluate_arithmetic
     from ...parser.parser import Parser
 
     if not args:
@@ -36,7 +36,7 @@ async def handle_let(
         try:
             # Parse and evaluate the arithmetic expression
             arith_expr = parser._parse_arithmetic_expression(expr_str)
-            last_value = evaluate_arithmetic_sync(ctx, arith_expr)
+            last_value = await evaluate_arithmetic(ctx, arith_expr)
         except Exception as e:
             return _result("", f"bash: let: {expr_str}: syntax error\n", 1)
 

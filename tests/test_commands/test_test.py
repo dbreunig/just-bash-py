@@ -281,9 +281,17 @@ class TestTestExitCodes:
     async def test_error_returns_2(self):
         """Error condition returns exit code 2."""
         bash = Bash()
-        # Unary operator without operand is an error
-        result = await bash.exec("test -f")
+        # Missing ] in [ command is an error
+        result = await bash.exec("[ -f /tmp")
         assert result.exit_code == 2
+
+    @pytest.mark.asyncio
+    async def test_single_operator_arg_is_string_test(self):
+        """Single argument (even operator-like) is non-empty string test."""
+        bash = Bash()
+        # bash treats single args as non-empty string tests
+        result = await bash.exec("test -f")
+        assert result.exit_code == 0  # "-f" is non-empty → true
 
     @pytest.mark.asyncio
     async def test_no_args_returns_1(self):

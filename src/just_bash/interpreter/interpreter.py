@@ -41,7 +41,7 @@ from .errors import (
     NounsetError,
     ReturnError,
 )
-from .types import InterpreterContext, InterpreterState, ShellOptions
+from .types import InterpreterContext, InterpreterState, ShellOptions, VariableStore, FDTable
 from .expansion import expand_word_async, expand_word_with_glob, get_variable, evaluate_arithmetic
 from .conditionals import evaluate_conditional
 from .control_flow import (
@@ -80,6 +80,17 @@ def _is_shopt_set(env: dict[str, str], name: str) -> bool:
     return DEFAULT_SHOPTS.get(name, False)
 
 
+def _word_has_quoting(word) -> bool:
+    """Check if a word contains any quoting (single, double, or escape)."""
+    from ..ast.types import SingleQuotedPart, DoubleQuotedPart, EscapedPart
+    if word is None or not hasattr(word, 'parts'):
+        return False
+    for part in word.parts:
+        if isinstance(part, (SingleQuotedPart, DoubleQuotedPart, EscapedPart)):
+            return True
+    return False
+
+
 class Interpreter:
     """AST interpreter for bash scripts."""
 
@@ -102,14 +113,14 @@ class Interpreter:
         self._commands = commands
         self._limits = limits
         self._state = state or InterpreterState(
-            env={
+            env=VariableStore({
                 "PATH": "/usr/local/bin:/usr/bin:/bin",
                 "HOME": "/home/user",
                 "USER": "user",
                 "SHELL": "/bin/bash",
                 "PWD": "/home/user",
                 "?": "0",
-            },
+            }),
             cwd="/home/user",
             previous_dir="/home/user",
             start_time=time.time(),
@@ -147,7 +158,9 @@ class Interpreter:
 
         # Create a new state for the subshell if env/cwd are provided
         if env or cwd:
-            new_env = {**self._state.env, **(env or {})}
+            new_env = self._state.env.copy() if isinstance(self._state.env, VariableStore) else VariableStore(self._state.env)
+            if env:
+                new_env.update(env)
             new_state = InterpreterState(
                 env=new_env,
                 cwd=cwd or self._state.cwd,
@@ -161,6 +174,7 @@ class Interpreter:
                     xtrace=self._state.options.xtrace,
                     verbose=self._state.options.verbose,
                 ),
+                fd_table=self._state.fd_table.clone(),
             )
             sub_interpreter = Interpreter(
                 fs=self._fs,
@@ -406,7 +420,7 @@ class Interpreter:
         """Execute a subshell command."""
         # Create a new interpreter with a copy of the state
         new_state = InterpreterState(
-            env=dict(self._state.env),
+            env=self._state.env.copy() if isinstance(self._state.env, VariableStore) else VariableStore(self._state.env),
             cwd=self._state.cwd,
             previous_dir=self._state.previous_dir,
             functions=dict(self._state.functions),
@@ -418,6 +432,7 @@ class Interpreter:
                 xtrace=self._state.options.xtrace,
                 verbose=self._state.options.verbose,
             ),
+            fd_table=self._state.fd_table.clone(),
         )
         sub_interpreter = Interpreter(
             fs=self._fs,
@@ -531,6 +546,15 @@ class Interpreter:
             import re as _re
             _array_lhs = _re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\[(.+)\]$', name)
 
+            # Resolve nameref for array assignment target
+            if (assignment.array
+                    and isinstance(self._state.env, VariableStore)
+                    and self._state.env.is_nameref(name)):
+                try:
+                    name = self._state.env.resolve_nameref(name)
+                except ValueError:
+                    pass
+
             # Check for array assignment
             if assignment.array:
                 if assignment.append:
@@ -578,10 +602,40 @@ class Interpreter:
                             auto_idx += 1
                 continue
 
+            # Resolve nameref for the assignment target
+            if (isinstance(self._state.env, VariableStore)
+                    and not _array_lhs
+                    and self._state.env.is_nameref(name)):
+                try:
+                    name = self._state.env.resolve_nameref(name)
+                except ValueError:
+                    pass
+
             # Expand assignment value
             value = ""
             if assignment.value:
                 value = await expand_word_async(self._ctx, assignment.value)
+
+            # Apply attribute-based transformations
+            if isinstance(self._state.env, VariableStore):
+                attrs = self._state.env.get_attributes(name)
+                if "i" in attrs:
+                    # Integer attribute: evaluate as arithmetic
+                    try:
+                        from .expansion import evaluate_arithmetic_sync
+                        from ..parser.parser import Parser
+                        parser = Parser()
+                        arith_expr = parser._parse_arith_comma(value)
+                        value = str(evaluate_arithmetic_sync(self._ctx, arith_expr))
+                    except Exception:
+                        try:
+                            value = str(int(value))
+                        except ValueError:
+                            value = "0"
+                if "l" in attrs:
+                    value = value.lower()
+                elif "u" in attrs:
+                    value = value.upper()
 
             if node.name is None:
                 # Assignment-only command - set in environment
@@ -589,6 +643,12 @@ class Interpreter:
                     # a[idx]=value or a[idx]+=value
                     arr_name = _array_lhs.group(1)
                     subscript = _array_lhs.group(2)
+                    # Resolve nameref for array base name
+                    if isinstance(self._state.env, VariableStore) and self._state.env.is_nameref(arr_name):
+                        try:
+                            arr_name = self._state.env.resolve_nameref(arr_name)
+                        except ValueError:
+                            pass
                     # Mark as array if not already
                     if f"{arr_name}__is_array" not in self._state.env:
                         self._state.env[f"{arr_name}__is_array"] = "indexed"
@@ -641,16 +701,33 @@ class Interpreter:
                     herestring_content = await expand_word_async(self._ctx, redir.target)
                     stdin = herestring_content + "\n"
             elif redir.operator == "<":
-                # Input redirection: read file content into stdin
+                # Input redirection: read file content
+                fd = redir.fd if redir.fd is not None else 0
                 if redir.target is not None and isinstance(redir.target, WordNode):
                     target_path = await expand_word_async(self._ctx, redir.target)
                     target_path = self._fs.resolve_path(self._state.cwd, target_path)
                     try:
-                        stdin = await self._fs.read_file(target_path)
+                        file_content = await self._fs.read_file(target_path)
                     except FileNotFoundError:
                         return _failure(f"bash: {target_path}: No such file or directory\n")
                     except IsADirectoryError:
                         return _failure(f"bash: {target_path}: Is a directory\n")
+                    if fd == 0:
+                        stdin = file_content
+                    else:
+                        # Custom FD input redirect - store in FD table
+                        self._state.fd_table.open(fd, target_path, "r")
+                        self._state.fd_table._fds[fd].content = file_content
+            elif redir.operator == "<&":
+                # Input FD duplication
+                fd = redir.fd if redir.fd is not None else 0
+                if redir.target is not None and isinstance(redir.target, WordNode):
+                    target_str = await expand_word_async(self._ctx, redir.target)
+                    if target_str == "-":
+                        self._state.fd_table.close(fd)
+                    elif target_str.isdigit():
+                        target_fd = int(target_str)
+                        self._state.fd_table.dup(target_fd, fd)
 
         try:
             # Expand command name
@@ -660,18 +737,37 @@ class Interpreter:
             alias_args: list[str] = []
             if _is_shopt_set(self._state.env, "expand_aliases"):
                 aliases = get_aliases(self._ctx)
-                if cmd_name in aliases:
-                    alias_value = aliases[cmd_name]
-                    # Simple word splitting for alias value
-                    import shlex
-                    try:
-                        alias_parts = shlex.split(alias_value)
-                    except ValueError:
-                        # Fall back to simple split if shlex fails
-                        alias_parts = alias_value.split()
-                    if alias_parts:
-                        cmd_name = alias_parts[0]
-                        alias_args = alias_parts[1:]
+                # Don't expand if command name was quoted
+                name_is_quoted = _word_has_quoting(node.name) if node.name else False
+                if not name_is_quoted and cmd_name in aliases:
+                    expanded_aliases: set[str] = set()
+                    trailing_space = False
+                    while cmd_name in aliases and cmd_name not in expanded_aliases:
+                        expanded_aliases.add(cmd_name)
+                        alias_value = aliases[cmd_name]
+                        # Check if alias value ends with whitespace (triggers next-word expansion)
+                        trailing_space = alias_value.endswith((" ", "\t"))
+                        # Simple word splitting for alias value
+                        import shlex
+                        try:
+                            alias_parts = shlex.split(alias_value)
+                        except ValueError:
+                            alias_parts = alias_value.split()
+                        if alias_parts:
+                            cmd_name = alias_parts[0]
+                            alias_args = alias_parts[1:] + alias_args
+                    # Trailing space: alias-expand first argument too
+                    if trailing_space and node.args and aliases:
+                        first_arg = await expand_word_async(self._ctx, node.args[0])
+                        if not _word_has_quoting(node.args[0]) and first_arg in aliases:
+                            arg_alias_value = aliases[first_arg]
+                            import shlex
+                            try:
+                                arg_parts = shlex.split(arg_alias_value)
+                            except ValueError:
+                                arg_parts = arg_alias_value.split()
+                            if arg_parts:
+                                alias_args.extend(arg_parts)
 
             # Check for function call first (functions override builtins)
             if cmd_name in self._state.functions:
@@ -705,6 +801,12 @@ class Interpreter:
                 # Create command context
                 from ..types import CommandContext
 
+                # Collect custom FD contents for commands
+                fd_contents: dict[int, str] = {}
+                for fd_num, fd_entry in self._state.fd_table._fds.items():
+                    if fd_num >= 3 and not fd_entry.is_closed:
+                        fd_contents[fd_num] = fd_entry.content
+
                 ctx = CommandContext(
                     fs=self._fs,
                     cwd=self._state.cwd,
@@ -715,6 +817,7 @@ class Interpreter:
                         script, opts.get("env"), opts["cwd"]
                     ),
                     get_registered_commands=lambda: list(self._commands.keys()),
+                    fd_contents=fd_contents,
                 )
                 result = await cmd.execute(args, ctx)
             else:
@@ -777,7 +880,7 @@ class Interpreter:
 
                 # Check for FD duplication operators - don't resolve as path
                 is_fd_dup = redir.operator in (">&", "<&")
-                is_fd_target = is_fd_dup and target_path in ("0", "1", "2", "-")
+                is_fd_target = is_fd_dup and (target_path.isdigit() or target_path == "-")
 
                 # Handle /dev/null and special device files
                 if target_path in ("/dev/null", "/dev/zero"):
@@ -807,9 +910,15 @@ class Interpreter:
                         elif fd == 2:
                             await self._fs.write_file(target_path, stderr)
                             stderr = ""
+                        elif fd >= 3:
+                            # Custom FD - register in FD table and create file
+                            self._state.fd_table.open(fd, target_path, "w")
+                            await self._fs.write_file(target_path, "")
                     else:
                         # Not the last redirect - just create/truncate the file
                         await self._fs.write_file(target_path, "")
+                        if fd >= 3:
+                            self._state.fd_table.open(fd, target_path, "w")
 
                 elif redir.operator == ">>":
                     # Append to file
@@ -825,10 +934,14 @@ class Interpreter:
                         elif fd == 2:
                             await self._fs.write_file(target_path, existing + stderr)
                             stderr = ""
+                        elif fd >= 3:
+                            self._state.fd_table.open(fd, target_path, "a")
                     else:
                         # Not last - ensure file exists but don't write content
                         if not existing:
                             await self._fs.write_file(target_path, "")
+                        if fd >= 3:
+                            self._state.fd_table.open(fd, target_path, "a")
 
                 elif redir.operator == "&>":
                     # Redirect both stdout and stderr to file
@@ -838,22 +951,74 @@ class Interpreter:
 
                 elif redir.operator == ">&":
                     # FD duplication
-                    if target_path == "2":
-                        # stdout to stderr: e.g., echo foo >&2
+                    if target_path == "-":
+                        # Close FD
+                        self._state.fd_table.close(fd)
+                    elif target_path == "2":
+                        # fd>&2: redirect fd to stderr
                         if fd == 1:
                             stderr = stderr + stdout
                             stdout = ""
+                        elif fd >= 3:
+                            # Custom FD to stderr - no content to redirect
+                            self._state.fd_table.dup(2, fd)
                     elif target_path == "1":
-                        # stderr to stdout: e.g., cmd 2>&1
+                        # fd>&1: redirect fd to stdout
                         if fd == 2:
                             stdout = stdout + stderr
                             stderr = ""
+                        elif fd >= 3:
+                            self._state.fd_table.dup(1, fd)
+                    elif target_path.isdigit():
+                        target_fd = int(target_path)
+                        if target_fd >= 3:
+                            # Redirect fd to a custom FD
+                            fd_entry = self._state.fd_table._fds.get(target_fd)
+                            fd_path = self._state.fd_table.get_path(target_fd)
+                            # Check if target FD is a dup of stdout or stderr
+                            target_dup_of = fd_entry.dup_of if fd_entry else None
+                            if fd == 1:
+                                if target_dup_of == 1:
+                                    # FD is dup of stdout - content stays in stdout
+                                    pass
+                                elif target_dup_of == 2:
+                                    # FD is dup of stderr - merge into stderr
+                                    stderr = stderr + stdout
+                                    stdout = ""
+                                elif fd_path:
+                                    # Write stdout to the target FD's file
+                                    try:
+                                        existing = await self._fs.read_file(fd_path)
+                                    except FileNotFoundError:
+                                        existing = ""
+                                    await self._fs.write_file(fd_path, existing + stdout)
+                                    stdout = ""
+                                else:
+                                    # Custom FD without file - store content
+                                    self._state.fd_table.write(target_fd, stdout)
+                                    stdout = ""
+                            elif fd == 2:
+                                if target_dup_of == 2:
+                                    # FD is dup of stderr - content stays in stderr
+                                    pass
+                                elif target_dup_of == 1:
+                                    # FD is dup of stdout - merge into stdout
+                                    stdout = stdout + stderr
+                                    stderr = ""
+                                elif fd_path:
+                                    try:
+                                        existing = await self._fs.read_file(fd_path)
+                                    except FileNotFoundError:
+                                        existing = ""
+                                    await self._fs.write_file(fd_path, existing + stderr)
+                                    stderr = ""
+                                else:
+                                    self._state.fd_table.write(target_fd, stderr)
+                                    stderr = ""
+                            else:
+                                self._state.fd_table.dup(target_fd, fd)
                         else:
-                            # fd>&1 - redirect fd to stdout
-                            pass
-                    elif target_path == "-":
-                        # Close FD - just discard
-                        pass
+                            self._state.fd_table.dup(target_fd, fd)
                     else:
                         # >&file is same as &> for fd 1
                         if fd == 1:
@@ -919,6 +1084,8 @@ class Interpreter:
 
         # Create local scope
         self._state.local_scopes.append({})
+        if isinstance(self._state.env, VariableStore):
+            self._state.env.push_local_meta_scope()
 
         try:
             # Execute function body (which is a CompoundCommandNode)
@@ -930,6 +1097,12 @@ class Interpreter:
         finally:
             # Pop local scope and restore saved variables
             scope = self._state.local_scopes.pop()
+
+            # Pop and restore metadata scope
+            if isinstance(self._state.env, VariableStore) and self._state.env._local_meta_scopes:
+                meta_scope = self._state.env.pop_local_meta_scope()
+                self._state.env.restore_metadata_from_scope(meta_scope)
+
             # First pass: identify arrays that need element cleanup
             # If __is_array is restored to None, the array didn't exist before
             # and we need to clean up all element keys created inside the function

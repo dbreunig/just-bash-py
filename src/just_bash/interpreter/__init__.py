@@ -1,7 +1,7 @@
 """Interpreter module for just-bash."""
 
 from .interpreter import Interpreter
-from .types import InterpreterContext, InterpreterState, ShellOptions
+from .types import InterpreterContext, InterpreterState, ShellOptions, VariableStore
 from .errors import (
     InterpreterError,
     ExitError,

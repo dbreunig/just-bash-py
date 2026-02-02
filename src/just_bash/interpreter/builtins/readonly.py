@@ -26,6 +26,8 @@ async def handle_readonly(
     ctx: "InterpreterContext", args: list[str]
 ) -> "ExecResult":
     """Execute the readonly builtin."""
+    from ..types import VariableStore
+
     # Parse options
     show_all = False
     names = []
@@ -45,13 +47,26 @@ async def handle_readonly(
             names.append(arg)
         i += 1
 
+    env = ctx.state.env
+
     # If no names and -p or no args, show all readonly variables
     if not names or show_all:
         output = []
-        readonly_vars = ctx.state.env.get("__readonly__", "").split()
+        # Collect readonly vars from metadata and legacy __readonly__
+        readonly_vars: set[str] = set()
+        if isinstance(env, VariableStore):
+            for vname, meta in env._metadata.items():
+                if "r" in meta.attributes:
+                    readonly_vars.add(vname)
+        # Also check legacy __readonly__ key
+        legacy_readonly = env.get("__readonly__", "").split()
+        readonly_vars.update(v for v in legacy_readonly if v)
+        # Also check state.readonly_vars
+        readonly_vars.update(ctx.state.readonly_vars)
+
         for var in sorted(readonly_vars):
-            if var in ctx.state.env:
-                value = ctx.state.env[var]
+            if var in env:
+                value = env[var]
                 output.append(f"declare -r {var}=\"{value}\"")
             else:
                 output.append(f"declare -r {var}")
@@ -60,21 +75,34 @@ async def handle_readonly(
         return _result("", "", 0)
 
     # Mark variables as readonly
-    readonly_set = set(ctx.state.env.get("__readonly__", "").split())
-
     for name_value in names:
         if "=" in name_value:
             name, value = name_value.split("=", 1)
             # Check if already readonly
-            if name in readonly_set:
+            if _is_readonly(ctx, name):
                 return _result("", f"bash: readonly: {name}: readonly variable\n", 1)
-            ctx.state.env[name] = value
+            env[name] = value
         else:
             name = name_value
 
+        # Set readonly via metadata
+        if isinstance(env, VariableStore):
+            env.set_attribute(name, "r")
+        ctx.state.readonly_vars.add(name)
+        # Also update legacy __readonly__ for backwards compat
+        readonly_set = set(env.get("__readonly__", "").split())
         readonly_set.add(name)
-
-    # Store readonly set
-    ctx.state.env["__readonly__"] = " ".join(sorted(readonly_set))
+        env["__readonly__"] = " ".join(sorted(readonly_set))
 
     return _result("", "", 0)
+
+
+def _is_readonly(ctx: "InterpreterContext", name: str) -> bool:
+    """Check if a variable is readonly."""
+    from ..types import VariableStore
+    env = ctx.state.env
+    if isinstance(env, VariableStore) and env.is_readonly(name):
+        return True
+    if name in ctx.state.readonly_vars:
+        return True
+    return name in env.get("__readonly__", "").split()

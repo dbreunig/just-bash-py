@@ -364,15 +364,32 @@ async def evaluate_binary_file_test(
 
 def evaluate_variable_test(ctx: "InterpreterContext", name: str) -> bool:
     """Test if a variable is set (-v)."""
+    from .types import VariableStore
+    env = ctx.state.env
+
     # Handle array element syntax: arr[idx]
     if "[" in name and name.endswith("]"):
         base = name[:name.index("[")]
         idx = name[name.index("[") + 1:-1]
+        # Resolve nameref for array base
+        if isinstance(env, VariableStore) and env.is_nameref(base):
+            try:
+                base = env.resolve_nameref(base)
+            except ValueError:
+                return False
         # Check if array element exists
         key = f"{base}_{idx}"
-        return key in ctx.state.env
+        return key in env
 
-    return name in ctx.state.env
+    # Resolve nameref
+    if isinstance(env, VariableStore) and env.is_nameref(name):
+        try:
+            resolved = env.resolve_nameref(name)
+            return resolved in env
+        except ValueError:
+            return False
+
+    return name in env
 
 
 def evaluate_shell_option(ctx: "InterpreterContext", option: str) -> bool:

@@ -742,6 +742,30 @@ class Lexer:
                     col += 1
                 continue
 
+            # Handle $[...] legacy arithmetic expansion
+            if char == "$" and pos + 1 < input_len and input_text[pos + 1] == "[":
+                value += char
+                pos += 1
+                col += 1
+                value += input_text[pos]  # Add the [
+                pos += 1
+                col += 1
+
+                # Track bracket depth
+                depth = 1
+                while depth > 0 and pos < input_len:
+                    c = input_text[pos]
+                    value += c
+
+                    if c == "[":
+                        depth += 1
+                    elif c == "]":
+                        depth -= 1
+
+                    pos += 1
+                    col += 1
+                continue
+
             # Handle ${...} parameter expansion
             if char == "$" and pos + 1 < input_len and input_text[pos + 1] == "{":
                 value += char

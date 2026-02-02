@@ -177,6 +177,9 @@ class CommandContext:
     sleep: Optional[Callable[[float], Awaitable[None]]] = None
     """Custom sleep implementation for testing."""
 
+    fd_contents: dict[int, str] = field(default_factory=dict)
+    """Contents of custom file descriptors (3+), for commands like read -u."""
+
 
 class Command(Protocol):
     """Protocol for command implementations."""

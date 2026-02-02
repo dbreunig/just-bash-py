@@ -29,7 +29,7 @@ ruff format src/ tests/
 ruff check src/ tests/ --fix
 ```
 
-**IMPORTANT: Do NOT run spec_tests unless explicitly asked.** The spec_tests suite takes 30+ minutes to run and contains many expected failures. Always use `--ignore=tests/spec_tests/` when running the full test suite.
+**IMPORTANT: Do NOT run spec_tests unless explicitly asked.** The spec_tests suite takes ~2 minutes to run and contains many expected failures. Always use `--ignore=tests/spec_tests/` when running the full test suite.
 
 ## Test-Driven Development (TDD)
 

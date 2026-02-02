@@ -28,7 +28,7 @@ import nest_asyncio  # type: ignore[import-untyped]
 
 from .commands import create_command_registry
 from .fs import InMemoryFs
-from .interpreter import ExitError, Interpreter, InterpreterState, ShellOptions
+from .interpreter import ExitError, Interpreter, InterpreterState, ShellOptions, VariableStore
 from .parser import parse, unescape_html_entities
 from .types import (
     Command,
@@ -97,7 +97,7 @@ class Bash:
         self._unescape_html = unescape_html
 
         # Set up initial state
-        default_env = {
+        default_env = VariableStore({
             "PATH": "/usr/local/bin:/usr/bin:/bin",
             "HOME": "/home/user",
             "USER": "user",
@@ -106,7 +106,8 @@ class Bash:
             "?": "0",
             "SHLVL": "1",
             "BASH_VERSION": "5.0.0(1)-release",
-        }
+            "OPTIND": "1",
+        })
         if env:
             default_env.update(env)
 
@@ -229,7 +230,7 @@ class Bash:
             commands=self._commands,
             limits=self._limits,
             state=InterpreterState(
-                env=dict(self._initial_state.env),
+                env=self._initial_state.env.copy() if isinstance(self._initial_state.env, VariableStore) else VariableStore(self._initial_state.env),
                 cwd=self._initial_state.cwd,
                 previous_dir=self._initial_state.previous_dir,
                 options=ShellOptions(

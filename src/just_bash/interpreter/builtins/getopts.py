@@ -29,6 +29,10 @@ async def handle_getopts(ctx: "InterpreterContext", args: list[str]) -> "ExecRes
     optstring = args[0]
     name = args[1]
 
+    # Validate variable name
+    import re
+    valid_name = bool(re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', name))
+
     # Get the arguments to parse (from args[2:] or positional params)
     if len(args) > 2:
         parse_args = args[2:]
@@ -93,8 +97,12 @@ async def handle_getopts(ctx: "InterpreterContext", args: list[str]) -> "ExecRes
     if opt_idx == -1:
         # Invalid option
         ctx.state.env[name] = "?"
-        ctx.state.env["OPTARG"] = opt_char
-        if not optstring.startswith(":"):
+        if optstring.startswith(":"):
+            # Silent mode: OPTARG = the invalid option character
+            ctx.state.env["OPTARG"] = opt_char
+        else:
+            # Normal mode: OPTARG is unset, print error
+            ctx.state.env.pop("OPTARG", None)
             stderr = f"bash: getopts: illegal option -- {opt_char}\n"
 
         # Advance position
@@ -128,6 +136,7 @@ async def handle_getopts(ctx: "InterpreterContext", args: list[str]) -> "ExecRes
                 ctx.state.env["OPTARG"] = opt_char
             else:
                 ctx.state.env[name] = "?"
+                ctx.state.env.pop("OPTARG", None)
                 stderr = f"bash: getopts: option requires an argument -- {opt_char}\n"
             ctx.state.env["OPTIND"] = str(optind + 1)
             ctx.state.env.pop(optchar_idx_key, None)
@@ -143,5 +152,12 @@ async def handle_getopts(ctx: "InterpreterContext", args: list[str]) -> "ExecRes
             ctx.state.env["OPTIND"] = str(optind + 1)
             ctx.state.env.pop(optchar_idx_key, None)
 
-    ctx.state.env[name] = opt_char
-    return ExecResult(stdout="", stderr=stderr, exit_code=0)
+    if valid_name:
+        ctx.state.env[name] = opt_char
+        return ExecResult(stdout="", stderr=stderr, exit_code=0)
+    else:
+        return ExecResult(
+            stdout="",
+            stderr=stderr + f"bash: getopts: `{name}': not a valid identifier\n",
+            exit_code=1,
+        )

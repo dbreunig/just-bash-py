@@ -346,8 +346,10 @@ async def handle_exec(
             break
         i += 1
 
-    # If no command, exec just affects redirections (which we don't handle here)
+    # If no command, exec affects persistent FD redirections
     if not cmd_args:
+        # Redirections are handled by the interpreter's redirect processing
+        # which now supports the FD table. Return success.
         return _result("", "", 0)
 
     # In sandboxed mode, just execute the command

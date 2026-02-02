@@ -89,6 +89,11 @@ async def handle_local(ctx: "InterpreterContext", args: list[str]) -> "ExecResul
         if name not in current_scope:
             current_scope[name] = ctx.state.env.get(name)
 
+        # Also save metadata
+        from ..types import VariableStore
+        if isinstance(ctx.state.env, VariableStore):
+            ctx.state.env.save_metadata_in_scope(name)
+
         # Handle array initialization
         if (is_array or is_assoc) and value.startswith("(") and value.endswith(")"):
             # Save existing array keys before overwriting

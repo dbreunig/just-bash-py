@@ -31,6 +31,59 @@ from dataclasses import dataclass
 from ...types import CommandContext, ExecResult
 
 
+def _bre_to_python(pattern: str) -> str:
+    """Convert a BRE (Basic Regular Expression) pattern to Python ERE.
+
+    In BRE: +, ?, (, ), {, }, | are literal; \\+, \\?, \\(, \\), \\{, \\}, \\| are special.
+    In Python ERE: +, ?, (, ), {, }, | are special; \\+, \\?, etc. are literal.
+    """
+    result = []
+    i = 0
+    in_bracket = False
+    while i < len(pattern):
+        ch = pattern[i]
+        if in_bracket:
+            result.append(ch)
+            if ch == "]" and i > 0:
+                in_bracket = False
+            i += 1
+            continue
+        if ch == "[":
+            in_bracket = True
+            result.append(ch)
+            i += 1
+            # Handle ] as first char in bracket (literal)
+            if i < len(pattern) and pattern[i] == "^":
+                result.append(pattern[i])
+                i += 1
+            if i < len(pattern) and pattern[i] == "]":
+                result.append(pattern[i])
+                i += 1
+            continue
+        if ch == "\\" and i + 1 < len(pattern):
+            nxt = pattern[i + 1]
+            if nxt in "+?(){}|":
+                # BRE \+ \? \( \) \{ \} \| → ERE special
+                result.append(nxt)
+                i += 2
+                continue
+            else:
+                # Other escape sequences pass through
+                result.append(ch)
+                result.append(nxt)
+                i += 2
+                continue
+        if ch in "+?(){}|":
+            # Literal in BRE → escape for Python ERE
+            result.append("\\")
+            result.append(ch)
+            i += 1
+            continue
+        result.append(ch)
+        i += 1
+    return "".join(result)
+
+
 @dataclass
 class SedAddress:
     """Represents a sed address."""
@@ -337,7 +390,8 @@ class SedCommand:
                 pattern = cmd_str[1:end]
                 flags = re.IGNORECASE if extended_regex else 0
                 try:
-                    address = SedAddress(type="regex", regex=re.compile(pattern, flags))
+                    py_pat = pattern if extended_regex else _bre_to_python(pattern)
+                    address = SedAddress(type="regex", regex=re.compile(py_pat, flags))
                 except re.error as e:
                     raise ValueError(f"invalid regex: {e}")
                 pos = end + 1
@@ -358,11 +412,12 @@ class SedCommand:
                             end2 = self._find_delimiter(cmd_str, pos + 1, "/")
                             if end2 != -1:
                                 pattern2 = cmd_str[pos + 1:end2]
+                                py_pat2 = pattern2 if extended_regex else _bre_to_python(pattern2)
                                 try:
                                     address = SedAddress(
                                         type="range",
                                         regex=address.regex,
-                                        end_regex=re.compile(pattern2, flags),
+                                        end_regex=re.compile(py_pat2, flags),
                                     )
                                 except re.error as e:
                                     raise ValueError(f"invalid regex: {e}")
@@ -418,7 +473,8 @@ class SedCommand:
                 regex_flags |= re.IGNORECASE
 
             try:
-                compiled = re.compile(pattern, regex_flags)
+                py_pat = pattern if extended_regex else _bre_to_python(pattern)
+                compiled = re.compile(py_pat, regex_flags)
             except re.error as e:
                 raise ValueError(f"invalid regex: {e}")
 

@@ -142,7 +142,7 @@ class OdCommand:
 
         # Read from stdin if no files
         if not files:
-            content = ctx.stdin.encode("utf-8", errors="replace")
+            content = ctx.stdin.encode("latin-1", errors="replace")
             # Apply skip and count
             if skip_bytes > 0:
                 content = content[skip_bytes:]
@@ -158,7 +158,7 @@ class OdCommand:
         for file in files:
             try:
                 if file == "-":
-                    content = ctx.stdin.encode("utf-8", errors="replace")
+                    content = ctx.stdin.encode("latin-1", errors="replace")
                 else:
                     path = ctx.fs.resolve_path(ctx.cwd, file)
                     content = await ctx.fs.read_file_bytes(path)

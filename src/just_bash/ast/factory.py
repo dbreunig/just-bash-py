@@ -207,7 +207,7 @@ def for_node(
     """Create a for node."""
     return ForNode(
         variable=variable,
-        words=tuple(words) if words else None,
+        words=tuple(words) if words is not None else None,
         body=tuple(body),
         redirections=tuple(redirections) if redirections else (),
     )

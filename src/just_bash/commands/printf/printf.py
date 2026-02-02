@@ -18,12 +18,14 @@ class PrintfCommand:
                 exit_code=2,
             )
 
-        # Parse -v option
+        # Parse -v option and -- end-of-options
         var_name = None
         format_start = 0
         if len(args) >= 2 and args[0] == "-v":
             var_name = args[1]
             format_start = 2
+        if format_start < len(args) and args[format_start] == "--":
+            format_start += 1
 
         if len(args) <= format_start:
             return ExecResult(
@@ -91,7 +93,7 @@ class PrintfCommand:
                 # Flags: -, +, space, #, 0
                 # Width: number or *
                 # Precision: .number or .*
-                spec_pattern = r"([-+# 0]*)(\*|\d+)?(?:\.(\*|\d+))?([diouxXeEfFgGsbcq])"
+                spec_pattern = r"([-+# 0]*)(\*|\d+)?(?:\.(\*|\d*))?([diouxXeEfFgGsbcq])"
                 spec_match = re.match(spec_pattern, format_str[i + 1:])
 
                 if spec_match:
@@ -125,8 +127,8 @@ class PrintfCommand:
                             arg_index += 1
                         else:
                             precision = 0
-                    elif precision_spec:
-                        precision = int(precision_spec)
+                    elif precision_spec is not None:
+                        precision = int(precision_spec) if precision_spec else 0
 
                     # Get argument
                     if arg_index < len(arguments):
@@ -279,26 +281,13 @@ class PrintfCommand:
         if escape_char in escape_map:
             return (escape_map[escape_char], 2)
         elif escape_char in "01234567":
-            # Octal escape: \0NNN or \NNN
-            if escape_char == "0":
-                # \0NNN format - up to 3 more octal digits after the 0
-                octal = ""
-                j = i + 2
-                while j < len(s) and len(octal) < 3 and s[j] in "01234567":
-                    octal += s[j]
-                    j += 1
-                if octal:
-                    return (chr(int(octal, 8)), j - i)
-                else:
-                    return ("\0", 2)
-            else:
-                # \NNN format - first digit is 1-7, up to 2 more octal digits
-                octal = escape_char
-                j = i + 2
-                while j < len(s) and len(octal) < 3 and s[j] in "01234567":
-                    octal += s[j]
-                    j += 1
-                return (chr(int(octal, 8)), j - i)
+            # Octal escape: \NNN - first digit plus up to 2 more (3 total)
+            octal = escape_char
+            j = i + 2
+            while j < len(s) and len(octal) < 3 and s[j] in "01234567":
+                octal += s[j]
+                j += 1
+            return (chr(int(octal, 8) & 0xFF), j - i)
         elif escape_char == "x":
             # Hex escape - collect consecutive \xHH sequences and try UTF-8 decoding
             hex_bytes = []

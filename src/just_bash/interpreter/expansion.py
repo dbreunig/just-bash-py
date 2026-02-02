@@ -12,6 +12,7 @@ Handles shell word expansion including:
 
 import fnmatch
 import re
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 from ..ast.types import (
@@ -34,6 +35,13 @@ if TYPE_CHECKING:
     from .types import InterpreterContext
 
 
+@dataclass
+class ExpandedSegment:
+    """A segment of expanded text with quoting context."""
+    text: str
+    quoted: bool  # True = protected from IFS splitting and globbing
+
+
 def get_variable(ctx: "InterpreterContext", name: str, check_nounset: bool = True) -> str:
     """Get a variable value from the environment.
 
@@ -42,11 +50,28 @@ def get_variable(ctx: "InterpreterContext", name: str, check_nounset: bool = Tru
     """
     env = ctx.state.env
 
+    # Resolve nameref for regular variable names (not special params or array subscripts)
+    from .types import VariableStore
+    if (isinstance(env, VariableStore)
+            and re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', name)
+            and env.is_nameref(name)):
+        try:
+            name = env.resolve_nameref(name)
+        except ValueError:
+            return ""
+
     # Check for array subscript syntax: name[subscript]
     array_match = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\[(.+)\]$', name)
     if array_match:
         arr_name = array_match.group(1)
         subscript = array_match.group(2)
+
+        # Resolve nameref for array base name
+        if isinstance(env, VariableStore) and env.is_nameref(arr_name):
+            try:
+                arr_name = env.resolve_nameref(arr_name)
+            except ValueError:
+                return ""
 
         # Handle arr[@] and arr[*] - all elements
         if subscript in ("@", "*"):
@@ -248,6 +273,25 @@ def _eval_array_subscript(ctx: "InterpreterContext", subscript: str) -> int:
         return 0
 
 
+def _expand_braced_param_sync(ctx: "InterpreterContext", content: str) -> str:
+    """Expand ${content} as a full parameter expansion (sync).
+
+    Handles operations like ${var:-default}, ${var:+alt}, ${#var},
+    ${var#pattern}, etc. inside arithmetic expressions.
+    """
+    # Try parsing through the parser's parameter expansion handler
+    try:
+        from ..parser.parser import Parser
+        parser = Parser()
+        part = parser._parse_parameter_expansion(content)
+        return expand_parameter(ctx, part, False)
+    except Exception:
+        pass
+
+    # Fallback: simple variable lookup
+    return get_variable(ctx, content, False)
+
+
 def _expand_arith_vars(ctx: "InterpreterContext", expr: str) -> str:
     """Expand bare variable names in arithmetic expression."""
     # Replace variable names with their values
@@ -337,6 +381,66 @@ async def expand_word_async(ctx: "InterpreterContext", word: WordNode) -> str:
     for part in word.parts:
         parts.append(await expand_part(ctx, part))
     return "".join(parts)
+
+
+def _escape_glob_chars(s: str) -> str:
+    """Escape glob metacharacters for fnmatch (literal matching).
+
+    Uses [x] notation which fnmatch always treats as literal character class.
+    """
+    return s.replace("[", "[[]").replace("*", "[*]").replace("?", "[?]")
+
+
+async def expand_word_for_case_pattern(ctx: "InterpreterContext", word: WordNode) -> str:
+    """Expand a word for use as a case pattern.
+
+    Glob metacharacters from quoted sources are escaped so they match
+    literally, while unquoted glob chars remain active.
+    """
+    parts = []
+    for part in word.parts:
+        parts.append(await _expand_part_for_pattern(ctx, part))
+    return "".join(parts)
+
+
+async def _expand_part_for_pattern(
+    ctx: "InterpreterContext", part: WordPart, in_double_quotes: bool = False
+) -> str:
+    """Expand a word part for case pattern matching.
+
+    Quoted parts have glob metacharacters escaped.
+    """
+    if isinstance(part, LiteralPart):
+        # Unquoted literal - glob chars remain active
+        return part.value
+    elif isinstance(part, SingleQuotedPart):
+        # Single-quoted - all glob chars escaped
+        return _escape_glob_chars(part.value)
+    elif isinstance(part, EscapedPart):
+        # Escaped char - literal
+        return _escape_glob_chars(part.value)
+    elif isinstance(part, DoubleQuotedPart):
+        # Double-quoted - glob chars escaped, but expansions still happen
+        result = []
+        for p in part.parts:
+            expanded = await _expand_part_for_pattern(ctx, p, in_double_quotes=True)
+            if isinstance(p, (LiteralPart, EscapedPart)):
+                # Literal text inside double quotes is protected
+                expanded = _escape_glob_chars(expanded)
+            elif isinstance(p, ParameterExpansionPart):
+                # Parameter expansion result inside double quotes is protected
+                expanded = _escape_glob_chars(expanded)
+            result.append(expanded)
+        return "".join(result)
+    elif isinstance(part, GlobPart):
+        # Unquoted glob - stays active
+        return part.pattern
+    elif isinstance(part, ParameterExpansionPart):
+        # Unquoted parameter expansion - glob chars stay active
+        return await expand_parameter_async(ctx, part, in_double_quotes)
+    else:
+        # All other parts: delegate to normal expansion
+        return await expand_part(ctx, part, in_double_quotes)
 
 
 def expand_part_sync(ctx: "InterpreterContext", part: WordPart, in_double_quotes: bool = False) -> str:
@@ -460,6 +564,211 @@ async def expand_part(ctx: "InterpreterContext", part: WordPart, in_double_quote
         return ""
 
 
+async def expand_word_segments(
+    ctx: "InterpreterContext", word: WordNode
+) -> list[ExpandedSegment]:
+    """Expand a word into a list of segments preserving quoting context.
+
+    Each segment carries its text and whether it was quoted (protected from
+    IFS splitting and globbing).
+    """
+    segments: list[ExpandedSegment] = []
+    for part in word.parts:
+        segments.extend(await _expand_part_segments(ctx, part, in_double_quotes=False))
+    return segments
+
+
+async def _expand_part_segments(
+    ctx: "InterpreterContext", part: WordPart, in_double_quotes: bool = False
+) -> list[ExpandedSegment]:
+    """Expand a single part into segments preserving quoting context."""
+    if isinstance(part, LiteralPart):
+        return [ExpandedSegment(text=part.value, quoted=in_double_quotes)]
+
+    elif isinstance(part, SingleQuotedPart):
+        return [ExpandedSegment(text=part.value, quoted=True)]
+
+    elif isinstance(part, EscapedPart):
+        return [ExpandedSegment(text=part.value, quoted=True)]
+
+    elif isinstance(part, DoubleQuotedPart):
+        segments: list[ExpandedSegment] = []
+        for p in part.parts:
+            segments.extend(
+                await _expand_part_segments(ctx, p, in_double_quotes=True)
+            )
+        return segments
+
+    elif isinstance(part, ParameterExpansionPart):
+        value = await expand_parameter_async(ctx, part, in_double_quotes)
+        return [ExpandedSegment(text=value, quoted=in_double_quotes)]
+
+    elif isinstance(part, TildeExpansionPart):
+        if in_double_quotes:
+            text = "~" if part.user is None else f"~{part.user}"
+            return [ExpandedSegment(text=text, quoted=True)]
+        if part.user is None:
+            text = ctx.state.env.get("HOME", "/home/user")
+        elif part.user == "+":
+            text = ctx.state.env.get("PWD", ctx.state.cwd)
+        elif part.user == "-":
+            text = ctx.state.env.get("OLDPWD", "")
+        elif part.user == "root":
+            text = "/root"
+        else:
+            text = f"~{part.user}"
+        # Tilde expansion result is not subject to further splitting
+        return [ExpandedSegment(text=text, quoted=True)]
+
+    elif isinstance(part, GlobPart):
+        return [ExpandedSegment(text=part.pattern, quoted=False)]
+
+    elif isinstance(part, ArithmeticExpansionPart):
+        expr = part.expression.expression if part.expression else None
+        try:
+            text = str(await evaluate_arithmetic(ctx, expr))
+        except (ValueError, ZeroDivisionError) as e:
+            raise ExitError(1, "", f"bash: {e}\n")
+        return [ExpandedSegment(text=text, quoted=in_double_quotes)]
+
+    elif isinstance(part, BraceExpansionPart):
+        results = []
+        for item in part.items:
+            if item.type == "Range":
+                expanded = expand_brace_range(item.start, item.end, item.step)
+                results.extend(expanded)
+            else:
+                results.append(await expand_word_async(ctx, item.word))
+        return [ExpandedSegment(text=" ".join(results), quoted=in_double_quotes)]
+
+    elif isinstance(part, CommandSubstitutionPart):
+        try:
+            result = await ctx.execute_script(part.body)
+            ctx.state.last_exit_code = result.exit_code
+            ctx.state.env["?"] = str(result.exit_code)
+            text = result.stdout.rstrip("\n")
+        except ExecutionLimitError:
+            raise
+        except ExitError as e:
+            ctx.state.last_exit_code = e.exit_code
+            ctx.state.env["?"] = str(e.exit_code)
+            text = e.stdout.rstrip("\n")
+        return [ExpandedSegment(text=text, quoted=in_double_quotes)]
+
+    return [ExpandedSegment(text="", quoted=in_double_quotes)]
+
+
+def _segments_to_string(segments: list[ExpandedSegment]) -> str:
+    """Flatten segments into a single string."""
+    return "".join(seg.text for seg in segments)
+
+
+def _segments_has_unquoted_glob(segments: list[ExpandedSegment]) -> bool:
+    """Check if segments contain unquoted glob characters."""
+    for seg in segments:
+        if not seg.quoted and (
+            any(c in seg.text for c in "*?[")
+            or re.search(r'[@?*+!]\(', seg.text)
+        ):
+            return True
+    return False
+
+
+def _split_segments_on_ifs(
+    segments: list[ExpandedSegment], ifs: str
+) -> list[str]:
+    """Split segments on IFS characters, only splitting in unquoted segments.
+
+    Quoted segments are never split. Unquoted segments are split on IFS chars.
+    Adjacent segments (quoted or unquoted) that don't contain IFS delimiters
+    are concatenated into the same output word.
+
+    IFS splitting rules:
+    - IFS whitespace (space/tab/newline): leading/trailing stripped, consecutive
+      merged into one delimiter
+    - IFS non-whitespace: each produces a field boundary
+    - Whitespace adjacent to non-whitespace IFS is part of that delimiter
+    """
+    if not segments:
+        return []
+
+    ifs_whitespace = set(c for c in ifs if c in " \t\n")
+    ifs_nonws = set(c for c in ifs if c not in " \t\n")
+
+    words: list[str] = []
+    current: list[str] = []
+    had_content = False  # Track if we've seen any non-IFS content
+
+    # Build a flat list of (char, splittable) pairs
+    chars: list[tuple[str, bool]] = []
+    for seg in segments:
+        if seg.quoted:
+            for c in seg.text:
+                chars.append((c, False))
+        else:
+            for c in seg.text:
+                chars.append((c, True))
+
+    i = 0
+    n = len(chars)
+
+    # Skip leading IFS whitespace
+    while i < n:
+        c, splittable = chars[i]
+        if splittable and c in ifs_whitespace:
+            i += 1
+        else:
+            break
+
+    while i < n:
+        c, splittable = chars[i]
+        if not splittable:
+            current.append(c)
+            had_content = True
+            i += 1
+        elif c in ifs_nonws:
+            # Non-whitespace IFS: always produces a field boundary
+            words.append("".join(current))
+            current = []
+            had_content = False
+            i += 1
+            # Skip trailing IFS whitespace after non-ws delimiter
+            while i < n and chars[i][1] and chars[i][0] in ifs_whitespace:
+                i += 1
+        elif c in ifs_whitespace:
+            # IFS whitespace: skip consecutive, check for adjacent non-ws
+            if had_content or current:
+                # Save word boundary position but don't emit yet -
+                # if a non-ws IFS follows, it's one composite delimiter
+                saved_word = "".join(current)
+                current = []
+                had_content = False
+                # Skip consecutive whitespace
+                while i < n and chars[i][1] and chars[i][0] in ifs_whitespace:
+                    i += 1
+                # Check if next is a non-ws IFS char
+                if i < n and chars[i][1] and chars[i][0] in ifs_nonws:
+                    # Composite delimiter: ws + nonws
+                    # Emit the saved word, then let the nonws handler run
+                    words.append(saved_word)
+                else:
+                    # Just whitespace delimiter
+                    words.append(saved_word)
+            else:
+                # Leading whitespace (or whitespace after delimiter) - skip
+                while i < n and chars[i][1] and chars[i][0] in ifs_whitespace:
+                    i += 1
+        else:
+            current.append(c)
+            had_content = True
+            i += 1
+
+    if current or had_content:
+        words.append("".join(current))
+
+    return words
+
+
 def expand_parameter(ctx: "InterpreterContext", part: ParameterExpansionPart, in_double_quotes: bool = False) -> str:
     """Expand a parameter expansion synchronously."""
     parameter = part.parameter
@@ -485,6 +794,18 @@ def expand_parameter(ctx: "InterpreterContext", part: ParameterExpansionPart, in
             return " ".join(sorted(matching))
 
         # ${!var} - variable indirection
+        # For namerefs: ${!nameref} returns the target variable NAME
+        from .types import VariableStore
+        env = ctx.state.env
+        if (isinstance(env, VariableStore)
+                and re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', indirect_name)
+                and env.is_nameref(indirect_name)):
+            meta = env._metadata.get(indirect_name)
+            if meta and meta.nameref_target:
+                return meta.nameref_target
+            return ""
+
+        # Standard indirect: ${!var} uses value of var as variable name
         ref_name = get_variable(ctx, indirect_name, False)
         if ref_name:
             return get_variable(ctx, ref_name, False)
@@ -675,23 +996,59 @@ def expand_parameter(ctx: "InterpreterContext", part: ParameterExpansionPart, in
 
     elif operation.type == "CaseModification":
         # ${var^^} or ${var,,} for case conversion
+        # ${var^^pattern} - only convert chars matching pattern
+        pattern = None
+        if operation.pattern:
+            try:
+                from .expansion import expand_word_async
+                import asyncio
+                # For sync context, try to get the raw pattern
+                if operation.pattern.parts:
+                    pattern = "".join(
+                        getattr(p, 'value', '') for p in operation.pattern.parts
+                    )
+            except Exception:
+                pass
+
         if operation.direction == "upper":
+            if pattern:
+                # Only uppercase chars matching pattern
+                result = []
+                for c in value:
+                    if fnmatch.fnmatch(c, pattern):
+                        result.append(c.upper())
+                    else:
+                        result.append(c)
+                return "".join(result) if operation.all else (
+                    _case_first_matching(value, pattern, str.upper) if value else ""
+                )
             if operation.all:
                 return value.upper()
             return value[0].upper() + value[1:] if value else ""
         else:
+            if pattern:
+                # Only lowercase chars matching pattern
+                result = []
+                for c in value:
+                    if fnmatch.fnmatch(c, pattern):
+                        result.append(c.lower())
+                    else:
+                        result.append(c)
+                return "".join(result) if operation.all else (
+                    _case_first_matching(value, pattern, str.lower) if value else ""
+                )
             if operation.all:
                 return value.lower()
             return value[0].lower() + value[1:] if value else ""
 
     elif operation.type == "Transform":
         # ${var@Q}, ${var@P}, ${var@a}, ${var@A}, ${var@E}, ${var@K}
+        # ${var@u}, ${var@U}, ${var@L} (case transforms)
         op = operation.operator
         if op == "Q":
-            # Quoted form - escape special chars and wrap in quotes
+            # Quoted form - produce bash-compatible single-quoted output
             if not value:
                 return "''"
-            # Simple quoting - use single quotes if no single quotes in value
             if "'" not in value:
                 return f"'{value}'"
             # Use $'...' quoting with escapes
@@ -716,6 +1073,36 @@ def expand_parameter(ctx: "InterpreterContext", part: ParameterExpansionPart, in
                         result.append("'")
                     elif c == '"':
                         result.append('"')
+                    elif c == 'a':
+                        result.append('\a')
+                    elif c == 'b':
+                        result.append('\b')
+                    elif c == 'f':
+                        result.append('\f')
+                    elif c == 'v':
+                        result.append('\v')
+                    elif c == 'x' and i + 3 < len(value):
+                        # Hex: \xNN
+                        hex_str = value[i+2:i+4]
+                        try:
+                            result.append(chr(int(hex_str, 16)))
+                            i += 4
+                            continue
+                        except ValueError:
+                            result.append(value[i:i+2])
+                    elif c in '0123456789':
+                        # Octal: \NNN
+                        oct_str = ""
+                        j = i + 1
+                        while j < len(value) and j < i + 4 and value[j] in '01234567':
+                            oct_str += value[j]
+                            j += 1
+                        try:
+                            result.append(chr(int(oct_str, 8)))
+                            i = j
+                            continue
+                        except ValueError:
+                            result.append(value[i:i+2])
                     else:
                         result.append(value[i:i+2])
                     i += 2
@@ -724,31 +1111,53 @@ def expand_parameter(ctx: "InterpreterContext", part: ParameterExpansionPart, in
                     i += 1
             return ''.join(result)
         elif op == "P":
-            # Prompt expansion - for now just return value
-            # Full implementation would expand \u, \h, \w, etc.
+            # Prompt expansion
             return value
         elif op == "A":
             # Assignment statement form
             return f"{parameter}={_shell_quote(value)}"
         elif op == "a":
-            # Attributes - check if array, readonly, etc.
-            attrs = []
-            if ctx.state.env.get(f"{parameter}__is_array") == "indexed":
-                attrs.append("a")
-            elif ctx.state.env.get(f"{parameter}__is_array") == "associative":
-                attrs.append("A")
-            readonly_set = ctx.state.env.get("__readonly__", "").split()
-            if parameter in readonly_set:
-                attrs.append("r")
-            return "".join(attrs)
+            # Attributes - check VariableStore metadata first
+            from .types import VariableStore
+            env = ctx.state.env
+            attrs = ""
+            if isinstance(env, VariableStore):
+                var_attrs = env.get_attributes(parameter)
+                # Build flags in standard order
+                for flag in "aAilnrtux":
+                    if flag in var_attrs:
+                        attrs += flag
+                # Check array type if not in metadata
+                if "a" not in attrs and "A" not in attrs:
+                    is_array = env.get(f"{parameter}__is_array")
+                    if is_array == "indexed":
+                        attrs = "a" + attrs
+                    elif is_array == "assoc":
+                        attrs = "A" + attrs
+            else:
+                if env.get(f"{parameter}__is_array") == "indexed":
+                    attrs += "a"
+                elif env.get(f"{parameter}__is_array") == "assoc":
+                    attrs += "A"
+                if parameter in getattr(ctx.state, 'readonly_vars', set()):
+                    attrs += "r"
+            return attrs
         elif op == "K":
-            # Key-value pairs for associative arrays
-            # For indexed arrays, show index=value pairs
+            # Key-value pairs
             elements = get_array_elements(ctx, parameter)
             if elements:
                 pairs = [f"[{idx}]=\"{val}\"" for idx, val in elements]
                 return " ".join(pairs)
             return value
+        elif op == "u":
+            # Uppercase first character
+            return value[0].upper() + value[1:] if value else ""
+        elif op == "U":
+            # Uppercase all
+            return value.upper()
+        elif op == "L":
+            # Lowercase all
+            return value.lower()
 
     return value
 
@@ -797,6 +1206,14 @@ def _apply_pattern_replacement(value: str, regex_pattern: str, pattern: str, rep
         return re.sub(regex_pattern, replacement, value)
     else:
         return re.sub(regex_pattern, replacement, value, count=1)
+
+
+def _case_first_matching(value: str, pattern: str, transform) -> str:
+    """Apply case transform to the first character matching pattern."""
+    for i, c in enumerate(value):
+        if fnmatch.fnmatch(c, pattern):
+            return value[:i] + transform(c) + value[i + 1:]
+    return value
 
 
 def _shell_quote(s: str) -> str:
@@ -1199,26 +1616,8 @@ async def expand_word_with_glob(
             all_results.extend(sub_result["values"])
         return {"values": all_results, "quoted": False}
 
-    # String-level brace expansion fallback for unquoted words where braces
-    # span across multiple parts (e.g., {$x,other} where $x is a ParameterExpansionPart)
-    expanded_text: str | None = None
-    if not has_quoted:
-        expanded_text = await expand_word_async(ctx, word)
-        if '{' in expanded_text and '}' in expanded_text:
-            brace_expanded = expand_braces(expanded_text)
-            if len(brace_expanded) > 1 or (len(brace_expanded) == 1 and brace_expanded[0] != expanded_text):
-                all_results = []
-                for exp_text in brace_expanded:
-                    if any(c in exp_text for c in "*?["):
-                        matches = await glob_expand(ctx, exp_text)
-                        if matches:
-                            all_results.extend(matches)
-                            continue
-                    if exp_text:
-                        all_results.append(exp_text)
-                return {"values": all_results, "quoted": False}
-
     # Special handling for "$@" and "$*" in double quotes
+    # (check BEFORE segment expansion to avoid double command substitution)
     # "$@" expands to multiple words (one per positional parameter)
     # "$*" expands to single word (params joined by IFS)
     if len(word.parts) == 1 and isinstance(word.parts[0], DoubleQuotedPart):
@@ -1280,13 +1679,34 @@ async def expand_word_with_glob(
     if values is not None:
         return {"values": values, "quoted": True}
 
-    # Expand the word (reuse if already expanded to avoid double side effects)
-    value = expanded_text if expanded_text is not None else await expand_word_async(ctx, word)
+    # Expand word to segments (primary expansion, handles command substitution etc.)
+    segments = await expand_word_segments(ctx, word)
+    value = _segments_to_string(segments)
+    # A word is "all quoted" only if every segment is quoted AND there's at least one segment
+    all_quoted = bool(segments) and all(seg.quoted for seg in segments)
 
-    # For unquoted words, perform IFS word splitting
+    # String-level brace expansion fallback for unquoted words where braces
+    # span across multiple parts (e.g., {$x,other} where $x is a ParameterExpansionPart)
+    # Use has_quoted (AST-level check) to avoid expanding braces that came from escaped/quoted parts
     if not has_quoted:
-        # Check for glob patterns first (including extglob)
-        if any(c in value for c in "*?[") or re.search(r'[@?*+!]\(', value):
+        if '{' in value and '}' in value:
+            brace_expanded = expand_braces(value)
+            if len(brace_expanded) > 1 or (len(brace_expanded) == 1 and brace_expanded[0] != value):
+                all_results = []
+                for exp_text in brace_expanded:
+                    if any(c in exp_text for c in "*?["):
+                        matches = await glob_expand(ctx, exp_text)
+                        if matches:
+                            all_results.extend(matches)
+                            continue
+                    if exp_text:
+                        all_results.append(exp_text)
+                return {"values": all_results, "quoted": False}
+
+    # For words with unquoted parts, perform glob expansion and IFS word splitting
+    if not all_quoted:
+        # Check for glob patterns in unquoted segments
+        if _segments_has_unquoted_glob(segments):
             matches = await glob_expand(ctx, value)
             if matches:
                 return {"values": matches, "quoted": False}
@@ -1311,11 +1731,11 @@ async def expand_word_with_glob(
         if has_expansion:
             ifs = ctx.state.env.get("IFS", " \t\n")
             if ifs:
-                # Split on IFS characters
-                words = _split_on_ifs(value, ifs)
+                # Split on IFS characters using segment-aware splitting
+                words = _split_segments_on_ifs(segments, ifs)
                 return {"values": words, "quoted": False}
 
-    return {"values": [value], "quoted": has_quoted}
+    return {"values": [value], "quoted": all_quoted}
 
 
 def _split_on_ifs(value: str, ifs: str) -> list[str]:
@@ -1748,7 +2168,7 @@ def evaluate_arithmetic_sync(ctx: "InterpreterContext", expr) -> int:
         elif expr.type == "ArithVariable":
             name = expr.name
             # Handle dynamic base constants like $base#value or base#value where base is a variable
-            if "#" in name:
+            if "#" in name and not name.startswith("$"):
                 hash_pos = name.index("#")
                 base_part = name[:hash_pos]
                 value_part = name[hash_pos + 1:]
@@ -1770,6 +2190,18 @@ def evaluate_arithmetic_sync(ctx: "InterpreterContext", expr) -> int:
                         return _parse_base_n_value(value_part, base)
                 except (ValueError, TypeError):
                     pass
+            # Handle ${...} parameter expansion that parser fell back to ArithVariable
+            if name.startswith("${") and name.endswith("}"):
+                inner = name[2:-1]
+                val = _expand_braced_param_sync(ctx, inner)
+                return _parse_arith_value(val)
+            # Handle $var simple variable reference
+            if name.startswith("$") and not name.startswith("$("):
+                var_name = name[1:]
+                if var_name.startswith("{") and var_name.endswith("}"):
+                    var_name = var_name[1:-1]
+                val = get_variable(ctx, var_name, False)
+                return _parse_arith_value(val)
             val = get_variable(ctx, name, False)
             return _parse_arith_value(val)
         elif expr.type == "ArithBinary":
@@ -1884,15 +2316,32 @@ def evaluate_arithmetic_sync(ctx: "InterpreterContext", expr) -> int:
             # Handle compound assignments: = += -= *= /= %= <<= >>= &= |= ^=
             op = getattr(expr, 'operator', '=')
             var_name = getattr(expr, 'variable', None) or getattr(expr, 'name', None)
+            subscript = getattr(expr, 'subscript', None)
+            string_key = getattr(expr, 'string_key', None)
             rhs = evaluate_arithmetic_sync(ctx, expr.value)
+
+            # Determine the storage key (for arrays, use arr_idx format)
+            store_key = var_name
+            if subscript is not None and var_name:
+                idx = evaluate_arithmetic_sync(ctx, subscript)
+                store_key = f"{var_name}_{idx}"
+                # Mark as array if not already
+                if f"{var_name}__is_array" not in ctx.state.env:
+                    ctx.state.env[f"{var_name}__is_array"] = "indexed"
+            elif string_key is not None and var_name:
+                store_key = f"{var_name}_{string_key}"
+                if f"{var_name}__is_array" not in ctx.state.env:
+                    ctx.state.env[f"{var_name}__is_array"] = "assoc"
 
             if op == '=':
                 value = rhs
             else:
                 # Get current value for compound operators
                 current = 0
-                if var_name:
-                    val = get_variable(ctx, var_name, False)
+                if store_key:
+                    val = ctx.state.env.get(store_key, "")
+                    if not val and var_name and subscript is None and string_key is None:
+                        val = get_variable(ctx, var_name, False)
                     try:
                         current = int(val) if val else 0
                     except ValueError:
@@ -1925,15 +2374,326 @@ def evaluate_arithmetic_sync(ctx: "InterpreterContext", expr) -> int:
                 else:
                     value = rhs
 
-            if var_name:
-                ctx.state.env[var_name] = str(value)
+            if store_key:
+                ctx.state.env[store_key] = str(value)
             return value
         elif expr.type == "ArithGroup":
             return evaluate_arithmetic_sync(ctx, expr.expression)
+        elif expr.type == "ArithNested":
+            # Nested arithmetic expansion: $((expr)) within arithmetic
+            if expr.expression:
+                return evaluate_arithmetic_sync(ctx, expr.expression)
+            return 0
+        elif expr.type == "ArithArrayElement":
+            # Array element access: arr[idx]
+            arr_name = expr.array
+            if expr.string_key is not None:
+                # Associative array
+                val = ctx.state.env.get(f"{arr_name}_{expr.string_key}", "")
+            elif expr.index is not None:
+                idx = evaluate_arithmetic_sync(ctx, expr.index)
+                val = ctx.state.env.get(f"{arr_name}_{idx}", "")
+            else:
+                val = ""
+            return _parse_arith_value(val)
+        elif expr.type == "ArithConcat":
+            # Concatenation of parts forming a single numeric value
+            result_str = ""
+            for part in expr.parts:
+                result_str += str(evaluate_arithmetic_sync(ctx, part))
+            return _parse_arith_value(result_str)
+        elif expr.type == "ArithDynamicBase":
+            # Dynamic base constant: ${base}#value
+            base_str = get_variable(ctx, expr.base_expr, False)
+            try:
+                base = int(base_str)
+                if 2 <= base <= 64:
+                    return _parse_base_n_value(expr.value, base)
+            except (ValueError, TypeError):
+                pass
+            return 0
+        elif expr.type == "ArithDynamicNumber":
+            # Dynamic number prefix: ${zero}11 or ${zero}xAB
+            prefix = get_variable(ctx, expr.prefix, False)
+            full = prefix + expr.suffix
+            return _parse_arith_value(full)
+        elif expr.type in ("ArithBracedExpansion", "ArithCommandSubst"):
+            # These need async handling - in sync mode, try basic resolution
+            if expr.type == "ArithBracedExpansion":
+                content = expr.content
+                val = _expand_braced_param_sync(ctx, content)
+                return _parse_arith_value(val)
+            # Command substitution can't be done synchronously
+            return 0
+        elif expr.type in ("ArithDoubleSubscript", "ArithNumberSubscript"):
+            # Invalid syntax
+            return 0
     return 0
 
 
 async def evaluate_arithmetic(ctx: "InterpreterContext", expr) -> int:
-    """Evaluate an arithmetic expression asynchronously."""
-    # For now, use sync version
-    return evaluate_arithmetic_sync(ctx, expr)
+    """Evaluate an arithmetic expression asynchronously.
+
+    Handles command substitution and parameter expansion within arithmetic.
+    """
+    if not expr or not hasattr(expr, 'type'):
+        return 0
+
+    if expr.type == "ArithNumber":
+        return expr.value
+    elif expr.type == "ArithVariable":
+        name = expr.name
+        # Handle dynamic base constants
+        if "#" in name and not name.startswith("$"):
+            hash_pos = name.index("#")
+            base_part = name[:hash_pos]
+            value_part = name[hash_pos + 1:]
+            if base_part.startswith("$"):
+                base_var = base_part[1:]
+                if base_var.startswith("{") and base_var.endswith("}"):
+                    base_var = base_var[1:-1]
+                base_str = get_variable(ctx, base_var, False)
+            else:
+                base_str = get_variable(ctx, base_part, False)
+                if not base_str:
+                    base_str = base_part
+            try:
+                base = int(base_str)
+                if 2 <= base <= 64:
+                    return _parse_base_n_value(value_part, base)
+            except (ValueError, TypeError):
+                pass
+        # Handle $((expr)) nested arithmetic in variable name
+        if name.startswith("$((") and name.endswith("))"):
+            inner = name[3:-2]
+            from ..parser.parser import Parser
+            parser = Parser()
+            inner_expr = parser._parse_arithmetic_expression(inner)
+            return await evaluate_arithmetic(ctx, inner_expr)
+        # Handle $(cmd) command substitution in variable name
+        if name.startswith("$(") and name.endswith(")") and not name.startswith("$(("):
+            cmd = name[2:-1]
+            if ctx.exec_fn:
+                result = await ctx.exec_fn(cmd, None, None)
+                val = result.stdout.rstrip("\n")
+                return _parse_arith_value(val)
+            return 0
+        # Handle ${...} parameter expansion
+        if name.startswith("${") and name.endswith("}"):
+            inner = name[2:-1]
+            val = _expand_braced_param_sync(ctx, inner)
+            return _parse_arith_value(val)
+        # Handle $var
+        if name.startswith("$") and not name.startswith("$("):
+            var_name = name[1:]
+            if var_name.startswith("{") and var_name.endswith("}"):
+                var_name = var_name[1:-1]
+            val = get_variable(ctx, var_name, False)
+            return _parse_arith_value(val)
+        val = get_variable(ctx, name, False)
+        return _parse_arith_value(val)
+    elif expr.type == "ArithBinary":
+        op = expr.operator
+        if op == "&&":
+            left = await evaluate_arithmetic(ctx, expr.left)
+            if not left:
+                return 0
+            right = await evaluate_arithmetic(ctx, expr.right)
+            return 1 if right else 0
+        elif op == "||":
+            left = await evaluate_arithmetic(ctx, expr.left)
+            if left:
+                return 1
+            right = await evaluate_arithmetic(ctx, expr.right)
+            return 1 if right else 0
+        elif op == ",":
+            await evaluate_arithmetic(ctx, expr.left)
+            return await evaluate_arithmetic(ctx, expr.right)
+        else:
+            left = await evaluate_arithmetic(ctx, expr.left)
+            right = await evaluate_arithmetic(ctx, expr.right)
+        if op == "+":
+            return left + right
+        elif op == "-":
+            return left - right
+        elif op == "*":
+            return left * right
+        elif op == "/":
+            if right == 0:
+                raise ValueError("division by 0")
+            return int(left / right)
+        elif op == "%":
+            if right == 0:
+                raise ValueError("division by 0")
+            return int(left - int(left / right) * right)
+        elif op == "**":
+            if right < 0:
+                raise ValueError("exponent less than 0")
+            return left ** right
+        elif op == "<":
+            return 1 if left < right else 0
+        elif op == ">":
+            return 1 if left > right else 0
+        elif op == "<=":
+            return 1 if left <= right else 0
+        elif op == ">=":
+            return 1 if left >= right else 0
+        elif op == "==":
+            return 1 if left == right else 0
+        elif op == "!=":
+            return 1 if left != right else 0
+        elif op == "&":
+            return left & right
+        elif op == "|":
+            return left | right
+        elif op == "^":
+            return left ^ right
+        elif op == "<<":
+            return left << right
+        elif op == ">>":
+            return left >> right
+    elif expr.type == "ArithUnary":
+        op = expr.operator
+        if op in ("++", "--"):
+            if hasattr(expr.operand, 'name'):
+                var_name = expr.operand.name
+                val = get_variable(ctx, var_name, False)
+                try:
+                    current = int(val) if val else 0
+                except ValueError:
+                    current = 0
+                new_val = current + 1 if op == "++" else current - 1
+                array_match = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\[(.+)\]$', var_name)
+                if array_match:
+                    arr_name = array_match.group(1)
+                    subscript = array_match.group(2)
+                    idx = _eval_array_subscript(ctx, subscript)
+                    ctx.state.env[f"{arr_name}_{idx}"] = str(new_val)
+                else:
+                    ctx.state.env[var_name] = str(new_val)
+                return new_val if expr.prefix else current
+            else:
+                operand = await evaluate_arithmetic(ctx, expr.operand)
+                return operand + 1 if op == "++" else operand - 1
+        operand = await evaluate_arithmetic(ctx, expr.operand)
+        if op == "-":
+            return -operand
+        elif op == "+":
+            return operand
+        elif op == "!":
+            return 0 if operand else 1
+        elif op == "~":
+            return ~operand
+    elif expr.type == "ArithTernary":
+        cond = await evaluate_arithmetic(ctx, expr.condition)
+        if cond:
+            return await evaluate_arithmetic(ctx, expr.consequent)
+        else:
+            return await evaluate_arithmetic(ctx, expr.alternate)
+    elif expr.type == "ArithAssignment":
+        op = getattr(expr, 'operator', '=')
+        var_name = getattr(expr, 'variable', None) or getattr(expr, 'name', None)
+        subscript = getattr(expr, 'subscript', None)
+        string_key = getattr(expr, 'string_key', None)
+        rhs = await evaluate_arithmetic(ctx, expr.value)
+
+        store_key = var_name
+        if subscript is not None and var_name:
+            idx = await evaluate_arithmetic(ctx, subscript)
+            store_key = f"{var_name}_{idx}"
+            if f"{var_name}__is_array" not in ctx.state.env:
+                ctx.state.env[f"{var_name}__is_array"] = "indexed"
+        elif string_key is not None and var_name:
+            store_key = f"{var_name}_{string_key}"
+            if f"{var_name}__is_array" not in ctx.state.env:
+                ctx.state.env[f"{var_name}__is_array"] = "assoc"
+
+        if op == '=':
+            value = rhs
+        else:
+            current = 0
+            if store_key:
+                val = ctx.state.env.get(store_key, "")
+                if not val and var_name and subscript is None and string_key is None:
+                    val = get_variable(ctx, var_name, False)
+                try:
+                    current = int(val) if val else 0
+                except ValueError:
+                    current = 0
+            if op == '+=':
+                value = current + rhs
+            elif op == '-=':
+                value = current - rhs
+            elif op == '*=':
+                value = current * rhs
+            elif op == '/=':
+                if rhs == 0:
+                    raise ValueError("division by 0")
+                value = int(current / rhs)
+            elif op == '%=':
+                if rhs == 0:
+                    raise ValueError("division by 0")
+                value = int(current - int(current / rhs) * rhs)
+            elif op == '<<=':
+                value = current << rhs
+            elif op == '>>=':
+                value = current >> rhs
+            elif op == '&=':
+                value = current & rhs
+            elif op == '|=':
+                value = current | rhs
+            elif op == '^=':
+                value = current ^ rhs
+            else:
+                value = rhs
+
+        if store_key:
+            ctx.state.env[store_key] = str(value)
+        return value
+    elif expr.type == "ArithGroup":
+        return await evaluate_arithmetic(ctx, expr.expression)
+    elif expr.type == "ArithNested":
+        if expr.expression:
+            return await evaluate_arithmetic(ctx, expr.expression)
+        return 0
+    elif expr.type == "ArithCommandSubst":
+        # Execute command and parse result as integer
+        if ctx.exec_fn:
+            result = await ctx.exec_fn(expr.command, None, None)
+            val = result.stdout.rstrip("\n")
+            return _parse_arith_value(val)
+        return 0
+    elif expr.type == "ArithBracedExpansion":
+        val = _expand_braced_param_sync(ctx, expr.content)
+        return _parse_arith_value(val)
+    elif expr.type == "ArithArrayElement":
+        arr_name = expr.array
+        if expr.string_key is not None:
+            val = ctx.state.env.get(f"{arr_name}_{expr.string_key}", "")
+        elif expr.index is not None:
+            idx = await evaluate_arithmetic(ctx, expr.index)
+            val = ctx.state.env.get(f"{arr_name}_{idx}", "")
+        else:
+            val = ""
+        return _parse_arith_value(val)
+    elif expr.type == "ArithConcat":
+        result_str = ""
+        for part in expr.parts:
+            result_str += str(await evaluate_arithmetic(ctx, part))
+        return _parse_arith_value(result_str)
+    elif expr.type == "ArithDynamicBase":
+        base_str = get_variable(ctx, expr.base_expr, False)
+        try:
+            base = int(base_str)
+            if 2 <= base <= 64:
+                return _parse_base_n_value(expr.value, base)
+        except (ValueError, TypeError):
+            pass
+        return 0
+    elif expr.type == "ArithDynamicNumber":
+        prefix = get_variable(ctx, expr.prefix, False)
+        full = prefix + expr.suffix
+        return _parse_arith_value(full)
+    elif expr.type in ("ArithDoubleSubscript", "ArithNumberSubscript"):
+        return 0
+    return 0

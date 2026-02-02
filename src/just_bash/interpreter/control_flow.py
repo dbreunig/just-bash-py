@@ -22,7 +22,7 @@ from ..ast.types import (
 )
 from ..types import ExecResult
 from .errors import BreakError, ContinueError, ExecutionLimitError, ExitError
-from .expansion import expand_word_async, expand_word_with_glob, evaluate_arithmetic
+from .expansion import expand_word_async, expand_word_for_case_pattern, expand_word_with_glob, evaluate_arithmetic
 
 if TYPE_CHECKING:
     from .types import InterpreterContext
@@ -75,9 +75,18 @@ async def execute_for(ctx: "InterpreterContext", node: ForNode) -> ExecResult:
     # Get words to iterate over
     words: list[str] = []
     if node.words is None:
-        # Iterate over positional parameters
-        params = ctx.state.env.get("@", "").split()
-        words = [p for p in params if p]
+        # Iterate over positional parameters ($1, $2, ...)
+        count = int(ctx.state.env.get("#", "0"))
+        words = []
+        for pi in range(1, count + 1):
+            val = ctx.state.env.get(str(pi), "")
+            if val:
+                words.append(val)
+        if not words:
+            # Fallback to $@ if positional params not set individually
+            at_val = ctx.state.env.get("@", "")
+            if at_val:
+                words = at_val.split()
     elif len(node.words) == 0:
         words = []
     else:
@@ -340,7 +349,7 @@ async def execute_case(ctx: "InterpreterContext", node: CaseNode) -> ExecResult:
             # Check each pattern
             matched = False
             for pattern in case_item.patterns:
-                pattern_value = await expand_word_async(ctx, pattern)
+                pattern_value = await expand_word_for_case_pattern(ctx, pattern)
                 if _case_match(word_value, pattern_value):
                     matched = True
                     break
@@ -351,11 +360,15 @@ async def execute_case(ctx: "InterpreterContext", node: CaseNode) -> ExecResult:
 
         if matched:
             # Execute the body for this case
-            for stmt in case_item.body:
-                result = await ctx.execute_statement(stmt)
-                stdout += result.stdout
-                stderr += result.stderr
-                exit_code = result.exit_code
+            try:
+                for stmt in case_item.body:
+                    result = await ctx.execute_statement(stmt)
+                    stdout += result.stdout
+                    stderr += result.stderr
+                    exit_code = result.exit_code
+            except ExitError as e:
+                e.prepend_output(stdout, stderr)
+                raise
 
             # Check terminator
             if case_item.terminator == ";;":
