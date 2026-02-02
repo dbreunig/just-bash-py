@@ -72,6 +72,8 @@ from ..ast import (
     ArithTernaryNode,
     ArithAssignmentNode,
     ArithExpr,
+    # Process substitution
+    ProcessSubstitutionPart,
     # Parameter expansion operations
     DefaultValueOp,
     AssignDefaultOp,
@@ -716,6 +718,20 @@ class Parser:
                 args.append(self._parse_word())
                 continue
 
+            # Check for process substitution <(...) or >(...)
+            if (self._check(TokenType.LESS) or self._check(TokenType.GREAT)) and self._peek(1).type == TokenType.LPAREN:
+                direction = "input" if self._current().type == TokenType.LESS else "output"
+                self._advance()  # consume < or >
+                self._advance()  # consume (
+                self._skip_newlines()
+                body_stmts = self._parse_compound_list()
+                self._skip_newlines()
+                self._expect(TokenType.RPAREN, "Expected ')' to close process substitution")
+                body = AST.script(body_stmts)
+                word = AST.word([ProcessSubstitutionPart(body=body, direction=direction)])
+                args.append(word)
+                continue
+
             break
 
         # Must have at least an assignment or a command name
@@ -824,6 +840,12 @@ class Parser:
                 num_end_col = num_token.column + len(num_token.value)
                 if next_token.column == num_end_col:
                     fd = int(self._advance().value)
+
+        # Process substitution <(...) or >(...) is NOT a redirection — bail out
+        if self._check(TokenType.LESS) and self._peek(1).type == TokenType.LPAREN:
+            return None
+        if self._check(TokenType.GREAT) and self._peek(1).type == TokenType.LPAREN:
+            return None
 
         # Check for redirection operator
         op_map: dict[TokenType, RedirectionOperator] = {

@@ -28,6 +28,7 @@ from ..ast.types import (
     TildeExpansionPart,
     GlobPart,
     BraceExpansionPart,
+    ProcessSubstitutionPart,
 )
 from .errors import BadSubstitutionError, ExecutionLimitError, ExitError, NounsetError
 
@@ -496,6 +497,9 @@ def expand_part_sync(ctx: "InterpreterContext", part: WordPart, in_double_quotes
     elif isinstance(part, CommandSubstitutionPart):
         # Command substitution requires async
         raise RuntimeError("Command substitution requires async expansion")
+    elif isinstance(part, ProcessSubstitutionPart):
+        # Process substitution requires async
+        raise RuntimeError("Process substitution requires async expansion")
     else:
         return ""
 
@@ -560,6 +564,15 @@ async def expand_part(ctx: "InterpreterContext", part: WordPart, in_double_quote
             ctx.state.last_exit_code = e.exit_code
             ctx.state.env["?"] = str(e.exit_code)
             return e.stdout.rstrip("\n")
+    elif isinstance(part, ProcessSubstitutionPart):
+        # Execute the subcommand and write its output to a temp file
+        if part.body:
+            import hashlib
+            result = await ctx.execute_script(part.body)
+            tmp_name = f"/tmp/proc_sub_{hashlib.md5(result.stdout.encode()).hexdigest()[:8]}"
+            await ctx.fs.write_file(tmp_name, result.stdout)
+            return tmp_name
+        return "/dev/null"
     else:
         return ""
 
@@ -654,6 +667,17 @@ async def _expand_part_segments(
             ctx.state.env["?"] = str(e.exit_code)
             text = e.stdout.rstrip("\n")
         return [ExpandedSegment(text=text, quoted=in_double_quotes)]
+
+    elif isinstance(part, ProcessSubstitutionPart):
+        if part.body:
+            import hashlib
+            result = await ctx.execute_script(part.body)
+            tmp_name = f"/tmp/proc_sub_{hashlib.md5(result.stdout.encode()).hexdigest()[:8]}"
+            await ctx.fs.write_file(tmp_name, result.stdout)
+            text = tmp_name
+        else:
+            text = "/dev/null"
+        return [ExpandedSegment(text=text, quoted=True)]
 
     return [ExpandedSegment(text="", quoted=in_double_quotes)]
 
