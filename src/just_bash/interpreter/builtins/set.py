@@ -20,11 +20,28 @@ Usage: shift [n]
 Shift positional parameters to the left by n (default 1).
 """
 
+import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..types import InterpreterContext
     from ...types import ExecResult
+
+_SAFE_VALUE_RE = re.compile(r'^[a-zA-Z0-9_/.,:@%^+=~-]+$')
+
+
+def _shell_quote_value(value: str) -> str:
+    """Quote a value for set output, matching bash behavior.
+
+    Simple values (alphanumeric etc.) are unquoted.
+    Empty values become ''.
+    Values with special chars are single-quoted with embedded
+    single quotes escaped as '\\''."""
+    if not value:
+        return "''"
+    if _SAFE_VALUE_RE.match(value):
+        return value
+    return "'" + value.replace("'", "'\\''") + "'"
 
 
 async def handle_set(ctx: "InterpreterContext", args: list[str]) -> "ExecResult":
@@ -38,7 +55,7 @@ async def handle_set(ctx: "InterpreterContext", args: list[str]) -> "ExecResult"
             # Skip internal variables
             if k.startswith("PIPESTATUS_") or k == "?":
                 continue
-            lines.append(f"{k}='{v}'")
+            lines.append(f"{k}={_shell_quote_value(v)}")
         return ExecResult(stdout="\n".join(lines) + "\n", stderr="", exit_code=0)
 
     i = 0
@@ -51,6 +68,21 @@ async def handle_set(ctx: "InterpreterContext", args: list[str]) -> "ExecResult"
             new_params = args[i + 1:]
             _set_positional_params(ctx, new_params)
             return ExecResult(stdout="", stderr="", exit_code=0)
+
+        # Handle bare `-`: stops option processing, remaining args are positional params.
+        # Also turns off -x and -v (bash behavior).
+        if arg == "-":
+            ctx.state.options.xtrace = False
+            ctx.state.options.verbose = False
+            # Remaining args become positional parameters
+            if i + 1 < len(args):
+                _set_positional_params(ctx, args[i + 1:])
+            return ExecResult(stdout="", stderr="", exit_code=0)
+
+        # Handle bare `+`: ignored as a flag (no-op), continue processing
+        if arg == "+":
+            i += 1
+            continue
 
         # Handle -o option
         if arg == "-o":
@@ -183,6 +215,29 @@ def _set_option(ctx: "InterpreterContext", name: str, enable: bool) -> "ExecResu
         options.verbose = enable
     elif name == "pipefail":
         options.pipefail = enable
+    elif name == "noglob":
+        options.noglob = enable
+    elif name == "noclobber":
+        options.noclobber = enable
+    elif name == "braceexpand":
+        options.nobraceexpand = not enable
+    elif name == "allexport":
+        options.allexport = enable
+    elif name == "emacs":
+        options.emacs = enable
+        if enable:
+            options.vi = False  # Mutually exclusive
+    elif name == "vi":
+        options.vi = enable
+        if enable:
+            options.emacs = False  # Mutually exclusive
+    elif name in (
+        "hashall", "histexpand", "history",
+        "interactive-comments", "keyword", "monitor", "notify",
+        "onecmd", "physical", "posix", "privileged",
+    ):
+        # Accepted but ignored options
+        pass
     else:
         return ExecResult(
             stdout="",
@@ -205,6 +260,17 @@ def _set_short_option(ctx: "InterpreterContext", char: str, enable: bool) -> "Ex
         options.xtrace = enable
     elif char == "v":
         options.verbose = enable
+    elif char == "f":
+        options.noglob = enable
+    elif char == "C":
+        options.noclobber = enable
+    elif char == "B":
+        options.nobraceexpand = not enable
+    elif char == "a":
+        options.allexport = enable
+    elif char in ("h", "H", "b", "m", "n", "p", "t"):
+        # Accepted but ignored short options
+        pass
     else:
         return ExecResult(
             stdout="",
@@ -215,28 +281,77 @@ def _set_short_option(ctx: "InterpreterContext", char: str, enable: bool) -> "Ex
 
 
 def _list_options(ctx: "InterpreterContext") -> str:
-    """List all options in human-readable format."""
+    """List all options in human-readable format (bash canonical order)."""
     options = ctx.state.options
-    lines = [
-        f"errexit         {'on' if options.errexit else 'off'}",
-        f"nounset         {'on' if options.nounset else 'off'}",
-        f"pipefail        {'on' if options.pipefail else 'off'}",
-        f"verbose         {'on' if options.verbose else 'off'}",
-        f"xtrace          {'on' if options.xtrace else 'off'}",
+    opt_list = [
+        ("allexport", options.allexport),
+        ("braceexpand", not options.nobraceexpand),
+        ("emacs", options.emacs),
+        ("errexit", options.errexit),
+        ("errtrace", False),
+        ("functrace", False),
+        ("hashall", True),
+        ("histexpand", False),
+        ("history", False),
+        ("interactive-comments", True),
+        ("keyword", False),
+        ("monitor", False),
+        ("noclobber", options.noclobber),
+        ("noexec", False),
+        ("noglob", options.noglob),
+        ("nolog", False),
+        ("notify", False),
+        ("nounset", options.nounset),
+        ("onecmd", False),
+        ("physical", False),
+        ("pipefail", options.pipefail),
+        ("posix", False),
+        ("privileged", False),
+        ("verbose", options.verbose),
+        ("vi", options.vi),
+        ("xtrace", options.xtrace),
     ]
+    lines = []
+    for name, enabled in opt_list:
+        pad = " " * (15 - len(name))
+        lines.append(f"{name}{pad} {'on' if enabled else 'off'}")
     return "\n".join(lines) + "\n"
 
 
 def _list_options_script(ctx: "InterpreterContext") -> str:
     """List options in re-inputable script format."""
     options = ctx.state.options
-    lines = [
-        f"set {'-' if options.errexit else '+'}o errexit",
-        f"set {'-' if options.nounset else '+'}o nounset",
-        f"set {'-' if options.pipefail else '+'}o pipefail",
-        f"set {'-' if options.verbose else '+'}o verbose",
-        f"set {'-' if options.xtrace else '+'}o xtrace",
+    opt_list = [
+        ("allexport", options.allexport),
+        ("braceexpand", not options.nobraceexpand),
+        ("emacs", options.emacs),
+        ("errexit", options.errexit),
+        ("errtrace", False),
+        ("functrace", False),
+        ("hashall", True),
+        ("histexpand", False),
+        ("history", False),
+        ("interactive-comments", True),
+        ("keyword", False),
+        ("monitor", False),
+        ("noclobber", options.noclobber),
+        ("noexec", False),
+        ("noglob", options.noglob),
+        ("nolog", False),
+        ("notify", False),
+        ("nounset", options.nounset),
+        ("onecmd", False),
+        ("physical", False),
+        ("pipefail", options.pipefail),
+        ("posix", False),
+        ("privileged", False),
+        ("verbose", options.verbose),
+        ("vi", options.vi),
+        ("xtrace", options.xtrace),
     ]
+    lines = []
+    for name, enabled in opt_list:
+        lines.append(f"set {'-' if enabled else '+'}o {name}")
     return "\n".join(lines) + "\n"
 
 
@@ -247,6 +362,12 @@ async def handle_shift(ctx: "InterpreterContext", args: list[str]) -> "ExecResul
     # Default shift count is 1
     n = 1
     if args:
+        if len(args) > 1:
+            return ExecResult(
+                stdout="",
+                stderr=f"bash: shift: too many arguments\n",
+                exit_code=1,
+            )
         try:
             n = int(args[0])
         except ValueError:

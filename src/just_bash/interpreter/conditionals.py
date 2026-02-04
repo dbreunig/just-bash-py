@@ -66,7 +66,8 @@ async def evaluate_conditional(
 
         # String comparisons (with pattern matching support in [[ ]])
         if op in STRING_COMPARE_OPS:
-            return compare_strings(op, left, right, allow_pattern=not is_rhs_quoted)
+            nocase = ctx.state.env.get("__shopt_nocasematch__") == "1"
+            return compare_strings(op, left, right, allow_pattern=not is_rhs_quoted, nocase=nocase)
 
         # Numeric comparisons
         if op in NUMERIC_OPS:
@@ -79,13 +80,30 @@ async def evaluate_conditional(
         # Regex matching
         if op == "=~":
             try:
-                match = re.search(right, left)
+                # When the pattern is quoted, treat as literal string match
+                pattern = re.escape(right) if is_rhs_quoted else right
+                # nocasematch shopt makes regex case-insensitive
+                flags = 0
+                if ctx.state.env.get("__shopt_nocasematch__") == "1":
+                    flags = re.IGNORECASE
+                match = re.search(pattern, left, flags)
+                # Clear old BASH_REMATCH entries first
+                to_remove = [k for k in ctx.state.env
+                           if k.startswith("BASH_REMATCH_") or k.startswith("BASH_REMATCH__")]
+                for k in to_remove:
+                    del ctx.state.env[k]
+
                 if match:
-                    # Set BASH_REMATCH
+                    # Set BASH_REMATCH as array
+                    ctx.state.env["BASH_REMATCH__is_array"] = "indexed"
                     ctx.state.env["BASH_REMATCH_0"] = match.group(0)
                     for i, group in enumerate(match.groups(), 1):
-                        ctx.state.env[f"BASH_REMATCH_{i}"] = group if group else ""
-                    ctx.state.env["BASH_REMATCH__length"] = str(len(match.groups()) + 1)
+                        ctx.state.env[f"BASH_REMATCH_{i}"] = group if group is not None else ""
+                else:
+                    # On non-match, BASH_REMATCH is unset
+                    if "BASH_REMATCH" in ctx.state.env:
+                        del ctx.state.env["BASH_REMATCH"]
+
                 return match is not None
             except re.error:
                 # Invalid regex is a syntax error (exit code 2)
@@ -148,8 +166,11 @@ async def evaluate_conditional(
     return False
 
 
-def compare_strings(op: str, left: str, right: str, allow_pattern: bool = False) -> bool:
+def compare_strings(op: str, left: str, right: str, allow_pattern: bool = False, nocase: bool = False) -> bool:
     """Compare strings, optionally with pattern matching."""
+    if nocase:
+        left = left.lower()
+        right = right.lower()
     if op == "=" or op == "==":
         if allow_pattern:
             return match_pattern(left, right)
@@ -388,6 +409,11 @@ def evaluate_variable_test(ctx: "InterpreterContext", name: str) -> bool:
             return resolved in env
         except ValueError:
             return False
+
+    # Dynamic variables that are always set
+    if name in ("SHELLOPTS", "BASHOPTS", "RANDOM", "LINENO", "SECONDS",
+                "BASH_VERSION", "BASHPID"):
+        return True
 
     return name in env
 

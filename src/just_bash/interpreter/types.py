@@ -279,6 +279,24 @@ class ShellOptions:
     verbose: bool = False
     """set -v: Print shell input lines as they are read."""
 
+    noglob: bool = False
+    """set -f: Disable filename expansion (globbing)."""
+
+    noclobber: bool = False
+    """set -C: Prevent output redirection from overwriting existing files."""
+
+    nobraceexpand: bool = False
+    """set +B: Disable brace expansion."""
+
+    allexport: bool = False
+    """set -a: Mark variables for export when they are set."""
+
+    emacs: bool = False
+    """set -o emacs: Use emacs-style line editing interface."""
+
+    vi: bool = False
+    """set -o vi: Use vi-style line editing interface."""
+
 
 @dataclass
 class InterpreterState:
@@ -290,8 +308,8 @@ class InterpreterState:
     cwd: str = "/home/user"
     """Current working directory."""
 
-    previous_dir: str = "/home/user"
-    """Previous directory (for cd -)."""
+    previous_dir: str = ""
+    """Previous directory (for cd -). Empty string means OLDPWD not set."""
 
     functions: dict[str, "FunctionDefNode"] = field(default_factory=dict)
     """Defined functions."""
@@ -341,7 +359,10 @@ class InterpreterState:
     group_stdin: Optional[str] = None
     """Stdin for commands in compound commands."""
 
-    readonly_vars: set[str] = field(default_factory=set)
+    dir_stack: list[str] = field(default_factory=list)
+    """Directory stack for pushd/popd/dirs."""
+
+    readonly_vars: set[str] = field(default_factory=lambda: {"SHELLOPTS", "BASHOPTS"})
     """Set of readonly variable names."""
 
     expansion_exit_code: Optional[int] = None

@@ -21,7 +21,7 @@ from ..ast.types import (
     CaseNode,
 )
 from ..types import ExecResult
-from .errors import BreakError, ContinueError, ExecutionLimitError, ExitError
+from .errors import BreakError, ContinueError, ErrexitError, ExecutionLimitError, ExitError, ReturnError
 from .expansion import expand_word_async, expand_word_for_case_pattern, expand_word_with_glob, evaluate_arithmetic
 
 if TYPE_CHECKING:
@@ -133,6 +133,12 @@ async def execute_for(ctx: "InterpreterContext", node: ForNode) -> ExecResult:
             except ExitError as e:
                 e.prepend_output(stdout, stderr)
                 raise
+            except ReturnError as e:
+                e.prepend_output(stdout, stderr)
+                raise
+            except ErrexitError as e:
+                e.prepend_output(stdout, stderr)
+                raise
     finally:
         ctx.state.loop_depth -= 1
 
@@ -192,6 +198,12 @@ async def execute_c_style_for(ctx: "InterpreterContext", node: CStyleForNode) ->
             except ExitError as e:
                 e.prepend_output(stdout, stderr)
                 raise
+            except ReturnError as e:
+                e.prepend_output(stdout, stderr)
+                raise
+            except ErrexitError as e:
+                e.prepend_output(stdout, stderr)
+                raise
 
             # Execute update
             if node.update:
@@ -208,6 +220,11 @@ async def execute_while(ctx: "InterpreterContext", node: WhileNode, stdin: str =
     stderr = ""
     exit_code = 0
     iterations = 0
+
+    # Set group_stdin so read builtin can consume piped input
+    saved_group_stdin = ctx.state.group_stdin
+    if stdin:
+        ctx.state.group_stdin = stdin
 
     ctx.state.loop_depth += 1
     try:
@@ -229,6 +246,20 @@ async def execute_while(ctx: "InterpreterContext", node: WhileNode, stdin: str =
 
                 if cond_result.exit_code != 0:
                     break
+            except BreakError as e:
+                stdout += e.stdout
+                stderr += e.stderr
+                if e.levels > 1 and ctx.state.loop_depth > 1:
+                    e.levels -= 1
+                    raise
+                break
+            except ContinueError as e:
+                stdout += e.stdout
+                stderr += e.stderr
+                if e.levels > 1 and ctx.state.loop_depth > 1:
+                    e.levels -= 1
+                    raise
+                continue
             finally:
                 ctx.state.in_condition = saved_in_condition
 
@@ -255,8 +286,15 @@ async def execute_while(ctx: "InterpreterContext", node: WhileNode, stdin: str =
             except ExitError as e:
                 e.prepend_output(stdout, stderr)
                 raise
+            except ReturnError as e:
+                e.prepend_output(stdout, stderr)
+                raise
+            except ErrexitError as e:
+                e.prepend_output(stdout, stderr)
+                raise
     finally:
         ctx.state.loop_depth -= 1
+        ctx.state.group_stdin = saved_group_stdin
 
     return _result(stdout, stderr, exit_code)
 
@@ -288,6 +326,20 @@ async def execute_until(ctx: "InterpreterContext", node: UntilNode) -> ExecResul
 
                 if cond_result.exit_code == 0:
                     break  # Condition became true, exit loop
+            except BreakError as e:
+                stdout += e.stdout
+                stderr += e.stderr
+                if e.levels > 1 and ctx.state.loop_depth > 1:
+                    e.levels -= 1
+                    raise
+                break
+            except ContinueError as e:
+                stdout += e.stdout
+                stderr += e.stderr
+                if e.levels > 1 and ctx.state.loop_depth > 1:
+                    e.levels -= 1
+                    raise
+                continue
             finally:
                 ctx.state.in_condition = saved_in_condition
 
@@ -314,6 +366,12 @@ async def execute_until(ctx: "InterpreterContext", node: UntilNode) -> ExecResul
             except ExitError as e:
                 e.prepend_output(stdout, stderr)
                 raise
+            except ReturnError as e:
+                e.prepend_output(stdout, stderr)
+                raise
+            except ErrexitError as e:
+                e.prepend_output(stdout, stderr)
+                raise
     finally:
         ctx.state.loop_depth -= 1
 
@@ -333,12 +391,21 @@ async def execute_case(ctx: "InterpreterContext", node: CaseNode) -> ExecResult:
     # Expand the word to match against
     word_value = await expand_word_async(ctx, node.word)
 
+    # Check if extglob is enabled
+    extglob_enabled = ctx.state.env.get("__shopt_extglob__", "0") == "1"
+    # Check if nocasematch is enabled
+    nocasematch = ctx.state.env.get("__shopt_nocasematch__", "0") == "1"
+
     def _case_match(value: str, pattern: str) -> bool:
-        """Match value against case pattern (supports extglob)."""
-        if _re.search(r'[@?*+!]\(', pattern):
+        """Match value against case pattern (supports extglob when enabled)."""
+        if nocasematch:
+            value = value.lower()
+            pattern = pattern.lower()
+        if extglob_enabled and _re.search(r'[@?*+!]\(', pattern):
             regex_pat = "^" + glob_to_regex(pattern) + "$"
             try:
-                return bool(_re.match(regex_pat, value))
+                flags = _re.IGNORECASE if nocasematch else 0
+                return bool(_re.match(regex_pat, value, flags))
             except _re.error:
                 pass
         return fnmatch.fnmatch(value, pattern)
@@ -367,6 +434,12 @@ async def execute_case(ctx: "InterpreterContext", node: CaseNode) -> ExecResult:
                     stderr += result.stderr
                     exit_code = result.exit_code
             except ExitError as e:
+                e.prepend_output(stdout, stderr)
+                raise
+            except ReturnError as e:
+                e.prepend_output(stdout, stderr)
+                raise
+            except ErrexitError as e:
                 e.prepend_output(stdout, stderr)
                 raise
 
@@ -416,10 +489,15 @@ async def execute_statements(
     """Execute a list of statements."""
     exit_code = 0
 
-    for stmt in statements:
-        result = await ctx.execute_statement(stmt)
-        stdout += result.stdout
-        stderr += result.stderr
-        exit_code = result.exit_code
+    try:
+        for stmt in statements:
+            result = await ctx.execute_statement(stmt)
+            stdout += result.stdout
+            stderr += result.stderr
+            exit_code = result.exit_code
+    except (BreakError, ContinueError, ReturnError, ErrexitError) as error:
+        # Prepend accumulated output before propagating control flow
+        error.prepend_output(stdout, stderr)
+        raise
 
     return _result(stdout, stderr, exit_code)

@@ -22,14 +22,17 @@ async def handle_unset(ctx: "InterpreterContext", args: list[str]) -> "ExecResul
     from ..types import VariableStore
 
     mode = "variable"
+    explicit_mode = False
     unset_nameref = False
     names = []
 
     for arg in args:
         if arg == "-v":
             mode = "variable"
+            explicit_mode = True
         elif arg == "-f":
             mode = "function"
+            explicit_mode = True
         elif arg == "-n":
             # -n: unset the nameref itself, not the target
             unset_nameref = True
@@ -41,11 +44,19 @@ async def handle_unset(ctx: "InterpreterContext", args: list[str]) -> "ExecResul
 
     import re
     env = ctx.state.env
+    exit_code = 0
+    stderr_parts = []
 
     for name in names:
         if mode == "function":
             ctx.state.functions.pop(name, None)
         else:
+            # Validate variable name (allow name, name[subscript])
+            base_name = name.split("[")[0] if "[" in name else name
+            if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', base_name):
+                stderr_parts.append(f"bash: unset: `{name}': not a valid identifier\n")
+                exit_code = 1
+                continue
             # Handle -n flag: unset the nameref variable itself
             if unset_nameref and isinstance(env, VariableStore):
                 env.clear_nameref(name)
@@ -92,8 +103,12 @@ async def handle_unset(ctx: "InterpreterContext", args: list[str]) -> "ExecResul
                 # Clean up metadata
                 if isinstance(env, VariableStore):
                     env._metadata.pop(resolved_name, None)
+                # If no variable was found and mode wasn't explicitly set,
+                # also try removing as function (POSIX behavior)
+                if resolved_name not in env and not explicit_mode:
+                    ctx.state.functions.pop(resolved_name, None)
 
-    return ExecResult(stdout="", stderr="", exit_code=0)
+    return ExecResult(stdout="", stderr="".join(stderr_parts), exit_code=exit_code)
 
 
 def _is_readonly(ctx: "InterpreterContext", name: str) -> bool:

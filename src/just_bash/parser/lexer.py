@@ -203,8 +203,7 @@ THREE_CHAR_OPS: list[tuple[str, TokenType]] = [
 TWO_CHAR_OPS: list[tuple[str, TokenType]] = [
     ("[[", TokenType.DBRACK_START),
     ("]]", TokenType.DBRACK_END),
-    ("((", TokenType.DPAREN_START),
-    ("))", TokenType.DPAREN_END),
+    # (( and )) are handled as special cases in _next_token for arithmetic depth tracking
     ("&&", TokenType.AND_AND),
     ("||", TokenType.OR_OR),
     (";;", TokenType.DSEMI),
@@ -244,6 +243,7 @@ class Lexer:
         self.column = 1
         self.tokens: list[Token] = []
         self.pending_heredocs: list[HeredocInfo] = []
+        self._arith_depth = 0  # Track (( )) nesting to avoid << being treated as heredoc
 
     def tokenize(self) -> list[Token]:
         """Tokenize the entire input."""
@@ -251,15 +251,16 @@ class Lexer:
         input_len = len(input_text)
 
         while self.pos < input_len:
+            # Check for pending here-documents after newline BEFORE skipping whitespace
+            # (heredoc content must preserve leading whitespace)
+            if self.pending_heredocs and self.tokens and self.tokens[-1].type == TokenType.NEWLINE:
+                self._read_heredoc_content()
+                continue
+
             self._skip_whitespace()
 
             if self.pos >= input_len:
                 break
-
-            # Check for pending here-documents after newline
-            if self.pending_heredocs and self.tokens and self.tokens[-1].type == TokenType.NEWLINE:
-                self._read_heredoc_content()
-                continue
 
             token = self._next_token()
             if token:
@@ -330,11 +331,12 @@ class Lexer:
             )
 
         # Three-character operators
-        # Special case: <<- (heredoc with tab stripping)
+        # Special case: <<- (heredoc with tab stripping) - but not inside (( ))
         if c0 == "<" and c1 == "<" and c2 == "-":
             self.pos = pos + 3
             self.column = start_column + 3
-            self._register_heredoc_from_lookahead(strip_tabs=True)
+            if self._arith_depth == 0:
+                self._register_heredoc_from_lookahead(strip_tabs=True)
             return self._make_token(TokenType.DLESSDASH, "<<-", pos, start_line, start_column)
 
         # Check other three-char operators
@@ -346,11 +348,26 @@ class Lexer:
                 return self._make_token(token_type, op, pos, start_line, start_column)
 
         # Two-character operators
-        # Special case: << (heredoc)
+        # Special case: (( and )) - track arithmetic depth so << inside (( )) isn't treated as heredoc
+        if c0 == "(" and c1 == "(":
+            self.pos = pos + 2
+            self.column = start_column + 2
+            self._arith_depth += 1
+            return self._make_token(TokenType.DPAREN_START, "((", pos, start_line, start_column)
+
+        if c0 == ")" and c1 == ")":
+            self.pos = pos + 2
+            self.column = start_column + 2
+            if self._arith_depth > 0:
+                self._arith_depth -= 1
+            return self._make_token(TokenType.DPAREN_END, "))", pos, start_line, start_column)
+
+        # Special case: << (heredoc) - but not inside (( )) where it's left-shift
         if c0 == "<" and c1 == "<":
             self.pos = pos + 2
             self.column = start_column + 2
-            self._register_heredoc_from_lookahead(strip_tabs=False)
+            if self._arith_depth == 0:
+                self._register_heredoc_from_lookahead(strip_tabs=False)
             return self._make_token(TokenType.DLESS, "<<", pos, start_line, start_column)
 
         # Check other two-char operators

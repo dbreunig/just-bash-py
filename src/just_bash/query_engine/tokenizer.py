@@ -23,6 +23,8 @@ KEYWORDS: dict[str, TokenType] = {
     "null": TokenType.NULL,
     "reduce": TokenType.REDUCE,
     "foreach": TokenType.FOREACH,
+    "def": TokenType.DEF,
+    "label": TokenType.LABEL,
 }
 
 
@@ -221,8 +223,18 @@ def tokenize(input_str: str) -> list[Token]:
             continue
 
         if c == "-":
-            # Could be negative number or minus operator
-            if is_digit(peek()):
+            # Only treat as negative number if preceded by an operator or start of input
+            # After a value (number, string, ident, ), ], etc.) it's the minus operator
+            prev_is_value = False
+            if tokens:
+                prev_type = tokens[-1].type
+                prev_is_value = prev_type in (
+                    TokenType.NUMBER, TokenType.STRING, TokenType.IDENT,
+                    TokenType.RPAREN, TokenType.RBRACKET, TokenType.RBRACE,
+                    TokenType.TRUE, TokenType.FALSE, TokenType.NULL,
+                    TokenType.DOT, TokenType.QUESTION,
+                )
+            if is_digit(peek()) and not prev_is_value:
                 num = c
                 while not is_eof() and (is_digit(peek()) or peek() == "."):
                     num += advance()
@@ -294,12 +306,56 @@ def tokenize(input_str: str) -> list[Token]:
                         s += "\r"
                     elif escaped == "t":
                         s += "\t"
+                    elif escaped == "b":
+                        s += "\b"
+                    elif escaped == "f":
+                        s += "\f"
                     elif escaped == "\\":
                         s += "\\"
+                    elif escaped == "/":
+                        s += "/"
                     elif escaped == '"':
                         s += '"'
                     elif escaped == "(":
-                        s += "\\("  # Keep for string interpolation
+                        # String interpolation \(expr) - track paren depth, skip inner strings
+                        s += "\\("
+                        interp_depth = 1
+                        while not is_eof() and interp_depth > 0:
+                            ic = peek()
+                            if ic == "(":
+                                interp_depth += 1
+                                s += advance()
+                            elif ic == ")":
+                                interp_depth -= 1
+                                if interp_depth > 0:
+                                    s += advance()
+                                else:
+                                    advance()  # consume closing )
+                            elif ic == '"':
+                                # Inner string literal - read through it
+                                s += advance()  # opening "
+                                while not is_eof() and peek() != '"':
+                                    if peek() == "\\":
+                                        s += advance()  # backslash
+                                        if not is_eof():
+                                            s += advance()  # escaped char
+                                    else:
+                                        s += advance()
+                                if not is_eof():
+                                    s += advance()  # closing "
+                            else:
+                                s += advance()
+                        s += ")"
+                    elif escaped == "u":
+                        # Unicode escape \uXXXX
+                        hex_str = ""
+                        for _ in range(4):
+                            if not is_eof():
+                                hex_str += advance()
+                        try:
+                            s += chr(int(hex_str, 16))
+                        except ValueError:
+                            s += "\\u" + hex_str
                     else:
                         s += escaped
                 else:

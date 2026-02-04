@@ -259,7 +259,7 @@ class LsCommand:
                             except FileNotFoundError:
                                 pass
                         output_entries.append(name)
-                    stdout += "  ".join(output_entries) + "\n"
+                    stdout += "\n".join(output_entries) + "\n"
             else:
                 # Single file/directory
                 name = path

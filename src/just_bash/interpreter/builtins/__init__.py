@@ -21,6 +21,8 @@ from .readonly import handle_readonly
 from .shopt import handle_shopt
 from .alias import handle_alias, handle_unalias
 from .getopts import handle_getopts
+from .dirs import handle_pushd, handle_popd, handle_dirs
+from .hash import handle_hash
 from .misc import (
     handle_colon,
     handle_true,
@@ -64,6 +66,9 @@ BUILTINS: dict[str, Callable[["InterpreterContext", list[str]], Awaitable["ExecR
     "alias": handle_alias,
     "unalias": handle_unalias,
     "getopts": handle_getopts,
+    "pushd": handle_pushd,
+    "popd": handle_popd,
+    "dirs": handle_dirs,
     ":": handle_colon,
     "true": handle_true,
     "false": handle_false,
@@ -72,6 +77,7 @@ BUILTINS: dict[str, Callable[["InterpreterContext", list[str]], Awaitable["ExecR
     "builtin": handle_builtin,
     "exec": handle_exec,
     "wait": handle_wait,
+    "hash": handle_hash,
 }
 
 

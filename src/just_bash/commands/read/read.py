@@ -25,7 +25,9 @@ class ReadCommand:
 
     async def execute(self, args: list[str], ctx: CommandContext) -> ExecResult:
         """Execute the read command."""
-        # Parse options
+        # Parse options - expand smooshed flags first (e.g., -rn1 -> -r -n 1)
+        expanded_args = self._expand_flags(args)
+
         raw_mode = False
         delimiter = "\n"
         nchars = None
@@ -35,82 +37,53 @@ class ReadCommand:
         var_names = []
 
         i = 0
-        while i < len(args):
-            arg = args[i]
+        while i < len(expanded_args):
+            arg = expanded_args[i]
             if arg == "-r":
                 raw_mode = True
-            elif arg == "-a" and i + 1 < len(args):
+            elif arg == "-s":
+                pass  # silent mode - ignore (no terminal)
+            elif arg == "-a" and i + 1 < len(expanded_args):
                 i += 1
-                array_name = args[i]
-            elif arg == "-d" and i + 1 < len(args):
+                array_name = expanded_args[i]
+            elif arg == "-d" and i + 1 < len(expanded_args):
                 i += 1
-                delimiter = args[i] if args[i] else "\0"
-            elif arg.startswith("-d") and len(arg) > 2:
-                delimiter = arg[2:]
-            elif arg == "-n" and i + 1 < len(args):
+                delimiter = expanded_args[i] if expanded_args[i] else "\0"
+            elif arg == "-n" and i + 1 < len(expanded_args):
                 i += 1
                 try:
-                    nchars = int(args[i])
+                    nchars = int(expanded_args[i])
                 except ValueError:
                     return ExecResult(
                         stdout="",
-                        stderr=f"bash: read: {args[i]}: invalid number\n",
+                        stderr=f"bash: read: {expanded_args[i]}: invalid number\n",
                         exit_code=1,
                     )
-            elif arg.startswith("-n") and len(arg) > 2:
-                try:
-                    nchars = int(arg[2:])
-                except ValueError:
-                    return ExecResult(
-                        stdout="",
-                        stderr=f"bash: read: {arg[2:]}: invalid number\n",
-                        exit_code=1,
-                    )
-            elif arg == "-N" and i + 1 < len(args):
+            elif arg == "-N" and i + 1 < len(expanded_args):
                 i += 1
                 try:
-                    nchars = int(args[i])
+                    nchars = int(expanded_args[i])
                 except ValueError:
                     return ExecResult(
                         stdout="",
-                        stderr=f"bash: read: {args[i]}: invalid number\n",
+                        stderr=f"bash: read: {expanded_args[i]}: invalid number\n",
                         exit_code=1,
                     )
                 no_split = True
                 delimiter = ""  # -N ignores delimiters
-            elif arg.startswith("-N") and len(arg) > 2:
-                try:
-                    nchars = int(arg[2:])
-                except ValueError:
-                    return ExecResult(
-                        stdout="",
-                        stderr=f"bash: read: {arg[2:]}: invalid number\n",
-                        exit_code=1,
-                    )
-                no_split = True
-                delimiter = ""  # -N ignores delimiters
-            elif arg == "-u" and i + 1 < len(args):
+            elif arg == "-u" and i + 1 < len(expanded_args):
                 i += 1
                 try:
-                    fd_num = int(args[i])
+                    fd_num = int(expanded_args[i])
                 except ValueError:
                     return ExecResult(
                         stdout="",
-                        stderr=f"bash: read: {args[i]}: invalid file descriptor\n",
+                        stderr=f"bash: read: {expanded_args[i]}: invalid file descriptor\n",
                         exit_code=1,
                     )
-            elif arg.startswith("-u") and len(arg) > 2:
-                try:
-                    fd_num = int(arg[2:])
-                except ValueError:
-                    return ExecResult(
-                        stdout="",
-                        stderr=f"bash: read: {arg[2:]}: invalid file descriptor\n",
-                        exit_code=1,
-                    )
-            elif arg == "-p" and i + 1 < len(args):
+            elif arg == "-p" and i + 1 < len(expanded_args):
                 i += 1
-            elif arg == "-t" and i + 1 < len(args):
+            elif arg == "-t" and i + 1 < len(expanded_args):
                 i += 1
             elif arg.startswith("-"):
                 pass
@@ -130,36 +103,17 @@ class ReadCommand:
         else:
             stdin = ctx.stdin or ""
 
-        # Determine if input was properly terminated by delimiter
-        # (affects exit code: 1 if no terminating delimiter found)
-        eof_reached = False
-        if not stdin:
-            eof_reached = True
-        elif no_split:
-            # -N mode: EOF if fewer chars available than requested
-            if nchars is not None and len(stdin) < nchars:
-                eof_reached = True
-        elif delimiter not in stdin:
-            eof_reached = True
+        # Read line from stdin, tracking how much was consumed
+        line, consumed, eof_reached = self._read_record(
+            stdin, delimiter, nchars, no_split, raw_mode
+        )
 
-        # Find the line to read
-        if delimiter == "":
-            # -N mode: read raw bytes, no delimiter processing
-            line = stdin
-        elif delimiter == "\n":
-            lines = stdin.split("\n")
-            line = lines[0] if lines else ""
-        else:
-            parts = stdin.split(delimiter)
-            line = parts[0] if parts else ""
-
-        # Apply nchars limit
-        if nchars is not None:
-            line = line[:nchars]
+        # Store remaining stdin for subsequent reads in the same group
+        remaining = stdin[consumed:]
+        ctx.env["__remaining_stdin__"] = remaining
 
         # Process backslash escapes if not in raw mode and not -N mode
-        if not raw_mode and not no_split:
-            line = line.replace("\\\n", "")
+        if not raw_mode and not no_split and nchars is None:
             result = []
             ci = 0
             while ci < len(line):
@@ -179,9 +133,10 @@ class ReadCommand:
             # Split on IFS for array assignment
             if no_split:
                 words = [line] if line else []
-            elif ifs:
+            elif ifs is not None and ifs != "":
                 words = self._split_on_ifs(line, ifs)
             else:
+                # Empty IFS: no splitting (treat as single word)
                 words = [line] if line else []
 
             # Clear existing array elements
@@ -203,16 +158,27 @@ class ReadCommand:
             if len(var_names) == 1:
                 ctx.env[var_names[0]] = line
             else:
-                # Even with multiple vars, -N doesn't split
                 ctx.env[var_names[0]] = line
                 for v in var_names[1:]:
                     ctx.env[v] = ""
-        elif use_reply or len(var_names) == 1:
-            # Single variable or REPLY: no IFS splitting
-            # But strip leading/trailing IFS whitespace
-            stripped = self._strip_ifs_whitespace(line, ifs)
-            ctx.env[var_names[0]] = stripped
-        elif not ifs:
+        elif use_reply:
+            # REPLY: preserve the line as-is (no IFS stripping)
+            # But strip trailing IFS whitespace for regular reads (not -n)
+            if nchars is not None:
+                # -n mode: REPLY gets raw characters, no stripping
+                ctx.env[var_names[0]] = line
+            else:
+                ctx.env[var_names[0]] = line
+        elif len(var_names) == 1:
+            # Single named variable: strip leading/trailing IFS whitespace
+            if nchars is not None:
+                # -n mode with named variable: strip IFS whitespace
+                stripped = self._strip_ifs_whitespace(line, ifs)
+                ctx.env[var_names[0]] = stripped
+            else:
+                stripped = self._strip_ifs_whitespace(line, ifs)
+                ctx.env[var_names[0]] = stripped
+        elif ifs is not None and ifs == "":
             # Empty IFS: no splitting
             ctx.env[var_names[0]] = line
             for v in var_names[1:]:
@@ -222,6 +188,120 @@ class ReadCommand:
             self._assign_split_vars(line, var_names, ifs, ctx)
 
         return ExecResult(stdout="", stderr="", exit_code=1 if eof_reached else 0)
+
+    def _read_record(
+        self,
+        stdin: str,
+        delimiter: str,
+        nchars: int | None,
+        no_split: bool,
+        raw_mode: bool,
+    ) -> tuple[str, int, bool]:
+        """Read one record from stdin.
+
+        Returns (line, consumed_bytes, eof_reached).
+        consumed_bytes is the number of characters consumed from stdin,
+        including the delimiter.
+        """
+        if not stdin:
+            return "", 0, True
+
+        # -N mode: read raw bytes, no delimiter processing
+        if delimiter == "" and no_split:
+            if nchars is not None:
+                line = stdin[:nchars]
+                eof_reached = len(stdin) < nchars
+                return line, len(line), eof_reached
+            return stdin, len(stdin), False
+
+        # -n mode: read up to nchars characters, stop at delimiter
+        if nchars is not None and not no_split:
+            line = ""
+            consumed = 0
+            for ci in range(min(nchars, len(stdin))):
+                if stdin[ci] == delimiter:
+                    consumed = ci + 1  # consume the delimiter too
+                    break
+                line += stdin[ci]
+                consumed = ci + 1
+            else:
+                # Reached nchars limit without hitting delimiter
+                pass
+            eof_reached = len(stdin) <= consumed and delimiter not in stdin[len(line):]
+            return line, consumed, eof_reached
+
+        # Normal mode: read up to delimiter
+        if delimiter == "\n" and not raw_mode:
+            # Handle line continuation: \<newline> joins lines
+            line_parts = []
+            pos = 0
+            while pos < len(stdin):
+                nl_pos = stdin.find("\n", pos)
+                if nl_pos == -1:
+                    # No more newlines - take rest as line, EOF
+                    line_parts.append(stdin[pos:])
+                    return "".join(line_parts), len(stdin), True
+                segment = stdin[pos:nl_pos]
+                if segment.endswith("\\"):
+                    # Line continuation: backslash before newline
+                    # Remove the backslash and join with next line
+                    line_parts.append(segment[:-1])
+                    pos = nl_pos + 1
+                    continue
+                else:
+                    line_parts.append(segment)
+                    consumed = nl_pos + 1  # include the newline
+                    return "".join(line_parts), consumed, False
+            # Exhausted input
+            return "".join(line_parts), len(stdin), True
+
+        # Default delimiter handling (newline in raw mode, or custom delimiter)
+        delim_pos = stdin.find(delimiter)
+        if delim_pos == -1:
+            # Delimiter not found - read all, EOF
+            return stdin, len(stdin), True
+        line = stdin[:delim_pos]
+        consumed = delim_pos + len(delimiter)
+        return line, consumed, False
+
+    @staticmethod
+    def _expand_flags(args: list[str]) -> list[str]:
+        """Expand smooshed flags like -rn1 into [-r, -n, 1], -rd into [-r, -d].
+
+        Simple flags (no value): r, s
+        Value flags (consume rest or next arg): d, n, N, a, u, p, t
+        """
+        simple_flags = set("rs")
+        value_flags = set("dnNaupt")
+        result = []
+
+        for arg in args:
+            if not arg.startswith("-") or arg == "-" or arg == "--":
+                result.append(arg)
+                continue
+
+            # Parse the flag characters
+            chars = arg[1:]  # strip leading -
+            ci = 0
+            while ci < len(chars):
+                c = chars[ci]
+                if c in simple_flags:
+                    result.append(f"-{c}")
+                    ci += 1
+                elif c in value_flags:
+                    # Value flag - rest of string is the value (if any)
+                    rest = chars[ci + 1:]
+                    result.append(f"-{c}")
+                    if rest:
+                        result.append(rest)
+                    break
+                else:
+                    # Unknown flag character - emit the whole remaining as-is
+                    result.append(f"-{chars[ci:]}")
+                    break
+            continue
+
+        return result
 
     def _strip_ifs_whitespace(self, value: str, ifs: str) -> str:
         """Strip leading and trailing IFS whitespace characters."""
@@ -344,15 +424,27 @@ class ReadCommand:
                 while pos < len(value) and value[pos] in ifs_ws:
                     pos += 1
             elif c in ifs_ws:
-                # IFS whitespace
+                # IFS whitespace - check for composite delimiter (ws + nonws)
                 if current:
-                    result.append("".join(current))
+                    saved = "".join(current)
                     current = []
+                else:
+                    saved = None
                 # Skip consecutive whitespace
                 while pos < len(value) and value[pos] in ifs_ws:
                     pos += 1
-                # If next char is non-ws delimiter, it's part of this delimiter run
-                # (don't start a new field yet - the non-ws handler will do it)
+                # Check if followed by non-ws delimiter (composite delimiter)
+                if pos < len(value) and value[pos] in ifs_nonws:
+                    # Composite: ws + nonws counted as one delimiter
+                    if saved is not None:
+                        result.append(saved)
+                    pos += 1  # consume the nonws char
+                    # Skip trailing whitespace after nonws
+                    while pos < len(value) and value[pos] in ifs_ws:
+                        pos += 1
+                else:
+                    if saved is not None:
+                        result.append(saved)
             else:
                 current.append(c)
                 pos += 1

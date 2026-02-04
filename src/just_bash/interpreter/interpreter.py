@@ -57,6 +57,27 @@ from .builtins.alias import get_aliases
 from .builtins.shopt import DEFAULT_SHOPTS
 
 
+def _word_has_literal_equals(word) -> bool:
+    """Check if a WordNode contains a literal '=' (not from variable expansion)."""
+    from ..ast.types import LiteralPart, DoubleQuotedPart
+    for part in word.parts:
+        if isinstance(part, LiteralPart) and "=" in part.value:
+            return True
+    return False
+
+
+def _apply_tilde_to_assignment(arg: str, ctx) -> str:
+    """Apply tilde expansion to the value portion of a name=value argument."""
+    if "=" in arg:
+        eq_idx = arg.index("=")
+        name = arg[:eq_idx]
+        value = arg[eq_idx + 1:]
+        from .expansion import expand_tilde_in_assignment_value
+        value = expand_tilde_in_assignment_value(ctx, value)
+        return name + "=" + value
+    return arg
+
+
 def _ok() -> ExecResult:
     """Return a successful result."""
     return ExecResult(stdout="", stderr="", exit_code=0)
@@ -122,7 +143,7 @@ class Interpreter:
                 "?": "0",
             }),
             cwd="/home/user",
-            previous_dir="/home/user",
+            previous_dir="",
             start_time=time.time(),
         )
 
@@ -173,6 +194,12 @@ class Interpreter:
                     nounset=self._state.options.nounset,
                     xtrace=self._state.options.xtrace,
                     verbose=self._state.options.verbose,
+                    noglob=self._state.options.noglob,
+                    noclobber=self._state.options.noclobber,
+                    nobraceexpand=self._state.options.nobraceexpand,
+                    allexport=self._state.options.allexport,
+                    emacs=self._state.options.emacs,
+                    vi=self._state.options.vi,
                 ),
                 fd_table=self._state.fd_table.clone(),
             )
@@ -182,9 +209,19 @@ class Interpreter:
                 limits=self._limits,
                 state=new_state,
             )
-            return await sub_interpreter.execute_script(ast)
+            try:
+                return await sub_interpreter.execute_script(ast)
+            except ExitError as e:
+                return ExecResult(stdout=e.stdout, stderr=e.stderr, exit_code=e.exit_code)
+            except ErrexitError as e:
+                return ExecResult(stdout=e.stdout, stderr=e.stderr, exit_code=e.exit_code)
 
-        return await self.execute_script(ast)
+        try:
+            return await self.execute_script(ast)
+        except ExitError as e:
+            return ExecResult(stdout=e.stdout, stderr=e.stderr, exit_code=e.exit_code)
+        except ErrexitError as e:
+            return ExecResult(stdout=e.stdout, stderr=e.stderr, exit_code=e.exit_code)
 
     async def execute_script(self, node: ScriptNode) -> ExecResult:
         """Execute a script AST node."""
@@ -254,7 +291,15 @@ class Interpreter:
                 stderr += error.stderr
                 continue
             except ReturnError as error:
-                # Handle return - prepend accumulated output before propagating
+                if self._state.call_depth == 0 and self._state.source_depth == 0:
+                    # At top level - warn and use return's exit code
+                    stdout += error.stdout
+                    stderr += error.stderr + "bash: return: can only `return' from a function or sourced script\n"
+                    exit_code = error.exit_code if error.exit_code != 0 else 1
+                    self._state.last_exit_code = exit_code
+                    self._state.env["?"] = str(exit_code)
+                    continue
+                # Inside function or sourced script - propagate
                 error.prepend_output(stdout, stderr)
                 raise
 
@@ -280,6 +325,7 @@ class Interpreter:
         exit_code = 0
         last_executed_index = -1
         last_pipeline_negated = False
+        has_and_or = len(node.pipelines) > 1
 
         for i, pipeline in enumerate(node.pipelines):
             operator = node.operators[i - 1] if i > 0 else None
@@ -300,11 +346,20 @@ class Interpreter:
             self._state.last_exit_code = exit_code
             self._state.env["?"] = str(exit_code)
 
+        # Track whether the non-zero exit was from a short-circuited AND-OR.
+        # Compound commands (groups, etc.) should not trigger errexit for
+        # exits that came from non-last commands in an AND-OR chain.
+        and_or_short_circuited = (
+            has_and_or
+            and exit_code != 0
+            and last_executed_index < len(node.pipelines) - 1
+        )
+
         # Check errexit (set -e)
         if (
             self._state.options.errexit
             and exit_code != 0
-            and last_executed_index == len(node.pipelines) - 1
+            and not and_or_short_circuited
             and not last_pipeline_negated
             and not self._state.in_condition
         ):
@@ -314,10 +369,11 @@ class Interpreter:
 
     async def execute_pipeline(self, node: PipelineNode) -> ExecResult:
         """Execute a pipeline AST node."""
-        # Use group_stdin for the first command if we're inside a group
+        # Use group_stdin for the first command if we're inside a group.
+        # Don't clear it here - commands that consume stdin (like read)
+        # will update it via __remaining_stdin__. Commands that don't
+        # consume stdin leave it unchanged for subsequent pipelines.
         stdin = self._state.group_stdin or ""
-        # Clear group_stdin after first use so it's not reused
-        self._state.group_stdin = ""
         last_result = _ok()
         pipefail_exit_code = 0
         pipestatus_exit_codes: list[int] = []
@@ -344,6 +400,12 @@ class Interpreter:
                 else:
                     raise
 
+            # Check if a command (like read) consumed stdin and set remaining
+            remaining = self._state.env.get("__remaining_stdin__")
+            if remaining is not None:
+                self._state.group_stdin = remaining
+                del self._state.env["__remaining_stdin__"]
+
             # Track exit code for PIPESTATUS
             pipestatus_exit_codes.append(result.exit_code)
 
@@ -352,12 +414,22 @@ class Interpreter:
                 pipefail_exit_code = result.exit_code
 
             if not is_last:
-                stdin = result.stdout
-                last_result = ExecResult(
-                    stdout="",
-                    stderr=result.stderr,
-                    exit_code=result.exit_code,
-                )
+                # Check if this pipe is |& (merge stderr into stdin for next command)
+                is_pipe_amp = (node.pipe_amp and i < len(node.pipe_amp) and node.pipe_amp[i])
+                if is_pipe_amp:
+                    stdin = result.stdout + result.stderr
+                    last_result = ExecResult(
+                        stdout="",
+                        stderr="",
+                        exit_code=result.exit_code,
+                    )
+                else:
+                    stdin = result.stdout
+                    last_result = ExecResult(
+                        stdout="",
+                        stderr=result.stderr,
+                        exit_code=result.exit_code,
+                    )
             else:
                 last_result = result
 
@@ -389,6 +461,27 @@ class Interpreter:
 
     async def execute_command(self, node: CommandNode, stdin: str) -> ExecResult:
         """Execute a command AST node."""
+        # For compound commands with redirections (except Group/Subshell which
+        # handle their own), process input redirections to provide stdin
+        needs_stdin_setup = (
+            hasattr(node, 'redirections') and node.redirections
+            and node.type not in ("SimpleCommand", "Group", "Subshell")
+        )
+        saved_group_stdin = None
+        if needs_stdin_setup:
+            stdin = await self._process_input_redirections(node.redirections, stdin)
+            if stdin:
+                saved_group_stdin = self._state.group_stdin
+                self._state.group_stdin = stdin
+
+        try:
+            return await self._execute_command_inner(node, stdin)
+        finally:
+            if saved_group_stdin is not None:
+                self._state.group_stdin = saved_group_stdin
+
+    async def _execute_command_inner(self, node: CommandNode, stdin: str) -> ExecResult:
+        """Inner dispatch for command execution."""
         if isinstance(node, SimpleCommandNode) or node.type == "SimpleCommand":
             return await self._execute_simple_command(node, stdin)
         elif isinstance(node, IfNode) or node.type == "If":
@@ -418,6 +511,10 @@ class Interpreter:
 
     async def _execute_subshell(self, node: SubshellNode, stdin: str) -> ExecResult:
         """Execute a subshell command."""
+        # Process input redirections (heredoc, herestring, <) to get stdin
+        if node.redirections:
+            stdin = await self._process_input_redirections(node.redirections, stdin)
+
         # Create a new interpreter with a copy of the state
         new_state = InterpreterState(
             env=self._state.env.copy() if isinstance(self._state.env, VariableStore) else VariableStore(self._state.env),
@@ -433,7 +530,12 @@ class Interpreter:
                 verbose=self._state.options.verbose,
             ),
             fd_table=self._state.fd_table.clone(),
+            parent_has_loop_context=self._state.loop_depth > 0 or self._state.parent_has_loop_context,
         )
+        # Pass pipeline stdin to subshell
+        if stdin:
+            new_state.group_stdin = stdin
+
         sub_interpreter = Interpreter(
             fs=self._fs,
             commands=self._commands,
@@ -456,6 +558,17 @@ class Interpreter:
             stdout += e.stdout
             stderr += e.stderr
             exit_code = e.exit_code
+        except (BreakError, ContinueError) as e:
+            # break/continue inside a subshell cannot cross the subshell boundary
+            # The subshell exits with exit code 0 (bash behavior)
+            stdout += e.stdout
+            stderr += e.stderr
+            exit_code = 0
+        except ErrexitError as e:
+            # errexit inside a subshell exits the subshell
+            stdout += e.stdout
+            stderr += e.stderr
+            exit_code = e.exit_code
 
         result = _result(stdout, stderr, exit_code)
 
@@ -472,6 +585,10 @@ class Interpreter:
         stderr = ""
         exit_code = 0
 
+        # Process input redirections (heredoc, herestring, <) to get stdin
+        if node.redirections:
+            stdin = await self._process_input_redirections(node.redirections, stdin)
+
         # Save and set group stdin
         saved_group_stdin = self._state.group_stdin
         if stdin:
@@ -483,6 +600,10 @@ class Interpreter:
                 stdout += result.stdout
                 stderr += result.stderr
                 exit_code = result.exit_code
+        except (ReturnError, BreakError, ContinueError, ErrexitError) as error:
+            # Prepend accumulated output before propagating control flow
+            error.prepend_output(stdout, stderr)
+            raise
         finally:
             self._state.group_stdin = saved_group_stdin
 
@@ -514,7 +635,7 @@ class Interpreter:
     async def _execute_arithmetic(self, node: ArithmeticCommandNode) -> ExecResult:
         """Execute an arithmetic command (( ... ))."""
         if node.expression is None:
-            return _result("", "", 0)
+            return _result("", "", 1)
 
         try:
             result = await evaluate_arithmetic(self._ctx, node.expression.expression)
@@ -555,10 +676,31 @@ class Interpreter:
                 except ValueError:
                     pass
 
+            # Check readonly before assignment
+            # In bash, readonly errors are non-fatal (print error, set exit code 1)
+            # unless errexit is set.
+            _ro_name = name
+            if _array_lhs:
+                _ro_name = _array_lhs.group(1)
+            _is_ro = (_ro_name in self._state.readonly_vars
+                      or (isinstance(self._state.env, VariableStore) and self._state.env.is_readonly(_ro_name)))
+            if _is_ro:
+                ro_result = ExecResult(stdout="", stderr=f"bash: {_ro_name}: readonly variable\n", exit_code=1)
+                if self._state.options.errexit:
+                    raise ErrexitError(1, stderr=f"bash: {_ro_name}: readonly variable\n")
+                return ro_result
+
             # Check for array assignment
             if assignment.array:
                 if assignment.append:
                     # a+=(2 3) - append to existing array
+                    # If variable is a scalar, convert it to an array first
+                    if f"{name}__is_array" not in self._state.env and name in self._state.env:
+                        scalar_val = self._state.env[name]
+                        self._state.env[f"{name}_0"] = scalar_val
+                        self._state.env[f"{name}__is_array"] = "indexed"
+                        del self._state.env[name]
+
                     # Find next available index
                     from .expansion import get_array_elements as _get_elems
                     existing_elems = _get_elems(self._ctx, name)
@@ -643,6 +785,13 @@ class Interpreter:
                     # a[idx]=value or a[idx]+=value
                     arr_name = _array_lhs.group(1)
                     subscript = _array_lhs.group(2)
+                    # Evaluate subscript as arithmetic expression for indexed arrays
+                    # but preserve string keys for associative arrays
+                    if subscript not in ("@", "*"):
+                        is_assoc = self._state.env.get(f"{arr_name}__is_array") in ("assoc", "associative")
+                        if not is_assoc:
+                            from .expansion import _eval_array_subscript
+                            subscript = str(_eval_array_subscript(self._ctx, subscript))
                     # Resolve nameref for array base name
                     if isinstance(self._state.env, VariableStore) and self._state.env.is_nameref(arr_name):
                         try:
@@ -677,7 +826,22 @@ class Interpreter:
 
         # If no command name, it's an assignment-only statement
         if node.name is None:
-            return _ok()
+            # Exit code is from the last command substitution during expansion, or 0
+            assign_exit = self._state.expansion_exit_code if self._state.expansion_exit_code is not None else 0
+            # Still process output redirections (e.g., x=$(cmd) 2>/dev/null)
+            if node.redirections:
+                result = ExecResult(stdout="", stderr="", exit_code=assign_exit)
+                # Collect any expansion stderr
+                if self._state.expansion_stderr:
+                    result = ExecResult(
+                        stdout=result.stdout,
+                        stderr=self._state.expansion_stderr,
+                        exit_code=assign_exit,
+                    )
+                    self._state.expansion_stderr = ""
+                    self._state.expansion_exit_code = None
+                return await self._process_output_redirections(node.redirections, result)
+            return ExecResult(stdout="", stderr="", exit_code=assign_exit)
 
         # Process redirections for heredocs and input redirections
         from ..ast.types import WordNode
@@ -685,6 +849,7 @@ class Interpreter:
         for redir in node.redirections:
             if redir.operator in ("<<", "<<-"):
                 # Here-document: the target should be a HereDocNode
+                fd = redir.fd if redir.fd is not None else 0
                 target = redir.target
                 if hasattr(target, 'content'):
                     # Expand content - parser handles quoted vs unquoted delimiter
@@ -694,7 +859,12 @@ class Interpreter:
                     if redir.operator == "<<-":
                         lines = heredoc_content.split("\n")
                         heredoc_content = "\n".join(line.lstrip("\t") for line in lines)
-                    stdin = heredoc_content
+                    if fd == 0:
+                        stdin = heredoc_content
+                    else:
+                        # Custom FD here-doc - store in FD table
+                        self._state.fd_table.open(fd, f"heredoc-fd{fd}", "r")
+                        self._state.fd_table._fds[fd].content = heredoc_content
             elif redir.operator == "<<<":
                 # Here-string: expand the word and use as stdin with trailing newline
                 if redir.target is not None and isinstance(redir.target, WordNode):
@@ -705,13 +875,17 @@ class Interpreter:
                 fd = redir.fd if redir.fd is not None else 0
                 if redir.target is not None and isinstance(redir.target, WordNode):
                     target_path = await expand_word_async(self._ctx, redir.target)
-                    target_path = self._fs.resolve_path(self._state.cwd, target_path)
-                    try:
-                        file_content = await self._fs.read_file(target_path)
-                    except FileNotFoundError:
-                        return _failure(f"bash: {target_path}: No such file or directory\n")
-                    except IsADirectoryError:
-                        return _failure(f"bash: {target_path}: Is a directory\n")
+                    resolved_path = self._fs.resolve_path(self._state.cwd, target_path)
+                    # Handle /dev/null specially
+                    if target_path in ("/dev/null", "/dev/zero"):
+                        file_content = ""
+                    else:
+                        try:
+                            file_content = await self._fs.read_file(resolved_path)
+                        except FileNotFoundError:
+                            return _failure(f"bash: {target_path}: No such file or directory\n")
+                        except IsADirectoryError:
+                            return _failure(f"bash: {target_path}: Is a directory\n")
                     if fd == 0:
                         stdin = file_content
                     else:
@@ -732,6 +906,21 @@ class Interpreter:
         try:
             # Expand command name
             cmd_name = await expand_word_async(self._ctx, node.name)
+
+            # If command name expanded to empty from unquoted expansion
+            # (e.g., $(true) or $UNSET_VAR), treat as no-op preserving exit code.
+            # In bash, temp assignments become permanent when there's no command
+            # (e.g., FOO=bar $unset makes FOO=bar permanent).
+            if not cmd_name and not _word_has_quoting(node.name):
+                # Expand all arguments too (bash expands all words before execution),
+                # so command substitutions in args still run and set exit code.
+                for arg in node.args:
+                    await expand_word_async(self._ctx, arg)
+                exit_code = self._state.expansion_exit_code if self._state.expansion_exit_code is not None else self._state.last_exit_code
+                result = ExecResult(stdout="", stderr="", exit_code=exit_code)
+                # Clear temp_assignments so finally block doesn't revert them
+                temp_assignments.clear()
+                return await self._process_output_redirections(node.redirections, result)
 
             # Alias expansion (before checking functions/builtins)
             alias_args: list[str] = []
@@ -783,9 +972,11 @@ class Interpreter:
                 expanded = await expand_word_with_glob(self._ctx, arg)
                 args.extend(expanded["values"])
 
-            # Check for expansion errors (e.g., failglob)
-            if self._state.expansion_exit_code is not None:
-                exit_code = self._state.expansion_exit_code
+            # Check for expansion errors (e.g., failglob) - only abort if
+            # there's an expansion error message, not for normal command
+            # substitution exit codes
+            if self._state.expansion_stderr:
+                exit_code = self._state.expansion_exit_code or 1
                 stderr = self._state.expansion_stderr
                 self._state.expansion_exit_code = None
                 self._state.expansion_stderr = ""
@@ -821,8 +1012,8 @@ class Interpreter:
                 )
                 result = await cmd.execute(args, ctx)
             else:
-                # Command not found
-                result = _failure(f"bash: {cmd_name}: command not found\n")
+                # Try to find and execute as a VFS script
+                result = await self._try_execute_vfs_script(cmd_name, args, stdin)
 
             # Process output redirections
             result = await self._process_output_redirections(node.redirections, result)
@@ -834,6 +1025,40 @@ class Interpreter:
                     del self._state.env[name]
                 else:
                     self._state.env[name] = old_value
+
+    async def _process_input_redirections(self, redirections: list, stdin: str) -> str:
+        """Process input redirections (heredoc, herestring, <) to get stdin.
+
+        Returns the stdin content from input redirections, or the original
+        stdin if no input redirections are present.
+        """
+        from ..ast.types import WordNode
+
+        for redir in redirections:
+            if redir.operator in ("<<", "<<-"):
+                target = redir.target
+                if hasattr(target, 'content'):
+                    heredoc_content = await expand_word_async(self._ctx, target.content)
+                    if redir.operator == "<<-":
+                        lines = heredoc_content.split("\n")
+                        heredoc_content = "\n".join(line.lstrip("\t") for line in lines)
+                    stdin = heredoc_content
+            elif redir.operator == "<<<":
+                if redir.target is not None and isinstance(redir.target, WordNode):
+                    herestring_content = await expand_word_async(self._ctx, redir.target)
+                    stdin = herestring_content + "\n"
+            elif redir.operator == "<":
+                if redir.target is not None and isinstance(redir.target, WordNode):
+                    target_path = await expand_word_async(self._ctx, redir.target)
+                    target_path = self._fs.resolve_path(self._state.cwd, target_path)
+                    try:
+                        file_content = await self._fs.read_file(target_path)
+                        stdin = file_content
+                    except FileNotFoundError:
+                        pass
+                    except Exception:
+                        pass
+        return stdin
 
     async def _process_output_redirections(
         self, redirections: list, result: ExecResult
@@ -850,10 +1075,10 @@ class Interpreter:
         for idx, redir in enumerate(redirections):
             if not isinstance(redir, RedirectionNode):
                 continue
-            if redir.operator in (">", ">>"):
+            if redir.operator in (">", ">>", ">|"):
                 fd = redir.fd if redir.fd is not None else 1
                 last_file_redir_for_fd[fd] = idx
-            elif redir.operator == "&>":
+            elif redir.operator in ("&>", "&>>"):
                 last_file_redir_for_fd[1] = idx
                 last_file_redir_for_fd[2] = idx
 
@@ -878,18 +1103,22 @@ class Interpreter:
             try:
                 fd = redir.fd if redir.fd is not None else 1  # Default to stdout
 
+                # Reject empty redirect target
+                if not target_path and redir.operator in (">", ">>", ">|", "&>", "&>>", "<"):
+                    return ExecResult(stdout="", stderr=f"bash: : ambiguous redirect\n", exit_code=1)
+
                 # Check for FD duplication operators - don't resolve as path
                 is_fd_dup = redir.operator in (">&", "<&")
                 is_fd_target = is_fd_dup and (target_path.isdigit() or target_path == "-")
 
                 # Handle /dev/null and special device files
                 if target_path in ("/dev/null", "/dev/zero"):
-                    if redir.operator in (">", ">>"):
+                    if redir.operator in (">", ">>", ">|"):
                         if fd == 1:
                             stdout = ""
                         elif fd == 2:
                             stderr = ""
-                    elif redir.operator == "&>":
+                    elif redir.operator in ("&>", "&>>"):
                         stdout = ""
                         stderr = ""
                     continue
@@ -897,10 +1126,28 @@ class Interpreter:
                     continue
 
                 # Resolve to absolute path for file operations
+                original_target = target_path
                 if not is_fd_target:
                     target_path = self._fs.resolve_path(self._state.cwd, target_path)
 
-                if redir.operator == ">":
+                # Check if target is a directory (can't redirect to directory)
+                if not is_fd_target and redir.operator in (">", ">>", ">|", "&>", "&>>"):
+                    try:
+                        if await self._fs.is_directory(target_path):
+                            return ExecResult(stdout="", stderr=f"bash: {original_target}: Is a directory\n", exit_code=1)
+                    except Exception:
+                        pass
+
+                if redir.operator in (">", ">|"):
+                    # Check noclobber: > on existing regular file is an error
+                    # >| bypasses noclobber
+                    if redir.operator == ">" and self._state.options.noclobber:
+                        try:
+                            if await self._fs.exists(target_path) and not await self._fs.is_directory(target_path):
+                                # Discard stdout since command shouldn't have run
+                                return ExecResult(stdout="", stderr=f"bash: {original_target}: cannot overwrite existing file\n", exit_code=1)
+                        except Exception:
+                            pass
                     is_last_for_fd = last_file_redir_for_fd.get(fd) == idx
                     if is_last_for_fd:
                         # Last redirect for this fd - write content
@@ -944,8 +1191,25 @@ class Interpreter:
                             self._state.fd_table.open(fd, target_path, "a")
 
                 elif redir.operator == "&>":
+                    # Check noclobber
+                    if self._state.options.noclobber:
+                        try:
+                            if await self._fs.exists(target_path) and not await self._fs.is_directory(target_path):
+                                return ExecResult(stdout="", stderr=f"bash: {original_target}: cannot overwrite existing file\n", exit_code=1)
+                        except Exception:
+                            pass
                     # Redirect both stdout and stderr to file
                     await self._fs.write_file(target_path, stdout + stderr)
+                    stdout = ""
+                    stderr = ""
+
+                elif redir.operator == "&>>":
+                    # Append both stdout and stderr to file (not subject to noclobber)
+                    try:
+                        existing = await self._fs.read_file(target_path)
+                    except FileNotFoundError:
+                        existing = ""
+                    await self._fs.write_file(target_path, existing + stdout + stderr)
                     stdout = ""
                     stderr = ""
 
@@ -1026,6 +1290,19 @@ class Interpreter:
                             stdout = ""
                             stderr = ""
 
+                elif redir.operator == "<&":
+                    # Input FD duplication - in output context, works same as >&
+                    if target_path == "-":
+                        self._state.fd_table.close(fd)
+                    elif target_path == "2":
+                        if fd == 1:
+                            stderr = stderr + stdout
+                            stdout = ""
+                    elif target_path == "1":
+                        if fd == 2:
+                            stdout = stdout + stderr
+                            stderr = ""
+
                 elif redir.operator == "2>&1":
                     # Redirect stderr to stdout
                     stdout = stdout + stderr
@@ -1043,6 +1320,135 @@ class Interpreter:
             stderr=stderr,
             exit_code=result.exit_code,
         )
+
+    async def _try_execute_vfs_script(
+        self, cmd_name: str, args: list[str], stdin: str
+    ) -> ExecResult:
+        """Try to find and execute a command as a VFS script file.
+
+        Searches by direct path (if cmd_name contains /) or by PATH lookup.
+        Returns command-not-found result if nothing is found.
+        """
+        import stat
+
+        resolved_path: str | None = None
+
+        if "/" in cmd_name:
+            # Direct path
+            candidate = self._fs.resolve_path(self._state.cwd, cmd_name)
+            try:
+                if await self._fs.exists(candidate):
+                    if not await self._fs.is_directory(candidate):
+                        resolved_path = candidate
+            except Exception:
+                pass
+        else:
+            # Search PATH directories in VFS
+            path_str = self._state.env.get("PATH", "")
+            if path_str:
+                for dir_entry in path_str.split(":"):
+                    if not dir_entry:
+                        dir_entry = "."
+                    candidate = self._fs.resolve_path(
+                        self._state.cwd, f"{dir_entry}/{cmd_name}"
+                    )
+                    try:
+                        if await self._fs.exists(candidate):
+                            if not await self._fs.is_directory(candidate):
+                                resolved_path = candidate
+                                break
+                    except Exception:
+                        pass
+
+        if resolved_path is None:
+            return ExecResult(
+                stdout="",
+                stderr=f"bash: {cmd_name}: command not found\n",
+                exit_code=127,
+            )
+
+        # Check if executable
+        try:
+            st = await self._fs.stat(resolved_path)
+            if not (st.mode & stat.S_IXUSR):
+                return ExecResult(
+                    stdout="",
+                    stderr=f"bash: {cmd_name}: Permission denied\n",
+                    exit_code=126,
+                )
+        except Exception:
+            return ExecResult(
+                stdout="",
+                stderr=f"bash: {cmd_name}: Permission denied\n",
+                exit_code=126,
+            )
+
+        # Read and execute as shell script
+        try:
+            content = await self._fs.read_file(resolved_path)
+            if isinstance(content, bytes):
+                content = content.decode("utf-8", errors="replace")
+
+            # Strip shebang line if present
+            if content.startswith("#!"):
+                newline_idx = content.find("\n")
+                if newline_idx >= 0:
+                    content = content[newline_idx + 1:]
+                else:
+                    content = ""
+
+            # Set up positional parameters for the script
+            old_params: dict[str, str | None] = {}
+            old_count = self._state.env.get("#")
+            old_zero = self._state.env.get("0")
+
+            # Save old positional params
+            i = 1
+            while str(i) in self._state.env:
+                old_params[str(i)] = self._state.env[str(i)]
+                i += 1
+
+            # Clear old positional params
+            for key in list(old_params.keys()):
+                del self._state.env[key]
+
+            # Set new positional params from args
+            self._state.env["0"] = cmd_name
+            for idx, arg in enumerate(args, 1):
+                self._state.env[str(idx)] = arg
+            self._state.env["#"] = str(len(args))
+
+            try:
+                result = await self._exec_fn(content, None, None)
+            finally:
+                # Restore old positional params
+                # Clear script params
+                for idx in range(1, len(args) + 1):
+                    self._state.env.pop(str(idx), None)
+
+                # Restore old params
+                for key, val in old_params.items():
+                    if val is not None:
+                        self._state.env[key] = val
+
+                if old_count is not None:
+                    self._state.env["#"] = old_count
+                else:
+                    self._state.env.pop("#", None)
+
+                if old_zero is not None:
+                    self._state.env["0"] = old_zero
+                else:
+                    self._state.env.pop("0", None)
+
+            return result
+
+        except Exception as e:
+            return ExecResult(
+                stdout="",
+                stderr=f"bash: {cmd_name}: {e}\n",
+                exit_code=2,
+            )
 
     async def _call_function(
         self, name: str, args: list, stdin: str, alias_args: list[str] | None = None
@@ -1157,9 +1563,20 @@ class Interpreter:
         """
         # Expand arguments with glob support (alias args first)
         args: list[str] = list(alias_args) if alias_args else []
+        # Declaration builtins get tilde expansion on literal assignment args
+        is_declaration = cmd_name in ("declare", "typeset", "local", "readonly", "export")
         for arg in node.args:
-            expanded = await expand_word_with_glob(self._ctx, arg)
-            args.extend(expanded["values"])
+            # Declaration builtins suppress word splitting on assignment args
+            is_assignment_arg = is_declaration and _word_has_literal_equals(arg)
+            expanded = await expand_word_with_glob(self._ctx, arg, no_split=is_assignment_arg)
+            values = expanded["values"]
+            if is_assignment_arg:
+                from .expansion import expand_tilde_in_assignment_value
+                values = [
+                    _apply_tilde_to_assignment(v, self._ctx)
+                    for v in values
+                ]
+            args.extend(values)
 
         # Update last arg for $_
         if args:

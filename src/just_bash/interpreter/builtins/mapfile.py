@@ -60,6 +60,18 @@ async def handle_mapfile(
             i += 2
             continue
 
+        if arg.startswith("-d") and len(arg) > 2:
+            # Handle -dX where X is the delimiter character (attached)
+            delimiter = arg[2:]
+            if delimiter == "\\n":
+                delimiter = "\n"
+            elif delimiter == "\\t":
+                delimiter = "\t"
+            elif delimiter == "":
+                delimiter = "\0"
+            i += 1
+            continue
+
         if arg == "-n" and i + 1 < len(args):
             try:
                 max_count = int(args[i + 1])
@@ -124,6 +136,9 @@ async def handle_mapfile(
     if not stdin:
         return _result("", "", 0)
 
+    # Check if input ends with delimiter (affects whether last element gets delimiter)
+    ends_with_delim = stdin.endswith(delimiter)
+
     if delimiter == "\n":
         lines = stdin.split("\n")
         # Remove last empty element if input ends with newline
@@ -131,6 +146,9 @@ async def handle_mapfile(
             lines = lines[:-1]
     else:
         lines = stdin.split(delimiter)
+        # Remove last empty element if input ends with delimiter
+        if ends_with_delim and lines and lines[-1] == "":
+            lines = lines[:-1]
 
     # Skip first N lines
     if skip_count > 0:
@@ -142,10 +160,11 @@ async def handle_mapfile(
 
     # Store lines in array
     for idx, line in enumerate(lines):
-        if strip_trailing:
-            # Remove trailing delimiter (already split, so just strip the char if present)
-            if delimiter != "\n" and line.endswith(delimiter):
-                line = line[:-len(delimiter)]
+        if not strip_trailing:
+            # Without -t, retain the delimiter on each line
+            # (except the last element if input didn't end with delimiter)
+            if idx < len(lines) - 1 or ends_with_delim:
+                line = line + delimiter
 
         ctx.state.env[f"{array_name}_{origin + idx}"] = line
 

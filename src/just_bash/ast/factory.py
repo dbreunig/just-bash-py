@@ -68,9 +68,10 @@ def statement(
 def pipeline(
     commands: Sequence["CommandNode"],  # type: ignore
     negated: bool = False,
+    pipe_amp: tuple[bool, ...] = (),
 ) -> PipelineNode:
     """Create a pipeline node."""
-    return PipelineNode(commands=tuple(commands), negated=negated)
+    return PipelineNode(commands=tuple(commands), negated=negated, pipe_amp=pipe_amp)
 
 
 def simple_command(

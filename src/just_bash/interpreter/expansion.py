@@ -148,6 +148,31 @@ def get_variable(ctx: "InterpreterContext", name: str, check_nounset: bool = Tru
         return str(env.get("$", "1"))  # PID (simulated)
     elif name == "!":
         return str(ctx.state.last_background_pid)
+    elif name == "-":
+        # Shell option flags string
+        flags = ""
+        opts = ctx.state.options
+        if opts.errexit:
+            flags += "e"
+        # 'h' = hashall (always on in non-interactive bash)
+        flags += "h"
+        if getattr(opts, 'noglob', False):
+            flags += "f"
+        if opts.nounset:
+            flags += "u"
+        if opts.verbose:
+            flags += "v"
+        if opts.xtrace:
+            flags += "x"
+        # 'B' = braceexpand (always on by default)
+        if not getattr(opts, 'nobraceexpand', False):
+            flags += "B"
+        if getattr(opts, 'noclobber', False):
+            flags += "C"
+        # 'H' = histexpand (default on for interactive)
+        # 's' = reading from stdin (always on for our use case)
+        flags += "s"
+        return flags
     elif name == "_":
         return ctx.state.last_arg
     elif name == "LINENO":
@@ -174,10 +199,46 @@ def get_variable(ctx: "InterpreterContext", name: str, check_nounset: bool = Tru
         if hasattr(ctx.state, 'seconds_reset_time') and ctx.state.seconds_reset_time is not None:
             return str(int(time.time() - ctx.state.seconds_reset_time))
         return str(int(time.time() - ctx.state.start_time))
+    elif name == "SHELLOPTS":
+        # Compute colon-separated list of enabled set -o options (alphabetical)
+        opts = ctx.state.options
+        enabled = []
+        if not getattr(opts, 'nobraceexpand', False):
+            enabled.append("braceexpand")
+        if opts.errexit:
+            enabled.append("errexit")
+        enabled.append("hashall")  # always on
+        enabled.append("interactive-comments")  # always on
+        if getattr(opts, 'noclobber', False):
+            enabled.append("noclobber")
+        if getattr(opts, 'noglob', False):
+            enabled.append("noglob")
+        if opts.nounset:
+            enabled.append("nounset")
+        if opts.pipefail:
+            enabled.append("pipefail")
+        if opts.verbose:
+            enabled.append("verbose")
+        if opts.xtrace:
+            enabled.append("xtrace")
+        return ":".join(enabled)
+    elif name == "BASHOPTS":
+        from .builtins.shopt import _get_shopts
+        shopts = _get_shopts(ctx)
+        enabled = sorted(n for n, v in shopts.items() if v)
+        return ":".join(enabled)
     elif name == "SHLVL":
         return env.get("SHLVL", "1")
     elif name == "BASH_VERSION":
         return env.get("BASH_VERSION", "5.0.0(1)-release")
+    elif name == "BASH_VERSINFO":
+        return env.get("BASH_VERSINFO", "5")
+    elif name == "OSTYPE":
+        return env.get("OSTYPE", "linux-gnu")
+    elif name == "MACHTYPE":
+        return env.get("MACHTYPE", "x86_64-pc-linux-gnu")
+    elif name == "HOSTNAME":
+        return env.get("HOSTNAME", "localhost")
     elif name == "BASHPID":
         return str(env.get("$", "1"))
 
@@ -200,7 +261,7 @@ def get_array_elements(ctx: "InterpreterContext", name: str) -> list[tuple[int, 
     """Get all elements of an array as (index, value) pairs.
 
     For associative arrays, the index is a synthetic sequential number.
-    Use get_array_elements_raw() for the actual key-value pairs.
+    Use get_array_keys() for the actual keys.
     """
     elements = []
     env = ctx.state.env
@@ -225,6 +286,18 @@ def get_array_elements(ctx: "InterpreterContext", name: str) -> list[tuple[int, 
     # Sort by index for indexed arrays
     if not is_assoc:
         elements.sort(key=lambda x: x[0])
+    return elements
+
+
+def get_array_elements_assoc(ctx: "InterpreterContext", name: str) -> list[tuple[str, str]]:
+    """Get all elements of an associative array as (key, value) pairs."""
+    elements = []
+    env = ctx.state.env
+    prefix = f"{name}_"
+    for key, value in env.items():
+        if key.startswith(prefix) and not key.startswith(f"{name}__"):
+            idx_part = key[len(prefix):]
+            elements.append((idx_part, value))
     return elements
 
 
@@ -368,6 +441,44 @@ def get_array_keys(ctx: "InterpreterContext", name: str) -> list[str]:
     return keys
 
 
+def expand_tilde_in_assignment_value(ctx: "InterpreterContext", value: str) -> str:
+    """Expand tilde at start and after : in assignment values.
+
+    Used by declaration builtins (local, readonly, export, declare) to expand
+    tilde in assignment values like 'foo:~' → 'foo:/home/user'.
+    """
+    if "~" not in value:
+        return value
+    home = ctx.state.env.get("HOME", "/home/user")
+
+    def _expand_tilde_prefix(s: str) -> str:
+        """Expand tilde at the start of a string segment."""
+        if not s.startswith("~"):
+            return s
+        # Find end of tilde prefix (username or empty)
+        j = 1
+        while j < len(s) and s[j] not in "/:" and (s[j].isalnum() or s[j] == "_"):
+            j += 1
+        # Check terminator: must be /, :, or end
+        if j < len(s) and s[j] not in "/:":
+            return s  # Not a valid tilde expansion
+        user = s[1:j]
+        if not user:
+            return home + s[j:]
+        elif user == "+":
+            return ctx.state.env.get("PWD", ctx.state.cwd) + s[j:]
+        elif user == "-":
+            return ctx.state.env.get("OLDPWD", "") + s[j:]
+        return s  # Unknown user, keep literal
+
+    # Split on : to handle tilde after each colon
+    parts = value.split(":")
+    parts[0] = _expand_tilde_prefix(parts[0])
+    for i in range(1, len(parts)):
+        parts[i] = _expand_tilde_prefix(parts[i])
+    return ":".join(parts)
+
+
 def expand_word(ctx: "InterpreterContext", word: WordNode) -> str:
     """Expand a word synchronously (no command substitution)."""
     parts = []
@@ -388,8 +499,10 @@ def _escape_glob_chars(s: str) -> str:
     """Escape glob metacharacters for fnmatch (literal matching).
 
     Uses [x] notation which fnmatch always treats as literal character class.
+    Also escapes parens to prevent extglob pattern misdetection.
     """
-    return s.replace("[", "[[]").replace("*", "[*]").replace("?", "[?]")
+    return (s.replace("[", "[[]").replace("*", "[*]").replace("?", "[?]")
+            .replace("(", "[(]").replace(")", "[)]"))
 
 
 async def expand_word_for_case_pattern(ctx: "InterpreterContext", word: WordNode) -> str:
@@ -556,6 +669,7 @@ async def expand_part(ctx: "InterpreterContext", part: WordPart, in_double_quote
             result = await ctx.execute_script(part.body)
             ctx.state.last_exit_code = result.exit_code
             ctx.state.env["?"] = str(result.exit_code)
+            ctx.state.expansion_exit_code = result.exit_code
             # Remove trailing newlines
             return result.stdout.rstrip("\n")
         except ExecutionLimitError:
@@ -563,6 +677,7 @@ async def expand_part(ctx: "InterpreterContext", part: WordPart, in_double_quote
         except ExitError as e:
             ctx.state.last_exit_code = e.exit_code
             ctx.state.env["?"] = str(e.exit_code)
+            ctx.state.expansion_exit_code = e.exit_code
             return e.stdout.rstrip("\n")
     elif isinstance(part, ProcessSubstitutionPart):
         # Execute the subcommand and write its output to a temp file
@@ -659,12 +774,14 @@ async def _expand_part_segments(
             result = await ctx.execute_script(part.body)
             ctx.state.last_exit_code = result.exit_code
             ctx.state.env["?"] = str(result.exit_code)
+            ctx.state.expansion_exit_code = result.exit_code
             text = result.stdout.rstrip("\n")
         except ExecutionLimitError:
             raise
         except ExitError as e:
             ctx.state.last_exit_code = e.exit_code
             ctx.state.env["?"] = str(e.exit_code)
+            ctx.state.expansion_exit_code = e.exit_code
             text = e.stdout.rstrip("\n")
         return [ExpandedSegment(text=text, quoted=in_double_quotes)]
 
@@ -715,6 +832,11 @@ def _split_segments_on_ifs(
     """
     if not segments:
         return []
+
+    # Empty IFS: no splitting at all
+    if not ifs:
+        combined = "".join(seg.text for seg in segments)
+        return [combined] if combined else []
 
     ifs_whitespace = set(c for c in ifs if c in " \t\n")
     ifs_nonws = set(c for c in ifs if c not in " \t\n")
@@ -772,9 +894,12 @@ def _split_segments_on_ifs(
                     i += 1
                 # Check if next is a non-ws IFS char
                 if i < n and chars[i][1] and chars[i][0] in ifs_nonws:
-                    # Composite delimiter: ws + nonws
-                    # Emit the saved word, then let the nonws handler run
+                    # Composite delimiter: ws + nonws - consume both as one delimiter
                     words.append(saved_word)
+                    i += 1  # consume the nonws char
+                    # Skip trailing ws after nonws
+                    while i < n and chars[i][1] and chars[i][0] in ifs_whitespace:
+                        i += 1
                 else:
                     # Just whitespace delimiter
                     words.append(saved_word)
@@ -831,9 +956,20 @@ def expand_parameter(ctx: "InterpreterContext", part: ParameterExpansionPart, in
 
         # Standard indirect: ${!var} uses value of var as variable name
         ref_name = get_variable(ctx, indirect_name, False)
-        if ref_name:
-            return get_variable(ctx, ref_name, False)
-        return ""
+        if operation:
+            # ${!ref:-default}, ${!ref#pattern}, etc.
+            # Resolve indirection, then apply operation to the resolved variable
+            if ref_name:
+                parameter = ref_name
+            else:
+                # ref doesn't resolve - use a name guaranteed to be unset
+                parameter = "__indirect_unset__"
+            # Fall through to operation handling below
+        else:
+            # Simple ${!var}
+            if ref_name:
+                return get_variable(ctx, ref_name, False)
+            return ""
 
     # Check if operation handles unset variables
     skip_nounset = operation and operation.type in (
@@ -887,6 +1023,13 @@ def expand_parameter(ctx: "InterpreterContext", part: ParameterExpansionPart, in
         return ""
 
     elif operation.type == "Length":
+        # Detect invalid length expressions like ${#x-default} or ${#v:1:3}
+        # These are stored by the parser with the full content starting with '#'
+        if parameter.startswith("#"):
+            raise BadSubstitutionError(
+                f"${{{parameter}}}: bad substitution",
+                stderr=f"bash: ${{{parameter}}}: bad substitution\n",
+            )
         # Check for array length
         array_match = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\[[@*]\]$', parameter)
         if array_match:
@@ -899,8 +1042,15 @@ def expand_parameter(ctx: "InterpreterContext", part: ParameterExpansionPart, in
         return str(len(value))
 
     elif operation.type == "Substring":
-        offset = operation.offset if hasattr(operation, 'offset') else 0
-        length = operation.length if hasattr(operation, 'length') else None
+        # Evaluate offset/length as arithmetic expressions if raw strings are present
+        if hasattr(operation, 'offset_str') and operation.offset_str is not None:
+            offset = _eval_array_subscript(ctx, operation.offset_str)
+        else:
+            offset = operation.offset if hasattr(operation, 'offset') else 0
+        if hasattr(operation, 'length_str') and operation.length_str is not None:
+            length = _eval_array_subscript(ctx, operation.length_str)
+        else:
+            length = operation.length if hasattr(operation, 'length') else None
 
         # Check for array slicing: ${a[@]:offset:length}
         array_match = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\[[@*]\]$', parameter)
@@ -935,19 +1085,21 @@ def expand_parameter(ctx: "InterpreterContext", part: ParameterExpansionPart, in
         pattern = expand_word(ctx, operation.pattern) if operation.pattern else ""
         greedy = operation.greedy
         from_end = operation.side == "suffix"
+        # Check if extglob is enabled
+        extglob_on = ctx.state.env.get("__shopt_extglob__", "0") == "1"
 
         # Check for array per-element operation: ${a[@]#pattern}
         array_match = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\[[@*]\]$', parameter)
         if array_match:
             elements = get_array_elements(ctx, array_match.group(1))
-            regex_pat = glob_to_regex(pattern, greedy=True, from_end=from_end)
+            regex_pat = glob_to_regex(pattern, greedy=True, from_end=from_end, extglob=extglob_on)
             results = []
             for _, elem_val in elements:
                 results.append(_apply_pattern_removal(elem_val, regex_pat, pattern, greedy, from_end))
             return " ".join(results)
 
         # Convert glob pattern to regex
-        regex_pattern = glob_to_regex(pattern, greedy=True, from_end=from_end)
+        regex_pattern = glob_to_regex(pattern, greedy=True, from_end=from_end, extglob=extglob_on)
 
         if from_end:
             # Remove from end: ${var%pattern} or ${var%%pattern}
@@ -958,25 +1110,25 @@ def expand_parameter(ctx: "InterpreterContext", part: ParameterExpansionPart, in
                     return value[:match.start()]
             else:
                 # ${var%pattern}: remove shortest matching suffix
+                # Check empty suffix first (pattern might match empty string)
+                if re.fullmatch(regex_pattern, ""):
+                    return value
                 # Try matching from the end, starting with the shortest suffix
                 for start in range(len(value) - 1, -1, -1):
                     suffix = value[start:]
                     if re.fullmatch(regex_pattern, suffix):
                         return value[:start]
-                # Also check empty suffix
-                if re.fullmatch(regex_pattern, ""):
-                    return value
         else:
             # Remove from start: ${var#pattern} or ${var##pattern}
             if greedy:
                 # ${var##pattern}: remove longest matching prefix
-                regex_greedy = glob_to_regex(pattern, greedy=True, from_end=False)
+                regex_greedy = glob_to_regex(pattern, greedy=True, from_end=False, extglob=extglob_on)
                 match = re.match(regex_greedy, value)
                 if match:
                     return value[match.end():]
             else:
                 # ${var#pattern}: remove shortest matching prefix
-                regex_nongreedy = glob_to_regex(pattern, greedy=False, from_end=False)
+                regex_nongreedy = glob_to_regex(pattern, greedy=False, from_end=False, extglob=extglob_on)
                 match = re.match(regex_nongreedy, value)
                 if match:
                     return value[match.end():]
@@ -987,8 +1139,18 @@ def expand_parameter(ctx: "InterpreterContext", part: ParameterExpansionPart, in
         replacement = expand_word(ctx, operation.replacement) if operation.replacement else ""
         replace_all = operation.all
         anchor = getattr(operation, 'anchor', None)
+        extglob_on = ctx.state.env.get("__shopt_extglob__", "0") == "1"
 
-        regex_pattern = glob_to_regex(pattern, greedy=False)
+        # Empty pattern with anchor: insert/append (bash behavior)
+        # Empty pattern without anchor: return value unchanged
+        if not pattern:
+            if anchor == "start":
+                return replacement + value
+            elif anchor == "end":
+                return value + replacement
+            return value
+
+        regex_pattern = glob_to_regex(pattern, greedy=True, extglob=extglob_on)
 
         # Check for array per-element operation: ${a[@]/pat/rep}
         array_match = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\[[@*]\]$', parameter)
@@ -1000,17 +1162,9 @@ def expand_parameter(ctx: "InterpreterContext", part: ParameterExpansionPart, in
             return " ".join(results)
 
         if anchor == "start":
-            # Anchored at start - only match at beginning
-            if pattern == "":
-                # Empty pattern at start means insert at beginning
-                return replacement + value
             anchored_pattern = "^" + regex_pattern
             return re.sub(anchored_pattern, replacement, value, count=1)
         elif anchor == "end":
-            # Anchored at end - only match at end
-            if pattern == "":
-                # Empty pattern at end means append
-                return value + replacement
             anchored_pattern = regex_pattern + "$"
             return re.sub(anchored_pattern, replacement, value, count=1)
         elif replace_all:
@@ -1020,7 +1174,24 @@ def expand_parameter(ctx: "InterpreterContext", part: ParameterExpansionPart, in
 
     elif operation.type == "CaseModification":
         # ${var^^} or ${var,,} for case conversion
-        # ${var^^pattern} - only convert chars matching pattern
+        # Check for array per-element: ${a[@]^^}
+        array_match_cm = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\[[@*]\]$', parameter)
+        if array_match_cm:
+            elements = get_array_elements(ctx, array_match_cm.group(1))
+            results = []
+            for _, elem_val in elements:
+                if operation.direction == "upper":
+                    if operation.all:
+                        results.append(elem_val.upper())
+                    else:
+                        results.append(elem_val[0].upper() + elem_val[1:] if elem_val else "")
+                else:
+                    if operation.all:
+                        results.append(elem_val.lower())
+                    else:
+                        results.append(elem_val[0].lower() + elem_val[1:] if elem_val else "")
+            return " ".join(results)
+
         pattern = None
         if operation.pattern:
             try:
@@ -1069,13 +1240,22 @@ def expand_parameter(ctx: "InterpreterContext", part: ParameterExpansionPart, in
         # ${var@Q}, ${var@P}, ${var@a}, ${var@A}, ${var@E}, ${var@K}
         # ${var@u}, ${var@U}, ${var@L} (case transforms)
         op = operation.operator
+
+        # Check for array per-element operation: ${a[@]@X} or ${a[*]@X}
+        array_match = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\[[@*]\]$', parameter)
+
         if op == "Q":
-            # Quoted form - produce bash-compatible single-quoted output
+            # Quoted form - unset variables produce empty output
+            if array_match:
+                elements = get_array_elements(ctx, array_match.group(1))
+                quoted = [_shell_quote(v) for _, v in elements]
+                return " ".join(quoted)
+            if is_unset:
+                return ""
             if not value:
                 return "''"
             if "'" not in value:
                 return f"'{value}'"
-            # Use $'...' quoting with escapes
             escaped = value.replace("\\", "\\\\").replace("'", "\\'")
             return f"$'{escaped}'"
         elif op == "E":
@@ -1138,41 +1318,50 @@ def expand_parameter(ctx: "InterpreterContext", part: ParameterExpansionPart, in
             # Prompt expansion
             return value
         elif op == "A":
-            # Assignment statement form
+            # Assignment statement form - unset variables produce no output
+            if is_unset:
+                return ""
             return f"{parameter}={_shell_quote(value)}"
         elif op == "a":
             # Attributes - check VariableStore metadata first
             from .types import VariableStore
             env = ctx.state.env
+            # For array subscript parameters, use the base name
+            attr_name = parameter
+            array_name_match = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\[', parameter)
+            if array_name_match:
+                attr_name = array_name_match.group(1)
             attrs = ""
             if isinstance(env, VariableStore):
-                var_attrs = env.get_attributes(parameter)
+                var_attrs = env.get_attributes(attr_name)
                 # Build flags in standard order
                 for flag in "aAilnrtux":
                     if flag in var_attrs:
                         attrs += flag
                 # Check array type if not in metadata
                 if "a" not in attrs and "A" not in attrs:
-                    is_array = env.get(f"{parameter}__is_array")
-                    if is_array == "indexed":
+                    is_arr = env.get(f"{attr_name}__is_array")
+                    if is_arr == "indexed":
                         attrs = "a" + attrs
-                    elif is_array == "assoc":
+                    elif is_arr == "assoc":
                         attrs = "A" + attrs
             else:
-                if env.get(f"{parameter}__is_array") == "indexed":
+                if env.get(f"{attr_name}__is_array") == "indexed":
                     attrs += "a"
-                elif env.get(f"{parameter}__is_array") == "assoc":
+                elif env.get(f"{attr_name}__is_array") == "assoc":
                     attrs += "A"
-                if parameter in getattr(ctx.state, 'readonly_vars', set()):
+                if attr_name in getattr(ctx.state, 'readonly_vars', set()):
                     attrs += "r"
             return attrs
-        elif op == "K":
-            # Key-value pairs
+        elif op == "K" or op == "k":
+            # Key-value pairs (for arrays), or quoted value (for scalars)
             elements = get_array_elements(ctx, parameter)
             if elements:
                 pairs = [f"[{idx}]=\"{val}\"" for idx, val in elements]
                 return " ".join(pairs)
-            return value
+            if is_unset:
+                return ""
+            return _shell_quote(value)
         elif op == "u":
             # Uppercase first character
             return value[0].upper() + value[1:] if value else ""
@@ -1216,14 +1405,12 @@ def _apply_pattern_removal(value: str, regex_pattern: str, pattern: str, greedy:
 
 def _apply_pattern_replacement(value: str, regex_pattern: str, pattern: str, replacement: str, replace_all: bool, anchor) -> str:
     """Apply pattern replacement to a single string value."""
+    if not pattern:
+        return value
     if anchor == "start":
-        if pattern == "":
-            return replacement + value
         anchored = "^" + regex_pattern
         return re.sub(anchored, replacement, value, count=1)
     elif anchor == "end":
-        if pattern == "":
-            return value + replacement
         anchored = regex_pattern + "$"
         return re.sub(anchored, replacement, value, count=1)
     elif replace_all:
@@ -1324,6 +1511,13 @@ def expand_braces(s: str) -> list[str]:
 
                 # Expand this brace pattern
                 expansions = _expand_brace_content(brace_content)
+
+                # If the expansion returns the original {content} unchanged,
+                # it means this wasn't a valid expansion - treat as literal
+                original = '{' + brace_content + '}'
+                if len(expansions) == 1 and expansions[0] == original:
+                    i = j
+                    continue
 
                 # Combine with prefix/suffix and recursively expand
                 result = []
@@ -1450,10 +1644,11 @@ def _expand_sequence(content: str) -> list[str]:
     return ['{' + content + '}']
 
 
-def glob_to_regex(pattern: str, greedy: bool = True, from_end: bool = False) -> str:
+def glob_to_regex(pattern: str, greedy: bool = True, from_end: bool = False, extglob: bool = True) -> str:
     """Convert a glob pattern to a regex pattern.
 
     Supports standard globs (*, ?, [...]) and extended globs (@, ?, *, +, !)(pat|pat).
+    Set extglob=False to disable extended glob pattern recognition.
     """
     # POSIX character class mappings
     posix_classes = {
@@ -1498,7 +1693,7 @@ def glob_to_regex(pattern: str, greedy: bool = True, from_end: bool = False) -> 
     while i < len(pattern):
         c = pattern[i]
         # Check for extglob patterns: @( ?( *( +( !(
-        if c in "@?*+!" and i + 1 < len(pattern) and pattern[i + 1] == "(":
+        if extglob and c in "@?*+!" and i + 1 < len(pattern) and pattern[i + 1] == "(":
             # Find matching closing paren
             depth = 1
             j = i + 2
@@ -1532,29 +1727,51 @@ def glob_to_regex(pattern: str, greedy: bool = True, from_end: bool = False) -> 
         elif c == "?":
             result.append(".")
         elif c == "[":
-            # Character class
-            j = i + 1
-            if j < len(pattern) and pattern[j] == "!":
-                result.append("[^")
-                j += 1
+            # Character class - check if it's a valid bracket expression
+            # Look for closing ']'
+            close_pos = pattern.find("]", i + 1)
+            # Allow ']' as first char in class: []] or [!]]
+            if i + 1 < len(pattern) and pattern[i + 1] in ("!", "^"):
+                close_pos2 = pattern.find("]", i + 3)
+                if close_pos == i + 2 and close_pos2 != -1:
+                    close_pos = close_pos2
+            elif i + 1 < len(pattern) and pattern[i + 1] == "]":
+                close_pos2 = pattern.find("]", i + 2)
+                if close_pos2 != -1:
+                    close_pos = close_pos2
+            if close_pos == -1:
+                # No closing ']' - treat '[' as literal
+                result.append("\\[")
             else:
-                result.append("[")
-            while j < len(pattern) and pattern[j] != "]":
-                # Check for POSIX character classes like [:alpha:]
-                if pattern[j] == "[" and j + 1 < len(pattern) and pattern[j + 1] == ":":
-                    # Find the closing :]
-                    end = pattern.find(":]", j + 2)
-                    if end != -1:
-                        posix_name = pattern[j:end + 2]
-                        if posix_name in posix_classes:
-                            result.append(posix_classes[posix_name])
-                            j = end + 2
-                            continue
-                result.append(pattern[j])
-                j += 1
-            result.append("]")
-            i = j
-        elif c in r"\^$.|+(){}":
+                j = i + 1
+                if j < len(pattern) and pattern[j] == "!":
+                    result.append("[^")
+                    j += 1
+                else:
+                    result.append("[")
+                while j < len(pattern) and pattern[j] != "]":
+                    # Check for POSIX character classes like [:alpha:]
+                    if pattern[j] == "[" and j + 1 < len(pattern) and pattern[j + 1] == ":":
+                        # Find the closing :]
+                        end = pattern.find(":]", j + 2)
+                        if end != -1:
+                            posix_name = pattern[j:end + 2]
+                            if posix_name in posix_classes:
+                                result.append(posix_classes[posix_name])
+                                j = end + 2
+                                continue
+                    result.append(pattern[j])
+                    j += 1
+                result.append("]")
+                i = j
+        elif c == "\\":
+            # Backslash escape in glob pattern - next char is literal
+            if i + 1 < len(pattern):
+                i += 1
+                result.append(re.escape(pattern[i]))
+            else:
+                result.append("\\\\")
+        elif c in r"^$.|+(){}":
             result.append("\\" + c)
         else:
             result.append(c)
@@ -1604,10 +1821,13 @@ def _find_brace_in_literal_parts(parts: list) -> tuple[int, int, int, str] | Non
 async def expand_word_with_glob(
     ctx: "InterpreterContext",
     word: WordNode,
+    no_split: bool = False,
 ) -> dict:
     """Expand a word with glob expansion support.
 
     Returns dict with 'values' (list of strings) and 'quoted' (bool).
+    If no_split is True, skip IFS word splitting (used for declaration
+    builtin assignment values like 'export x=$var').
     """
     # Check if word contains any quoted parts
     has_quoted = any(
@@ -1632,13 +1852,53 @@ async def expand_word_with_glob(
 
         expansions = _expand_brace_content(content)
 
-        all_results = []
-        for exp_text in expansions:
-            new_parts = before_parts + [LiteralPart(value=exp_text)] + after_parts
-            new_word = WordNode(parts=tuple(new_parts))
-            sub_result = await expand_word_with_glob(ctx, new_word)
-            all_results.extend(sub_result["values"])
-        return {"values": all_results, "quoted": False}
+        # If the expansion returns the original {content} unchanged,
+        # it means this wasn't a valid expansion - skip brace expansion
+        original = '{' + content + '}'
+        if len(expansions) == 1 and expansions[0] == original:
+            pass  # Fall through to normal expansion
+        else:
+            all_results = []
+            for exp_text in expansions:
+                new_parts = before_parts + [LiteralPart(value=exp_text)] + after_parts
+                new_word = WordNode(parts=tuple(new_parts))
+                sub_result = await expand_word_with_glob(ctx, new_word)
+                all_results.extend(sub_result["values"])
+            return {"values": all_results, "quoted": False}
+
+    # Special handling for unquoted $@ and $* (and ${arr[@]} / ${arr[*]})
+    # When unquoted, these produce individual elements, then each is IFS-split
+    if len(word.parts) == 1 and isinstance(word.parts[0], ParameterExpansionPart):
+        param_part = word.parts[0]
+        if param_part.parameter in ("@", "*") and param_part.operation is None:
+            params = _get_positional_params(ctx)
+            if not params:
+                return {"values": [], "quoted": False}
+            ifs = ctx.state.env.get("IFS", " \t\n")
+            result = []
+            for p in params:
+                if ifs:
+                    split_words = _split_on_ifs(p, ifs)
+                    result.extend(split_words)
+                else:
+                    result.append(p)
+            return {"values": result, "quoted": False}
+        # ${arr[@]} or ${arr[*]} unquoted
+        array_match = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\[[@*]\]$', param_part.parameter)
+        if array_match and param_part.operation is None:
+            arr_name = array_match.group(1)
+            elements = get_array_elements(ctx, arr_name)
+            if not elements:
+                return {"values": [], "quoted": False}
+            ifs = ctx.state.env.get("IFS", " \t\n")
+            result = []
+            for _, val in elements:
+                if ifs:
+                    split_words = _split_on_ifs(val, ifs)
+                    result.extend(split_words)
+                else:
+                    result.append(val)
+            return {"values": result, "quoted": False}
 
     # Special handling for "$@" and "$*" in double quotes
     # (check BEFORE segment expansion to avoid double command substitution)
@@ -1712,13 +1972,14 @@ async def expand_word_with_glob(
     # String-level brace expansion fallback for unquoted words where braces
     # span across multiple parts (e.g., {$x,other} where $x is a ParameterExpansionPart)
     # Use has_quoted (AST-level check) to avoid expanding braces that came from escaped/quoted parts
-    if not has_quoted:
+    noglob_opt = getattr(ctx.state.options, 'noglob', False)
+    if not has_quoted and not getattr(ctx.state.options, 'nobraceexpand', False):
         if '{' in value and '}' in value:
             brace_expanded = expand_braces(value)
             if len(brace_expanded) > 1 or (len(brace_expanded) == 1 and brace_expanded[0] != value):
                 all_results = []
                 for exp_text in brace_expanded:
-                    if any(c in exp_text for c in "*?["):
+                    if not noglob_opt and any(c in exp_text for c in "*?["):
                         matches = await glob_expand(ctx, exp_text)
                         if matches:
                             all_results.extend(matches)
@@ -1729,8 +1990,9 @@ async def expand_word_with_glob(
 
     # For words with unquoted parts, perform glob expansion and IFS word splitting
     if not all_quoted:
-        # Check for glob patterns in unquoted segments
-        if _segments_has_unquoted_glob(segments):
+        # Check for glob patterns in unquoted segments (unless noglob is set)
+        noglob = getattr(ctx.state.options, 'noglob', False)
+        if not noglob and _segments_has_unquoted_glob(segments):
             matches = await glob_expand(ctx, value)
             if matches:
                 return {"values": matches, "quoted": False}
@@ -1752,7 +2014,7 @@ async def expand_word_with_glob(
             isinstance(p, (ParameterExpansionPart, CommandSubstitutionPart, ArithmeticExpansionPart))
             for p in word.parts
         )
-        if has_expansion:
+        if has_expansion and not no_split:
             ifs = ctx.state.env.get("IFS", " \t\n")
             if ifs:
                 # Split on IFS characters using segment-aware splitting
@@ -1773,6 +2035,10 @@ def _split_on_ifs(value: str, ifs: str) -> list[str]:
     if not value:
         return []
 
+    # Empty IFS: no splitting at all
+    if not ifs:
+        return [value]
+
     # Identify which IFS chars are whitespace
     ifs_whitespace = "".join(c for c in ifs if c in " \t\n")
     ifs_nonws = "".join(c for c in ifs if c not in " \t\n")
@@ -1782,24 +2048,47 @@ def _split_on_ifs(value: str, ifs: str) -> list[str]:
         return value.split()
 
     # Complex case: mix of whitespace and non-whitespace IFS
+    # Whitespace adjacent to non-whitespace IFS chars forms composite delimiters
     result = []
     current = []
     i = 0
+
+    # Skip leading IFS whitespace
+    while i < len(value) and value[i] in ifs_whitespace:
+        i += 1
+
     while i < len(value):
         c = value[i]
         if c in ifs_whitespace:
-            # Skip leading/consecutive whitespace
+            # Whitespace delimiter
             if current:
-                result.append("".join(current))
+                saved = "".join(current)
                 current = []
-            # Skip all consecutive whitespace
+            else:
+                saved = None
+            # Skip consecutive whitespace
             while i < len(value) and value[i] in ifs_whitespace:
                 i += 1
+            # Check if followed by non-ws IFS char (composite delimiter)
+            if i < len(value) and value[i] in ifs_nonws:
+                # Composite: ws + nonws counted as one delimiter
+                if saved is not None:
+                    result.append(saved)
+                i += 1  # consume the nonws char
+                # Skip trailing whitespace after nonws
+                while i < len(value) and value[i] in ifs_whitespace:
+                    i += 1
+            else:
+                if saved is not None:
+                    result.append(saved)
         elif c in ifs_nonws:
             # Non-whitespace delimiter produces field
             result.append("".join(current))
             current = []
             i += 1
+            # Skip trailing IFS whitespace after non-ws delimiter
+            while i < len(value) and value[i] in ifs_whitespace:
+                i += 1
         else:
             current.append(c)
             i += 1
@@ -2154,6 +2443,13 @@ def _parse_arith_value(val: str) -> int:
     val = val.strip()
     if not val:
         return 0
+    # Handle negative numbers
+    if val.startswith("-"):
+        rest = val[1:].strip()
+        if rest:
+            return -_parse_arith_value(rest)
+    if val.startswith("+"):
+        val = val[1:].strip()
     # Hex
     if val.startswith("0x") or val.startswith("0X"):
         try:
@@ -2183,6 +2479,75 @@ def _parse_arith_value(val: str) -> int:
         return 0
 
 
+# Thread-local recursion guard for arithmetic variable resolution
+_arith_resolve_depth = 0
+_MAX_ARITH_DEPTH = 32
+
+
+def _resolve_arith_variable(ctx: "InterpreterContext", val: str) -> int:
+    """Resolve a variable value in arithmetic context with recursive evaluation.
+
+    In bash, variable values in arithmetic are recursively evaluated:
+    - If val is "y" and y=3, evaluates to 3
+    - If val is "1+2", evaluates to 3
+    """
+    global _arith_resolve_depth
+
+    if not val:
+        return 0
+    val = val.strip()
+    if not val:
+        return 0
+
+    # Try as a plain number first (most common case)
+    plain = _parse_arith_value(val)
+    try:
+        int(val.strip().lstrip("+-"))  # Check if it's truly numeric
+        return plain
+    except ValueError:
+        pass
+
+    # Check for hex/octal/base-N that _parse_arith_value handles
+    stripped = val.strip().lstrip("+-")
+    if stripped.startswith("0x") or stripped.startswith("0X"):
+        return plain
+    if "#" in stripped:
+        return plain
+    if stripped.startswith("0") and len(stripped) > 1 and stripped[1:].isdigit():
+        return plain
+
+    # Guard against infinite recursion
+    _arith_resolve_depth += 1
+    if _arith_resolve_depth > _MAX_ARITH_DEPTH:
+        _arith_resolve_depth -= 1
+        return 0
+
+    try:
+        # If val is a valid identifier, try looking it up as a variable
+        import re as _re
+        if _re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', val):
+            var_val = get_variable(ctx, val, False)
+            if var_val and var_val != val:
+                return _resolve_arith_variable(ctx, var_val)
+            return 0
+
+        # Try parsing as an arithmetic expression
+        from ..parser.parser import Parser
+        from ..parser.lexer import Lexer
+        try:
+            lexer = Lexer(val)
+            parser = Parser(lexer)
+            arith_node = parser.parse_arithmetic_expression()
+            if arith_node:
+                return evaluate_arithmetic_sync(ctx, arith_node)
+        except Exception:
+            pass
+
+        return 0
+    finally:
+        _arith_resolve_depth -= 1
+
+
 def evaluate_arithmetic_sync(ctx: "InterpreterContext", expr) -> int:
     """Evaluate an arithmetic expression synchronously."""
     # Simple implementation for basic arithmetic
@@ -2191,6 +2556,16 @@ def evaluate_arithmetic_sync(ctx: "InterpreterContext", expr) -> int:
             return expr.value
         elif expr.type == "ArithVariable":
             name = expr.name
+            # Detect floating point numbers - bash doesn't support them in arithmetic
+            if "." in name and not name.startswith("$"):
+                # Check if it looks like a float (digits around a dot)
+                dot_pos = name.index(".")
+                before_dot = name[:dot_pos]
+                after_dot = name[dot_pos:]
+                if before_dot.isdigit() or (not before_dot and after_dot[1:].isdigit()):
+                    raise ValueError(
+                        f"{name}: syntax error: invalid arithmetic operator (error token is \"{after_dot}\")"
+                    )
             # Handle dynamic base constants like $base#value or base#value where base is a variable
             if "#" in name and not name.startswith("$"):
                 hash_pos = name.index("#")
@@ -2218,16 +2593,17 @@ def evaluate_arithmetic_sync(ctx: "InterpreterContext", expr) -> int:
             if name.startswith("${") and name.endswith("}"):
                 inner = name[2:-1]
                 val = _expand_braced_param_sync(ctx, inner)
-                return _parse_arith_value(val)
+                return _resolve_arith_variable(ctx, val)
             # Handle $var simple variable reference
             if name.startswith("$") and not name.startswith("$("):
                 var_name = name[1:]
                 if var_name.startswith("{") and var_name.endswith("}"):
                     var_name = var_name[1:-1]
                 val = get_variable(ctx, var_name, False)
-                return _parse_arith_value(val)
+                return _resolve_arith_variable(ctx, val)
+            # Bare variable name - resolve recursively (x → y → 3)
             val = get_variable(ctx, name, False)
-            return _parse_arith_value(val)
+            return _resolve_arith_variable(ctx, val)
         elif expr.type == "ArithBinary":
             op = expr.operator
             # Short-circuit for && and ||
@@ -2467,6 +2843,15 @@ async def evaluate_arithmetic(ctx: "InterpreterContext", expr) -> int:
         return expr.value
     elif expr.type == "ArithVariable":
         name = expr.name
+        # Detect floating point numbers - bash doesn't support them in arithmetic
+        if "." in name and not name.startswith("$"):
+            dot_pos = name.index(".")
+            before_dot = name[:dot_pos]
+            after_dot = name[dot_pos:]
+            if before_dot.isdigit() or (not before_dot and after_dot[1:].isdigit()):
+                raise ValueError(
+                    f"{name}: syntax error: invalid arithmetic operator (error token is \"{after_dot}\")"
+                )
         # Handle dynamic base constants
         if "#" in name and not name.startswith("$"):
             hash_pos = name.index("#")
@@ -2506,16 +2891,17 @@ async def evaluate_arithmetic(ctx: "InterpreterContext", expr) -> int:
         if name.startswith("${") and name.endswith("}"):
             inner = name[2:-1]
             val = _expand_braced_param_sync(ctx, inner)
-            return _parse_arith_value(val)
+            return _resolve_arith_variable(ctx, val)
         # Handle $var
         if name.startswith("$") and not name.startswith("$("):
             var_name = name[1:]
             if var_name.startswith("{") and var_name.endswith("}"):
                 var_name = var_name[1:-1]
             val = get_variable(ctx, var_name, False)
-            return _parse_arith_value(val)
+            return _resolve_arith_variable(ctx, val)
+        # Bare variable name - resolve recursively
         val = get_variable(ctx, name, False)
-        return _parse_arith_value(val)
+        return _resolve_arith_variable(ctx, val)
     elif expr.type == "ArithBinary":
         op = expr.operator
         if op == "&&":

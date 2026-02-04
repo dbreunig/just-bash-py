@@ -31,16 +31,30 @@ async def handle_break(ctx: "InterpreterContext", args: list[str]) -> "ExecResul
                 128,
                 stderr=f"bash: break: {args[0]}: numeric argument required\n",
             )
+        if len(args) > 1:
+            # In bash, too many arguments still breaks the loop
+            if ctx.state.loop_depth > 0:
+                raise BreakError(levels=levels)
+            from ...types import ExecResult
+            return ExecResult(
+                stdout="",
+                stderr="bash: break: too many arguments\n",
+                exit_code=1,
+            )
 
-    # Check if we're in a loop
-    if ctx.state.loop_depth < 1:
+    # If not inside a loop but inside a subshell spawned from a loop,
+    # break should exit the subshell (bash behavior)
+    if ctx.state.loop_depth == 0 and ctx.state.parent_has_loop_context:
+        raise BreakError(levels=levels)
+
+    # If not inside a loop, print warning and return success (bash behavior)
+    if ctx.state.loop_depth == 0:
         from ...types import ExecResult
         return ExecResult(
             stdout="",
-            stderr="",  # bash doesn't print error for break outside loop
+            stderr="bash: break: only meaningful in a `for', `while', or `until' loop\n",
             exit_code=0,
         )
-
     raise BreakError(levels=levels)
 
 
@@ -63,16 +77,30 @@ async def handle_continue(ctx: "InterpreterContext", args: list[str]) -> "ExecRe
                 128,
                 stderr=f"bash: continue: {args[0]}: numeric argument required\n",
             )
+        if len(args) > 1:
+            # In bash, too many arguments still breaks the loop
+            if ctx.state.loop_depth > 0:
+                raise BreakError(levels=levels)
+            from ...types import ExecResult
+            return ExecResult(
+                stdout="",
+                stderr="bash: continue: too many arguments\n",
+                exit_code=1,
+            )
 
-    # Check if we're in a loop
-    if ctx.state.loop_depth < 1:
+    # If not inside a loop but inside a subshell spawned from a loop,
+    # continue/break should exit the subshell (bash behavior)
+    if ctx.state.loop_depth == 0 and ctx.state.parent_has_loop_context:
+        raise ContinueError(levels=levels)
+
+    # If not inside a loop, print warning and return success (bash behavior)
+    if ctx.state.loop_depth == 0:
         from ...types import ExecResult
         return ExecResult(
             stdout="",
-            stderr="",  # bash doesn't print error for continue outside loop
+            stderr="bash: continue: only meaningful in a `for', `while', or `until' loop\n",
             exit_code=0,
         )
-
     raise ContinueError(levels=levels)
 
 
@@ -94,7 +122,7 @@ async def handle_return(ctx: "InterpreterContext", args: list[str]) -> "ExecResu
             return ExecResult(
                 stdout="",
                 stderr=f"bash: return: {args[0]}: numeric argument required\n",
-                exit_code=1,
+                exit_code=2,
             )
 
     raise ReturnError(exit_code)

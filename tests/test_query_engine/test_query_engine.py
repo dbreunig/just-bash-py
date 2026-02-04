@@ -500,8 +500,8 @@ class TestEvaluator:
         # .b.c? on {"a": 1} returns [None] because .b returns null
         assert evaluate({"a": 1}, parse(".b.c?")) == [None]
         assert evaluate({"a": {"b": 1}}, parse(".a.b?")) == [1]
-        # Access on non-objects returns None in our implementation
-        assert evaluate("not an object", parse(".foo?")) == [None]
+        # Access on non-objects is suppressed by ? (returns empty)
+        assert evaluate("not an object", parse(".foo?")) == []
 
     def test_variable_binding(self):
         result = evaluate(5, parse(". as $x | $x * $x"))

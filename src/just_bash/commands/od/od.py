@@ -243,7 +243,7 @@ class OdCommand:
                 parts.append("".join(chars))
             elif format_type == "x":
                 # Hexadecimal format: 4-char fields
-                hex_vals = [f"  {byte:02x}" for byte in line_data]
+                hex_vals = [f" {byte:02x}" for byte in line_data]
                 parts.append("".join(hex_vals))
             elif format_type == "d":
                 # Decimal format: 4-char fields

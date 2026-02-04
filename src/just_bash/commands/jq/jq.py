@@ -113,8 +113,8 @@ class JqCommand:
                 use_tabs = True
             elif arg in ("-a", "--ascii-output"):
                 ascii_output = True
-            elif arg.startswith("-") and len(arg) > 1:
-                # Combined flags
+            elif arg.startswith("-") and len(arg) > 1 and not (filter_str is None and (arg[1:2].isdigit() or arg[1:2] == ".")):
+                # Combined flags (but not if it looks like a negative number/expression and no filter set)
                 for c in arg[1:]:
                     if c == "r":
                         raw_output = True

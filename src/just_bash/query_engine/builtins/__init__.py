@@ -11,7 +11,7 @@ from collections.abc import Callable
 from typing import Any
 from urllib.parse import quote as uri_quote
 
-from ..types import AstNode, EvalContext
+from ..types import AstNode, EvalContext, JqError
 
 # Type for the evaluate function passed from evaluator
 EvalFunc = Callable[[Any, AstNode, EvalContext], list[Any]]
@@ -73,7 +73,13 @@ def call_builtin(
     if name == "utf8bytelength":
         if isinstance(value, str):
             return [len(value.encode("utf-8"))]
-        return [None]
+        type_name = _jq_type_for_error(value)
+        short_val = json.dumps(value) if not isinstance(value, (dict, list)) else (
+            "[]" if isinstance(value, list) and not value else
+            "{}" if isinstance(value, dict) and not value else
+            json.dumps(value)[:20]
+        )
+        raise ValueError(f"{type_name} ({short_val}) only strings have UTF-8 byte length")
 
     if name == "type":
         if value is None:
@@ -95,7 +101,7 @@ def call_builtin(
 
     if name == "error":
         msg = eval_fn(value, args[0], ctx)[0] if args else value
-        raise ValueError(str(msg))
+        raise JqError(msg)
 
     if name == "not":
         return [not _is_truthy(value)]
@@ -111,7 +117,10 @@ def call_builtin(
 
     if name == "first":
         if args:
-            results = eval_fn(value, args[0], ctx)
+            try:
+                results = eval_fn(value, args[0], ctx)
+            except (JqError, ValueError):
+                results = []
             return [results[0]] if results else []
         if isinstance(value, list) and value:
             return [value[0]]
@@ -119,7 +128,10 @@ def call_builtin(
 
     if name == "last":
         if args:
-            results = eval_fn(value, args[0], ctx)
+            try:
+                results = eval_fn(value, args[0], ctx)
+            except (JqError, ValueError):
+                results = []
             return [results[-1]] if results else []
         if isinstance(value, list) and value:
             return [value[-1]]
@@ -129,10 +141,20 @@ def call_builtin(
         if not args:
             return [None]
         ns = eval_fn(value, args[0], ctx)
-        n = ns[0] if ns else 0
         if len(args) > 1:
-            results = eval_fn(value, args[1], ctx)
-            return [results[n]] if isinstance(n, int) and 0 <= n < len(results) else []
+            try:
+                gen_results = eval_fn(value, args[1], ctx)
+            except (JqError, ValueError):
+                gen_results = []
+            results = []
+            for n in ns:
+                if isinstance(n, int):
+                    if n < 0:
+                        raise JqError("nth doesn't support negative indices")
+                    if 0 <= n < len(gen_results):
+                        results.append(gen_results[n])
+            return results
+        n = ns[0] if ns else 0
         if isinstance(value, list):
             return [value[n]] if isinstance(n, int) and 0 <= n < len(value) else [None]
         return [None]
@@ -142,12 +164,36 @@ def call_builtin(
             return []
         starts = eval_fn(value, args[0], ctx)
         if len(args) == 1:
-            n = starts[0] if starts else 0
-            return list(range(int(n)))
+            # range(n) — for each n, generate 0..n-1
+            results = []
+            for n in starts:
+                ni = int(n) if isinstance(n, (int, float)) else 0
+                if ni > 0:
+                    results.extend(range(ni))
+            return results
         ends = eval_fn(value, args[1], ctx)
-        start = int(starts[0]) if starts else 0
-        end = int(ends[0]) if ends else 0
-        return list(range(start, end))
+        if len(args) == 2:
+            # range(start; end) — generate for each combination
+            results = []
+            for s in starts:
+                for e in ends:
+                    si = int(s) if isinstance(s, (int, float)) else 0
+                    ei = int(e) if isinstance(e, (int, float)) else 0
+                    results.extend(range(si, ei))
+            return results
+        # range(start; end; step)
+        steps = eval_fn(value, args[2], ctx)
+        results = []
+        for s in starts:
+            for e in ends:
+                for st in steps:
+                    si = int(s) if isinstance(s, (int, float)) else 0
+                    ei = int(e) if isinstance(e, (int, float)) else 0
+                    sti = int(st) if isinstance(st, (int, float)) else 0
+                    if sti == 0:
+                        continue
+                    results.extend(range(si, ei, sti))
+        return results
 
     if name == "reverse":
         if isinstance(value, list):
@@ -232,31 +278,26 @@ def call_builtin(
     if name == "flatten":
         if not isinstance(value, list):
             return [None]
-        depth = float("inf")
         if args:
             depth_vals = eval_fn(value, args[0], ctx)
-            depth = depth_vals[0] if depth_vals else float("inf")
-        result = _flatten(value, int(depth) if depth != float("inf") else None)
-        return [result]
+            results = []
+            for d in depth_vals:
+                depth = d if isinstance(d, (int, float)) else float("inf")
+                results.append(_flatten(value, int(depth) if depth != float("inf") else None))
+            return results
+        return [_flatten(value, None)]
 
     if name == "add":
+        if args:
+            # add(filter) - collect filter results and add them
+            results = eval_fn(value, args[0], ctx)
+            if not results:
+                return [None]
+            return _jq_add(results)
         if isinstance(value, list):
             if not value:
                 return [None]
-            if all(isinstance(x, (int, float)) for x in value):
-                return [sum(value)]
-            if all(isinstance(x, str) for x in value):
-                return ["".join(value)]
-            if all(isinstance(x, list) for x in value):
-                result = []
-                for x in value:
-                    result.extend(x)
-                return [result]
-            if all(isinstance(x, dict) for x in value):
-                result = {}
-                for x in value:
-                    result.update(x)
-                return [result]
+            return _jq_add(value)
         return [None]
 
     if name == "any":
@@ -361,18 +402,25 @@ def call_builtin(
         if not args:
             return [None]
         paths = eval_fn(value, args[0], ctx)
-        path = paths[0] if paths else []
-        current = value
-        for key in path:
-            if current is None:
-                return [None]
-            if isinstance(current, list) and isinstance(key, int):
-                current = current[key] if 0 <= key < len(current) else None
-            elif isinstance(current, dict) and isinstance(key, str):
-                current = current.get(key)
-            else:
-                return [None]
-        return [current]
+        results = []
+        for path in paths:
+            if not isinstance(path, list):
+                results.append(None)
+                continue
+            current = value
+            for key in path:
+                if current is None:
+                    current = None
+                    break
+                if isinstance(current, list) and isinstance(key, int):
+                    current = current[key] if 0 <= key < len(current) else None
+                elif isinstance(current, dict) and isinstance(key, str):
+                    current = current.get(key)
+                else:
+                    current = None
+                    break
+            results.append(current)
+        return results
 
     if name == "setpath":
         if len(args) < 2:
@@ -397,15 +445,22 @@ def call_builtin(
     if name == "path":
         if not args:
             return [[]]
-        # Collect all paths that match the expression
-        paths = []
-        _collect_paths(value, args[0], ctx, eval_fn, [], paths)
+        # Compute paths that the expression navigates to
+        paths = _compute_paths(value, args[0], ctx, eval_fn)
         return paths
 
     if name == "del":
         if not args:
             return [value]
-        return [_apply_del(value, args[0], ctx, eval_fn)]
+        # Compute all paths to delete, then delete from longest first
+        paths = _compute_paths(value, args[0], ctx, eval_fn)
+        if not paths:
+            return [_apply_del(value, args[0], ctx, eval_fn)]
+        result = value
+        # Delete by paths, longest first to avoid shifting
+        for path in sorted(paths, key=len, reverse=True):
+            result = _delete_path(result, path)
+        return [result]
 
     if name == "paths":
         paths = _get_all_paths(value, [])
@@ -464,15 +519,36 @@ def call_builtin(
         if not isinstance(value, list):
             return [None]
         seps = eval_fn(value, args[0], ctx) if args else [""]
-        sep = str(seps[0]) if seps else ""
-        return [sep.join(v if isinstance(v, str) else json.dumps(v) for v in value)]
+        results = []
+        for sep in seps:
+            s = str(sep) if sep is not None else ""
+            parts = []
+            for v in value:
+                if v is None:
+                    parts.append("")
+                elif isinstance(v, str):
+                    parts.append(v)
+                else:
+                    parts.append(json.dumps(v))
+            results.append(s.join(parts))
+        return results
 
     if name == "split":
         if not isinstance(value, str) or not args:
             return [None]
         seps = eval_fn(value, args[0], ctx)
-        sep = str(seps[0]) if seps else ""
-        return [value.split(sep)]
+        sep = seps[0] if seps else ""
+        if isinstance(sep, str):
+            if sep == "":
+                return [list(value)]
+            # With 2 args, second is flags for regex split
+            if len(args) > 1:
+                flags_val = eval_fn(value, args[1], ctx)
+                flags = flags_val[0] if flags_val else ""
+                re_flags = _get_re_flags(str(flags) if flags else "")
+                return [re.split(sep, value, flags=re_flags)]
+            return [value.split(sep)]
+        return [None]
 
     if name == "test":
         if not isinstance(value, str) or not args:
@@ -489,73 +565,120 @@ def call_builtin(
     if name == "match":
         if not isinstance(value, str) or not args:
             return [None]
-        patterns = eval_fn(value, args[0], ctx)
-        pattern = str(patterns[0]) if patterns else ""
+        pattern, flags_str = _extract_pattern_flags(value, args, ctx, eval_fn)
         try:
-            flags = eval_fn(value, args[1], ctx)[0] if len(args) > 1 else ""
-            re_flags = _get_re_flags(flags)
+            re_flags = _get_re_flags(flags_str)
+            is_global = "g" in flags_str
+            if is_global:
+                matches = list(re.finditer(pattern, value, re_flags))
+                if not matches:
+                    return []
+                return [_match_to_dict(m, pattern) for m in matches]
             m = re.search(pattern, value, re_flags)
             if not m:
-                return []
-            return [
-                {
-                    "offset": m.start(),
-                    "length": len(m.group()),
-                    "string": m.group(),
-                    "captures": [
-                        {
-                            "offset": m.start(i + 1) if m.group(i + 1) else None,
-                            "length": len(m.group(i + 1)) if m.group(i + 1) else 0,
-                            "string": m.group(i + 1) or "",
-                            "name": None,
-                        }
-                        for i in range(m.lastindex or 0)
-                    ],
-                }
-            ]
+                return [None]
+            return [_match_to_dict(m, pattern)]
         except re.error:
             return [None]
 
     if name == "capture":
         if not isinstance(value, str) or not args:
             return [None]
-        patterns = eval_fn(value, args[0], ctx)
-        pattern = str(patterns[0]) if patterns else ""
+        pattern, flags_str = _extract_pattern_flags(value, args, ctx, eval_fn)
         try:
-            flags = eval_fn(value, args[1], ctx)[0] if len(args) > 1 else ""
-            re_flags = _get_re_flags(flags)
+            re_flags = _get_re_flags(flags_str)
             m = re.search(pattern, value, re_flags)
-            if not m or not m.groupdict():
-                return [{}]
-            return [m.groupdict()]
+            if not m:
+                return [None]
+            # Return dict of named groups (None for unmatched optional groups)
+            result = {}
+            for gname, gval in m.groupdict().items():
+                result[gname] = gval
+            return [result] if result else [None]
         except re.error:
             return [None]
+
+    if name == "scan":
+        if not isinstance(value, str) or not args:
+            return [None]
+        pattern, flags_str = _extract_pattern_flags(value, args, ctx, eval_fn)
+        try:
+            re_flags = _get_re_flags(flags_str)
+            results = []
+            for m in re.finditer(pattern, value, re_flags):
+                if m.lastindex and m.lastindex > 0:
+                    # Has capture groups - return as array
+                    results.append(list(m.groups()))
+                else:
+                    results.append(m.group())
+            return results
+        except re.error:
+            return []
+
+    if name == "splits":
+        if not isinstance(value, str) or not args:
+            return [None]
+        pattern, flags_str = _extract_pattern_flags(value, args, ctx, eval_fn)
+        try:
+            re_flags = _get_re_flags(flags_str)
+            return re.split(pattern, value, flags=re_flags)
+        except re.error:
+            return [value]
 
     if name == "sub":
         if not isinstance(value, str) or len(args) < 2:
             return [None]
-        patterns = eval_fn(value, args[0], ctx)
-        replacements = eval_fn(value, args[1], ctx)
-        pattern = str(patterns[0]) if patterns else ""
-        replacement = str(replacements[0]) if replacements else ""
+        pattern, flags_str = _extract_pattern_flags(value, [args[0]] + args[2:], ctx, eval_fn)
         try:
-            flags = eval_fn(value, args[2], ctx)[0] if len(args) > 2 else ""
-            re_flags = _get_re_flags(flags)
-            return [re.sub(pattern, replacement, value, count=1, flags=re_flags)]
+            re_flags = _get_re_flags(flags_str)
+            is_global = "g" in flags_str
+            # The replacement is a jq expression, evaluated with match as input
+            m = re.search(pattern, value, re_flags)
+            if not m:
+                return [value]
+            match_dict = _match_to_dict(m, pattern)
+            replacements = eval_fn(match_dict, args[1], ctx)
+            results = []
+            for repl in replacements:
+                replacement = str(repl) if repl is not None else ""
+                if is_global:
+                    results.append(re.sub(pattern, replacement, value, flags=re_flags))
+                else:
+                    results.append(re.sub(pattern, replacement, value, count=1, flags=re_flags))
+            return results
         except re.error:
             return [value]
 
     if name == "gsub":
         if not isinstance(value, str) or len(args) < 2:
             return [None]
-        patterns = eval_fn(value, args[0], ctx)
-        replacements = eval_fn(value, args[1], ctx)
-        pattern = str(patterns[0]) if patterns else ""
-        replacement = str(replacements[0]) if replacements else ""
+        pattern, flags_str = _extract_pattern_flags(value, [args[0]] + args[2:], ctx, eval_fn)
         try:
-            flags = eval_fn(value, args[2], ctx)[0] if len(args) > 2 else "g"
-            re_flags = _get_re_flags(flags)
-            return [re.sub(pattern, replacement, value, flags=re_flags)]
+            re_flags = _get_re_flags(flags_str)
+            # Evaluate replacement for each match
+            matches = list(re.finditer(pattern, value, re_flags))
+            if not matches:
+                return [value]
+            # Build replacement by evaluating the replacement expr for each match
+            result = value
+            offset_adjust = 0
+            replacements_expr = args[1]
+            all_repls = []
+            for m in matches:
+                match_dict = _match_to_dict(m, pattern)
+                repls = eval_fn(match_dict, replacements_expr, ctx)
+                all_repls.extend(repls)
+
+            if len(all_repls) <= 1:
+                # Simple case: one replacement for all matches
+                repl = str(all_repls[0]) if all_repls else ""
+                return [re.sub(pattern, repl, value, flags=re_flags)]
+            else:
+                # Multiple outputs from replacement - return multiple results
+                results = []
+                for repl in all_repls:
+                    results.append(re.sub(pattern, str(repl) if repl is not None else "", value, flags=re_flags))
+                return results
         except re.error:
             return [value]
 
@@ -606,48 +729,69 @@ def call_builtin(
         if not args:
             return [None]
         needles = eval_fn(value, args[0], ctx)
-        needle = needles[0] if needles else None
-        if isinstance(value, str) and isinstance(needle, str):
-            idx = value.find(needle)
-            return [idx if idx >= 0 else None]
-        if isinstance(value, list):
-            for i, item in enumerate(value):
-                if _deep_equal(item, needle):
-                    return [i]
-            return [None]
-        return [None]
+        results = []
+        for needle in needles:
+            if isinstance(value, str) and isinstance(needle, str):
+                if needle == "":
+                    results.append(None)
+                else:
+                    idx = value.find(needle)
+                    results.append(idx if idx >= 0 else None)
+            elif isinstance(value, list):
+                found = None
+                for i, item in enumerate(value):
+                    if _deep_equal(item, needle):
+                        found = i
+                        break
+                results.append(found)
+            else:
+                results.append(None)
+        return results
 
     if name == "rindex":
         if not args:
             return [None]
         needles = eval_fn(value, args[0], ctx)
-        needle = needles[0] if needles else None
-        if isinstance(value, str) and isinstance(needle, str):
-            idx = value.rfind(needle)
-            return [idx if idx >= 0 else None]
-        if isinstance(value, list):
-            for i in range(len(value) - 1, -1, -1):
-                if _deep_equal(value[i], needle):
-                    return [i]
-            return [None]
-        return [None]
+        results = []
+        for needle in needles:
+            if isinstance(value, str) and isinstance(needle, str):
+                idx = value.rfind(needle)
+                results.append(idx if idx >= 0 else None)
+            elif isinstance(value, list):
+                found = None
+                for i in range(len(value) - 1, -1, -1):
+                    if _deep_equal(value[i], needle):
+                        found = i
+                        break
+                results.append(found)
+            else:
+                results.append(None)
+        return results
 
     if name == "indices":
         if not args:
             return [[]]
         needles = eval_fn(value, args[0], ctx)
-        needle = needles[0] if needles else None
-        result = []
-        if isinstance(value, str) and isinstance(needle, str):
-            idx = value.find(needle)
-            while idx != -1:
-                result.append(idx)
-                idx = value.find(needle, idx + 1)
-        elif isinstance(value, list):
-            for i, item in enumerate(value):
-                if _deep_equal(item, needle):
-                    result.append(i)
-        return [result]
+        results = []
+        for needle in needles:
+            result = []
+            if isinstance(value, str) and isinstance(needle, str):
+                idx = value.find(needle)
+                while idx != -1:
+                    result.append(idx)
+                    idx = value.find(needle, idx + 1)
+            elif isinstance(value, list) and isinstance(needle, list):
+                # Find subsequence positions
+                nlen = len(needle)
+                for i in range(len(value) - nlen + 1):
+                    if all(_deep_equal(value[i + j], needle[j]) for j in range(nlen)):
+                        result.append(i)
+            elif isinstance(value, list):
+                for i, item in enumerate(value):
+                    if _deep_equal(item, needle):
+                        result.append(i)
+            results.append(result)
+        return results if len(results) != 1 else results
 
     # Math functions
     if name == "floor":
@@ -667,7 +811,10 @@ def call_builtin(
 
     if name == "sqrt":
         if isinstance(value, (int, float)):
-            return [math.sqrt(value)]
+            result = math.sqrt(value)
+            if result == int(result):
+                return [int(result)]
+            return [result]
         return [None]
 
     if name in ("fabs", "abs"):
@@ -903,9 +1050,19 @@ def call_builtin(
         if len(args) < 2:
             return []
         ns = eval_fn(value, args[0], ctx)
-        n = ns[0] if ns else 0
-        results = eval_fn(value, args[1], ctx)
-        return results[: int(n)]
+        results = []
+        for n in ns:
+            ni = int(n) if isinstance(n, (int, float)) else 0
+            if ni < 0:
+                raise JqError("limit doesn't support negative count")
+            if ni == 0:
+                continue
+            try:
+                stream = eval_fn(value, args[1], ctx)
+            except (JqError, ValueError):
+                stream = []
+            results.extend(stream[:ni])
+        return results
 
     if name == "until":
         if len(args) < 2:
@@ -967,10 +1124,21 @@ def call_builtin(
 
     if name == "@base64d":
         if isinstance(value, str):
+            # Check for trailing bytes issue first
+            stripped = value.rstrip("=")
+            if len(stripped) % 4 == 1:
+                raise JqError(f"string ({json.dumps(value)}) trailing base64 byte found")
             try:
-                return [base64.b64decode(value).decode("utf-8")]
+                # Add padding if needed
+                padded = value + "=" * (4 - len(value) % 4) if len(value) % 4 else value
+                return [base64.b64decode(padded).decode("utf-8")]
             except Exception:
-                return [None]
+                # Truncate long values in error message (jq truncates without closing quote)
+                if len(value) > 10:
+                    display = f'"{value[:10]}...'
+                else:
+                    display = json.dumps(value)
+                raise JqError(f"string ({display}) is not valid base64 data")
         return [None]
 
     if name == "@uri":
@@ -1060,7 +1228,283 @@ def call_builtin(
     if name == "root":
         return [ctx.root] if ctx.root is not None else []
 
+    if name == "isempty":
+        if not args:
+            return [value is None or (isinstance(value, (list, dict, str)) and len(value) == 0)]
+        try:
+            results = eval_fn(value, args[0], ctx)
+            return [len(results) == 0]
+        except Exception:
+            return [True]
+
+    if name == "IN":
+        if len(args) == 1:
+            # IN(stream) — check if . is in the stream
+            try:
+                stream = eval_fn(value, args[0], ctx)
+                return [value in stream]
+            except Exception:
+                return [False]
+        if len(args) == 2:
+            # IN(expr; stream) — check if each result of expr is in stream
+            vals = eval_fn(value, args[0], ctx)
+            stream = eval_fn(value, args[1], ctx)
+            return [v in stream for v in vals]
+        return [False]
+
+    if name == "bsearch":
+        if not args or not isinstance(value, list):
+            return [None]
+        targets = eval_fn(value, args[0], ctx)
+        target = targets[0] if targets else None
+        # Binary search on sorted array
+        lo, hi = 0, len(value) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if value[mid] == target:
+                return [mid]
+            elif _jq_sort_key(value[mid]) < _jq_sort_key(target):
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return [-(lo + 1)]
+
+    if name == "combinations":
+        if not isinstance(value, list):
+            return [None]
+        if args:
+            # combinations(n) — n-ary combinations of value
+            ns = eval_fn(value, args[0], ctx)
+            n = int(ns[0]) if ns else 2
+            import itertools
+            return list(list(combo) for combo in itertools.product(value, repeat=n))
+        # combinations — treat value as array of arrays, return cartesian product
+        if all(isinstance(x, list) for x in value):
+            import itertools
+            return [list(combo) for combo in itertools.product(*value)]
+        return [value]
+
+    if name == "builtins":
+        # Return list of builtin function names
+        builtin_names = [
+            "add", "all", "any", "arrays", "ascii", "ascii_downcase", "ascii_upcase",
+            "booleans", "bsearch", "builtins", "capture", "ceil", "combinations",
+            "contains", "debug", "del", "delpaths", "empty", "endswith", "env",
+            "error", "exp", "exp10", "exp2", "explode", "false", "first",
+            "flatten", "floor", "from_entries", "fromjson", "getpath", "group_by",
+            "gsub", "has", "if", "implode", "in", "IN", "indices", "infinite",
+            "input_line_number", "inside", "isempty", "isfinite", "isinfinite",
+            "isnan", "isnormal", "iterables", "join", "keys", "keys_unsorted",
+            "last", "leaf_paths", "length", "limit", "log", "log10", "log2",
+            "ltrimstr", "map", "map_values", "match", "max", "max_by", "min",
+            "min_by", "nan", "not", "now", "nth", "null", "nulls", "numbers",
+            "objects", "path", "paths", "pow", "range", "recurse", "repeat",
+            "reverse", "round", "rtrimstr", "scalars", "select", "setpath",
+            "sin", "sort", "sort_by", "split", "sqrt", "startswith",
+            "strings", "sub", "test", "to_entries", "tostring", "tonumber",
+            "transpose", "trim", "true", "type", "unique", "unique_by",
+            "until", "utf8bytelength", "values", "walk", "while",
+            "with_entries",
+        ]
+        return [builtin_names]
+
+    if name == "toboolean":
+        if isinstance(value, bool):
+            return [value]
+        if isinstance(value, str):
+            if value.lower() == "true":
+                return [True]
+            if value.lower() == "false":
+                return [False]
+            raise JqError(f"string ({json.dumps(value)}) cannot be parsed as a boolean")
+        raise JqError(f"{_jq_type_for_error(value)} ({json.dumps(value)}) cannot be parsed as a boolean")
+
+    if name == "pick":
+        if not args:
+            return [None]
+        result = {}
+        for arg in args:
+            # Get paths for this expression, then set them in result
+            paths = _get_paths_for_expr(value, arg, ctx, eval_fn)
+            for p in paths:
+                v = _get_value_at_path(value, p)
+                result = _set_path(result, p, v)
+        return [result]
+
+    if name == "skip":
+        if len(args) < 2:
+            return []
+        ns = eval_fn(value, args[0], ctx)
+        gen = eval_fn(value, args[1], ctx)
+        results = []
+        for n in ns:
+            ni = int(n) if isinstance(n, (int, float)) else 0
+            if ni < 0:
+                raise JqError("skip doesn't support negative count")
+            results.extend(gen[ni:])
+        return results
+
+    if name == "trimstr":
+        if not args:
+            return [value]
+        strs = eval_fn(value, args[0], ctx)
+        s = strs[0] if strs else ""
+        if isinstance(value, str) and isinstance(s, str):
+            result = value
+            if result.startswith(s):
+                result = result[len(s):]
+            if result.endswith(s):
+                result = result[:-len(s)] if s else result
+            return [result]
+        return [value]
+
+    if name in ("ltrim", "rtrim"):
+        if isinstance(value, str):
+            if name == "ltrim":
+                return [value.lstrip()]
+            return [value.rstrip()]
+        return [value]
+
+    if name in ("strftime", "strflocaltime"):
+        import time
+        if not args:
+            return [None]
+        fmts = eval_fn(value, args[0], ctx)
+        fmt = fmts[0] if fmts else "%Y-%m-%dT%H:%M:%SZ"
+        if isinstance(value, (int, float)):
+            t = time.gmtime(value)
+            return [time.strftime(fmt, t)]
+        return [None]
+
+    if name == "strptime":
+        import time
+        if not args:
+            return [None]
+        fmts = eval_fn(value, args[0], ctx)
+        fmt = fmts[0] if fmts else "%Y-%m-%dT%H:%M:%SZ"
+        if isinstance(value, str):
+            try:
+                t = time.strptime(value, fmt)
+                # Return broken-down time as list like jq
+                return [[t.tm_year, t.tm_mon - 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec, t.tm_wday, t.tm_yday - 1]]
+            except ValueError:
+                return [None]
+        return [None]
+
+    if name == "mktime":
+        import calendar
+        if isinstance(value, list) and len(value) >= 6:
+            import time
+            t = time.struct_time((value[0], value[1] + 1, value[2], value[3], value[4], value[5], 0, 0, 0))
+            return [int(calendar.timegm(t))]
+        return [None]
+
+    if name == "gmtime":
+        import time
+        if isinstance(value, (int, float)):
+            t = time.gmtime(value)
+            return [[t.tm_year, t.tm_mon - 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec, t.tm_wday, t.tm_yday - 1]]
+        return [None]
+
+    if name == "fromdate":
+        import time
+        import calendar
+        if isinstance(value, str):
+            try:
+                t = time.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+                return [int(calendar.timegm(t))]
+            except ValueError:
+                return [None]
+        return [None]
+
+    if name == "todate":
+        import time
+        if isinstance(value, (int, float)):
+            t = time.gmtime(value)
+            return [time.strftime("%Y-%m-%dT%H:%M:%SZ", t)]
+        return [None]
+
+    if name == "INDEX":
+        if len(args) == 1:
+            # INDEX(f) — create object indexed by f applied to each element
+            if isinstance(value, list):
+                result = {}
+                for item in value:
+                    keys = eval_fn(item, args[0], ctx)
+                    key = keys[0] if keys else None
+                    if key is not None:
+                        result[str(key)] = item
+                return [result]
+            return [{}]
+        if len(args) == 2:
+            # INDEX(stream; f) — index stream by f
+            stream = eval_fn(value, args[0], ctx)
+            result = {}
+            for item in stream:
+                keys = eval_fn(item, args[1], ctx)
+                key = keys[0] if keys else None
+                if key is not None:
+                    result[str(key)] = item
+            return [result]
+        return [{}]
+
+    if name == "JOIN":
+        if len(args) >= 2:
+            idx = eval_fn(value, args[0], ctx)
+            index_obj = idx[0] if idx else {}
+            if isinstance(index_obj, dict):
+                stream = eval_fn(value, args[1], ctx)
+                result = {}
+                for item in stream:
+                    if isinstance(item, list) and len(item) >= 1:
+                        key = str(item[0])
+                        if key in index_obj:
+                            result[key] = [index_obj[key], item]
+                return [result]
+        return [{}]
+
+    if name == "@urid":
+        from urllib.parse import unquote
+        if isinstance(value, str):
+            try:
+                decoded = unquote(value, errors="strict")
+                # Check for invalid UTF-8 sequences
+                decoded.encode("utf-8")
+                return [decoded]
+            except (ValueError, UnicodeDecodeError, UnicodeEncodeError):
+                raise JqError(f"string ({json.dumps(value)}) is not a valid uri encoding")
+        return [value]
+
     raise ValueError(f"Unknown function: {name}")
+
+
+def _jq_add(items: list[Any]) -> list[Any]:
+    """Add a list of values together jq-style."""
+    if not items:
+        return [None]
+    # Filter out None values for type detection
+    non_null = [x for x in items if x is not None]
+    if not non_null:
+        return [None]
+    if all(isinstance(x, (int, float)) for x in non_null):
+        return [sum(non_null)]
+    if all(isinstance(x, str) for x in non_null):
+        return ["".join(non_null)]
+    if all(isinstance(x, list) for x in non_null):
+        result: list[Any] = []
+        for x in non_null:
+            result.extend(x)
+        return [result]
+    if all(isinstance(x, dict) for x in non_null):
+        result_dict: dict[str, Any] = {}
+        for x in non_null:
+            result_dict.update(x)
+        return [result_dict]
+    # Mixed types - try numeric
+    try:
+        return [sum(x for x in non_null if isinstance(x, (int, float)))]
+    except Exception:
+        return [None]
 
 
 def _is_truthy(v: Any) -> bool:
@@ -1209,6 +1653,86 @@ def _get_value_at_path(value: Any, path: list[str | int]) -> Any:
     return current
 
 
+def _compute_paths(
+    value: Any,
+    expr: AstNode,
+    ctx: EvalContext,
+    eval_fn: EvalFunc,
+) -> list[list[str | int]]:
+    """Compute paths that an expression navigates to."""
+    node_type = expr.type
+
+    if node_type == "Identity":
+        return [[]]
+
+    if node_type == "Field":
+        field_node = expr
+        if field_node.base:
+            base_paths = _compute_paths(value, field_node.base, ctx, eval_fn)
+            results = []
+            for bp in base_paths:
+                results.append(bp + [field_node.name])
+            return results
+        return [[field_node.name]]
+
+    if node_type == "Index":
+        index_node = expr
+        indices = eval_fn(value, index_node.index, ctx)
+        if index_node.base:
+            base_paths = _compute_paths(value, index_node.base, ctx, eval_fn)
+            results = []
+            for bp in base_paths:
+                for idx in indices:
+                    results.append(bp + [idx])
+            return results
+        return [[idx] for idx in indices]
+
+    if node_type == "Iterate":
+        iter_node = expr
+        if iter_node.base:
+            base_paths = _compute_paths(value, iter_node.base, ctx, eval_fn)
+            results = []
+            for bp in base_paths:
+                v = _get_value_at_path(value, bp)
+                if isinstance(v, list):
+                    for i in range(len(v)):
+                        results.append(bp + [i])
+                elif isinstance(v, dict):
+                    for k in v.keys():
+                        results.append(bp + [k])
+            return results
+        if isinstance(value, list):
+            return [[i] for i in range(len(value))]
+        if isinstance(value, dict):
+            return [[k] for k in value.keys()]
+        return []
+
+    if node_type == "Pipe":
+        pipe_node = expr
+        left_paths = _compute_paths(value, pipe_node.left, ctx, eval_fn)
+        results = []
+        for lp in left_paths:
+            v = _get_value_at_path(value, lp)
+            right_paths = _compute_paths(v, pipe_node.right, ctx, eval_fn)
+            for rp in right_paths:
+                results.append(lp + rp)
+        return results
+
+    if node_type == "Recurse":
+        # .. returns all paths
+        all_paths = _get_all_paths(value, [])
+        return [list(p) for p in all_paths]
+
+    if node_type == "Comma":
+        comma_node = expr
+        left = _compute_paths(value, comma_node.left, ctx, eval_fn)
+        right = _compute_paths(value, comma_node.right, ctx, eval_fn)
+        return left + right
+
+    # For other expression types, fall back to evaluation
+    return [[]]
+
+
 def _collect_paths(
     value: Any,
     expr: AstNode,
@@ -1258,6 +1782,50 @@ def _apply_del(value: Any, path_expr: AstNode, ctx: EvalContext, eval_fn: EvalFu
     return value
 
 
+def _jq_type_for_error(v: Any) -> str:
+    """Return jq type name for error messages."""
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "boolean"
+    if isinstance(v, (int, float)):
+        return "number"
+    if isinstance(v, str):
+        return "string"
+    if isinstance(v, list):
+        return "array"
+    if isinstance(v, dict):
+        return "object"
+    return "unknown"
+
+
+def _get_paths_for_expr(
+    value: Any,
+    expr: AstNode,
+    ctx: EvalContext,
+    eval_fn: EvalFunc,
+) -> list[list[str | int]]:
+    """Get paths that an expression refers to."""
+    if expr.type == "Field":
+        base_paths = _get_paths_for_expr(value, expr.base, ctx, eval_fn) if expr.base else [[]]
+        return [p + [expr.name] for p in base_paths]
+    if expr.type == "Index":
+        base_paths = _get_paths_for_expr(value, expr.base, ctx, eval_fn) if expr.base else [[]]
+        indices = eval_fn(value, expr.index, ctx)
+        result = []
+        for p in base_paths:
+            for idx in indices:
+                result.append(p + [idx])
+        return result
+    if expr.type == "Identity":
+        return [[]]
+    if expr.type == "Comma":
+        left = _get_paths_for_expr(value, expr.left, ctx, eval_fn)
+        right = _get_paths_for_expr(value, expr.right, ctx, eval_fn)
+        return left + right
+    return [[]]
+
+
 def _walk_recurse(value: Any, results: list[Any]) -> None:
     """Walk recursively through a value."""
     results.append(value)
@@ -1281,3 +1849,58 @@ def _get_re_flags(flags: str) -> int:
     if "x" in flags:
         result |= re.VERBOSE
     return result
+
+
+def _extract_pattern_flags(
+    value: Any,
+    args: list[AstNode],
+    ctx: EvalContext,
+    eval_fn: EvalFunc,
+) -> tuple[str, str]:
+    """Extract pattern and flags from match/test/sub arguments.
+
+    Handles both match("pattern"; "flags") and match(["pattern", "flags"]) forms.
+    """
+    patterns = eval_fn(value, args[0], ctx)
+    pat_val = patterns[0] if patterns else ""
+
+    if isinstance(pat_val, list):
+        # ["pattern", "flags"] form
+        pattern = str(pat_val[0]) if pat_val else ""
+        flags_str = str(pat_val[1]) if len(pat_val) > 1 else ""
+    else:
+        pattern = str(pat_val) if pat_val is not None else ""
+        flags_str = ""
+
+    # Also check for explicit flags argument
+    if len(args) > 1:
+        flags_val = eval_fn(value, args[1], ctx)
+        if flags_val:
+            flags_str = str(flags_val[0]) if flags_val[0] is not None else flags_str
+
+    return pattern, flags_str
+
+
+def _match_to_dict(m: re.Match, pattern: str) -> dict[str, Any]:
+    """Convert a regex match object to jq match dict format."""
+    # Get named groups from pattern
+    named_groups = dict(re.compile(pattern).groupindex)
+    name_by_idx = {v: k for k, v in named_groups.items()}
+
+    captures = []
+    for i in range(1, (m.lastindex or 0) + 1):
+        grp = m.group(i)
+        cap: dict[str, Any] = {
+            "offset": m.start(i) if grp is not None else -1,
+            "length": len(grp) if grp is not None else 0,
+            "string": grp if grp is not None else None,
+            "name": name_by_idx.get(i),
+        }
+        captures.append(cap)
+
+    return {
+        "offset": m.start(),
+        "length": len(m.group()),
+        "string": m.group(),
+        "captures": captures,
+    }

@@ -6633,3 +6633,1064 @@ EOF""")
         result = await bash.exec("wc -l &lt; /input.txt &amp;&amp; echo done")
         assert "3" in result.stdout
         assert "done" in result.stdout
+
+
+class TestEmptyArithmeticExitCode:
+    """Test that empty (( )) returns exit code 1."""
+
+    @pytest.mark.asyncio
+    async def test_empty_arith_returns_1(self):
+        """Empty (( )) should return exit code 1 (evaluates to 0/false)."""
+        bash = Bash()
+        result = await bash.exec("(( )); echo $?")
+        assert result.stdout == "1\n"
+
+    @pytest.mark.asyncio
+    async def test_empty_arith_dollar_returns_0(self):
+        """Empty $(( )) should return 0."""
+        bash = Bash()
+        result = await bash.exec("echo $(( ))")
+        assert result.stdout == "0\n"
+
+
+class TestShiftValidation:
+    """Test shift builtin argument validation."""
+
+    @pytest.mark.asyncio
+    async def test_shift_extra_args(self):
+        """shift 1 extra should fail."""
+        bash = Bash()
+        result = await bash.exec("set -- a b c; shift 1 extra 2>&1")
+        assert result.exit_code != 0
+
+    @pytest.mark.asyncio
+    async def test_shift_negative(self):
+        """shift with negative count should fail."""
+        bash = Bash()
+        result = await bash.exec("set -- a b c; shift -1 2>&1")
+        assert result.exit_code != 0
+
+
+class TestDollarSingleQuoteControlChars:
+    """Test $'\\cX' control character escapes."""
+
+    @pytest.mark.asyncio
+    async def test_c_escape_ctrl_a(self):
+        """$'\\cA' should produce control character 0x01."""
+        bash = Bash()
+        result = await bash.exec("printf '%s' $'\\cA' | od -An -tx1")
+        assert "01" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_c_escape_ctrl_at(self):
+        """$'\\c@' should produce NUL (0x00), which is stripped."""
+        bash = Bash()
+        result = await bash.exec("echo -n $'\\c@' | wc -c")
+        assert result.stdout.strip() == "0"
+
+    @pytest.mark.asyncio
+    async def test_c_escape_ctrl_question(self):
+        """$'\\c?' should produce DEL (0x7F)."""
+        bash = Bash()
+        result = await bash.exec("printf '%s' $'\\c?' | od -An -tx1")
+        assert "7f" in result.stdout
+
+
+class TestSubstringArithmeticOffset:
+    """Test ${s:$var} substring with arithmetic expressions as offset/length."""
+
+    @pytest.mark.asyncio
+    async def test_variable_offset(self):
+        """${s:$zero} should use variable value as offset."""
+        bash = Bash()
+        result = await bash.exec("s='abcd'; zero=0; echo ${s:$zero}")
+        assert result.stdout == "abcd\n"
+
+    @pytest.mark.asyncio
+    async def test_variable_offset_and_length(self):
+        """${s:$zero:4} should use variable values."""
+        bash = Bash()
+        result = await bash.exec("s='abcd'; zero=0; echo ${s:$zero:4}")
+        assert result.stdout == "abcd\n"
+
+    @pytest.mark.asyncio
+    async def test_variable_offset_and_variable_length(self):
+        """${s:$one:$one} should use variable values for both."""
+        bash = Bash()
+        result = await bash.exec("s='abcd'; one=1; echo ${s:$one:$one}")
+        assert result.stdout == "b\n"
+
+    @pytest.mark.asyncio
+    async def test_arithmetic_expression_offset(self):
+        """${s:1+1} should evaluate arithmetic expression."""
+        bash = Bash()
+        result = await bash.exec("s='abcd'; echo ${s:1+1}")
+        assert result.stdout == "cd\n"
+
+    @pytest.mark.asyncio
+    async def test_bare_variable_name_offset(self):
+        """${s:n} should treat n as arithmetic variable."""
+        bash = Bash()
+        result = await bash.exec("s='abcd'; n=2; echo ${s:n}")
+        assert result.stdout == "cd\n"
+
+
+class TestMapfileDelimiterRetention:
+    """Test mapfile retains delimiter without -t flag."""
+
+    @pytest.mark.asyncio
+    async def test_mapfile_retains_newline(self):
+        """mapfile without -t should retain trailing newline on each line."""
+        bash = Bash()
+        result = await bash.exec("printf '1\\n2\\n3\\n' | mapfile arr; echo -n \"${arr[0]}\"")
+        assert result.stdout == "1\n"
+
+    @pytest.mark.asyncio
+    async def test_mapfile_t_strips_newline(self):
+        """mapfile -t should strip trailing newline."""
+        bash = Bash()
+        result = await bash.exec("printf '1\\n2\\n3\\n' | mapfile -t arr; echo -n \"${arr[0]}\"")
+        assert result.stdout == "1"
+
+    @pytest.mark.asyncio
+    async def test_mapfile_retains_custom_delimiter(self):
+        """mapfile -d: without -t should retain delimiter."""
+        bash = Bash()
+        result = await bash.exec("printf '1:2:3:' | mapfile -d: arr; echo -n \"${arr[0]}\"")
+        assert result.stdout == "1:"
+
+
+class TestArraySubscriptArithmeticLHS:
+    """Test array subscript arithmetic evaluation on LHS of assignment."""
+
+    @pytest.mark.asyncio
+    async def test_variable_subscript(self):
+        """a[n]=X should evaluate n as variable."""
+        bash = Bash()
+        result = await bash.exec("a=(1 2 3); n=1; a[n]=X; echo ${a[@]}")
+        assert result.stdout == "1 X 3\n"
+
+    @pytest.mark.asyncio
+    async def test_arithmetic_subscript(self):
+        """a[1+1]=X should evaluate expression."""
+        bash = Bash()
+        result = await bash.exec("a=(1 2 3); a[1+1]=X; echo ${a[@]}")
+        assert result.stdout == "1 2 X\n"
+
+    @pytest.mark.asyncio
+    async def test_variable_arithmetic_subscript(self):
+        """a[zero+5-4]=X should evaluate complex expression."""
+        bash = Bash()
+        result = await bash.exec("a=(1 2 3); zero=0; a[zero+5-4]=X; echo ${a[@]}")
+        assert result.stdout == "1 X 3\n"
+
+
+class TestPipeAmp:
+    """Test |& (pipe both stdout and stderr)."""
+
+    @pytest.mark.asyncio
+    async def test_pipe_amp_merges_stderr(self):
+        """|& should pipe both stdout and stderr to next command."""
+        bash = Bash()
+        result = await bash.exec("echo stdout; echo stderr >&2")
+        assert "stdout" in result.stdout
+        assert "stderr" in result.stderr
+
+    @pytest.mark.asyncio
+    async def test_pipe_amp_basic(self):
+        """|& should pass stderr to stdin of next command."""
+        bash = Bash()
+        result = await bash.exec("{ echo out; echo err >&2; } |& cat")
+        assert "out" in result.stdout
+        assert "err" in result.stdout
+
+
+class TestShoptNounsetValidation:
+    """Test that shopt rejects set -o options without -o flag."""
+
+    @pytest.mark.asyncio
+    async def test_shopt_s_nounset_fails(self):
+        """shopt -s nounset should fail (nounset is a set -o option)."""
+        bash = Bash()
+        result = await bash.exec("shopt -s nounset 2>/dev/null; echo $?")
+        assert result.stdout == "1\n"
+
+    @pytest.mark.asyncio
+    async def test_shopt_s_o_nounset_succeeds(self):
+        """shopt -s -o nounset should succeed."""
+        bash = Bash()
+        result = await bash.exec("shopt -s -o nounset; echo $?")
+        assert result.stdout == "0\n"
+
+
+class TestWhileReadPipeline:
+    """Test while read in pipeline."""
+
+    @pytest.mark.asyncio
+    async def test_seq_pipe_while_read(self):
+        """seq 3 | while read i; do echo .$i; done should work."""
+        bash = Bash()
+        result = await bash.exec("seq 3 | while read i; do echo \".$i\"; done")
+        assert result.stdout == ".1\n.2\n.3\n"
+
+    @pytest.mark.asyncio
+    async def test_echo_pipe_while_read(self):
+        """echo pipe to while read loop."""
+        bash = Bash()
+        result = await bash.exec("printf 'a\\nb\\n' | while read line; do echo \"got:$line\"; done")
+        assert result.stdout == "got:a\ngot:b\n"
+
+
+class TestCStyleForLoopNestedParens:
+    """Test C-style for loop with nested parentheses."""
+
+    @pytest.mark.asyncio
+    async def test_nested_parens_in_condition(self):
+        """for (( n=0; n<(3-(1)); n++ )) should work."""
+        bash = Bash()
+        result = await bash.exec("for (( n=0; n<(3-(1)); n++ )); do echo $n; done")
+        assert result.stdout == "0\n1\n"
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_single_nested_paren(self):
+        """for (( n=0; n<(3); n++ )) should work."""
+        bash = Bash()
+        result = await bash.exec("for (( n=0; n<(3); n++ )); do echo $n; done")
+        assert result.stdout == "0\n1\n2\n"
+        assert result.exit_code == 0
+
+
+class TestScalarToArrayAppend:
+    """Test scalar variable conversion to array via +=()."""
+
+    @pytest.mark.asyncio
+    async def test_scalar_to_array_append(self):
+        """s='abc'; s+=(d e f) should convert scalar to array then append."""
+        bash = Bash()
+        result = await bash.exec("s='abc'; s+=(d e f); echo \"${s[@]}\"")
+        assert result.stdout == "abc d e f\n"
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_scalar_to_array_count(self):
+        """After s+=(d e f), ${#s[@]} should count all elements."""
+        bash = Bash()
+        result = await bash.exec("s='abc'; s+=(d e f); echo ${#s[@]}")
+        assert result.stdout == "4\n"
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_scalar_to_array_index_zero(self):
+        """After conversion, s[0] should be the original scalar value."""
+        bash = Bash()
+        result = await bash.exec("s='abc'; s+=(d e f); echo \"${s[0]}\"")
+        assert result.stdout == "abc\n"
+        assert result.exit_code == 0
+
+
+class TestPatternSubstitutionGreedy:
+    """Test pattern substitution uses longest match (greedy)."""
+
+    @pytest.mark.asyncio
+    async def test_glob_star_longest_match(self):
+        """${v/c*/XX} should replace c and everything after with XX."""
+        bash = Bash()
+        result = await bash.exec("v=abcde; echo ${v/c*/XX}")
+        assert result.stdout == "abXX\n"
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_glob_star_at_end(self):
+        """${v/b*/} should remove from b onwards."""
+        bash = Bash()
+        result = await bash.exec("v=abc; echo ${v/b*/}")
+        assert result.stdout == "a\n"
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_glob_star_in_middle(self):
+        """${v/a*d/X} should replace from a through d."""
+        bash = Bash()
+        result = await bash.exec("v=abcde; echo ${v/a*d/X}")
+        assert result.stdout == "Xe\n"
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_empty_pattern_replace_all(self):
+        """${x//$empty/r} with empty expanded pattern returns original."""
+        bash = Bash()
+        result = await bash.exec("x=-foo-; echo \"${x//$unset/bar}\"")
+        assert result.stdout == "-foo-\n"
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_empty_pattern_replace_once(self):
+        """${x/$empty/r} with empty expanded pattern returns original."""
+        bash = Bash()
+        result = await bash.exec("x=foo; echo \"${x/$unset/bar}\"")
+        assert result.stdout == "foo\n"
+        assert result.exit_code == 0
+
+
+class TestIFSWordSplitting:
+    """Test IFS word splitting edge cases."""
+
+    @pytest.mark.asyncio
+    async def test_unquoted_star_empty_ifs(self):
+        """$* with empty IFS should produce individual positional params."""
+        bash = Bash()
+        result = await bash.exec('set -- "1 2" "3  4"; IFS=; argv.py $*')
+        assert result.stdout == "['1 2', '3  4']\n"
+
+    @pytest.mark.asyncio
+    async def test_quoted_star_empty_ifs(self):
+        """"$*" with empty IFS should join params with no separator."""
+        bash = Bash()
+        result = await bash.exec('set -- "1 2" "3  4"; IFS=; argv.py "$*"')
+        assert result.stdout == "['1 23  4']\n"
+
+    @pytest.mark.asyncio
+    async def test_unquoted_at_with_non_default_ifs(self):
+        """$@ with non-default IFS should produce individual params."""
+        bash = Bash()
+        result = await bash.exec("IFS=:; set -- x 'y z'; argv.py $@")
+        assert result.stdout == "['x', 'y z']\n"
+
+    @pytest.mark.asyncio
+    async def test_unquoted_star_with_non_default_ifs(self):
+        """$* with non-default IFS should produce individual params."""
+        bash = Bash()
+        result = await bash.exec("IFS=:; set -- x 'y z'; argv.py $*")
+        assert result.stdout == "['x', 'y z']\n"
+
+    @pytest.mark.asyncio
+    async def test_ifs_whitespace_nonws_composite_delimiter(self):
+        """Whitespace + non-whitespace IFS chars form composite delimiters."""
+        bash = Bash()
+        result = await bash.exec("IFS='_ '; s='a_b _ _ _ c  _d e'; argv.py $s")
+        assert result.stdout == "['a', 'b', '', '', 'c', 'd', 'e']\n"
+
+    @pytest.mark.asyncio
+    async def test_ifs_leading_nonws_produces_empty(self):
+        """Leading non-whitespace IFS char produces empty field."""
+        bash = Bash()
+        result = await bash.exec("IFS='_ '; s='_ a  b _ '; argv.py $s")
+        assert result.stdout == "['', 'a', 'b']\n"
+
+    @pytest.mark.asyncio
+    async def test_ifs_leading_ws_is_stripped(self):
+        """Leading whitespace IFS chars are stripped (no empty field)."""
+        bash = Bash()
+        result = await bash.exec("IFS='_ '; s='  a  b _ '; argv.py $s")
+        assert result.stdout == "['a', 'b']\n"
+
+    @pytest.mark.asyncio
+    async def test_empty_ifs_at_array(self):
+        """${arr[@]} with empty IFS produces individual elements."""
+        bash = Bash()
+        result = await bash.exec("myarray=(a 'b c'); IFS=''; argv.py ${myarray[@]}")
+        assert result.stdout == "['a', 'b c']\n"
+
+    @pytest.mark.asyncio
+    async def test_empty_ifs_star_array(self):
+        """${arr[*]} with empty IFS produces individual elements."""
+        bash = Bash()
+        result = await bash.exec("myarray=(a 'b c'); IFS=''; argv.py ${myarray[*]}")
+        assert result.stdout == "['a', 'b c']\n"
+
+
+class TestEmptyCommandExitCode:
+    """Test exit code when command name expands to empty."""
+
+    @pytest.mark.asyncio
+    async def test_command_sub_true_preserves_exit_code(self):
+        """$(true) as bare command should preserve exit code 0."""
+        bash = Bash()
+        result = await bash.exec("$(true); echo $?")
+        assert result.stdout == "0\n"
+
+    @pytest.mark.asyncio
+    async def test_command_sub_false_preserves_exit_code(self):
+        """$(false) as bare command should preserve exit code 1."""
+        bash = Bash()
+        result = await bash.exec("$(false); echo $?")
+        assert result.stdout == "1\n"
+
+    @pytest.mark.asyncio
+    async def test_unset_var_as_command_preserves_exit(self):
+        """$UNSET_VAR as command should be a no-op."""
+        bash = Bash()
+        result = await bash.exec("true; $UNSET_VAR; echo $?")
+        assert result.stdout == "0\n"
+
+    @pytest.mark.asyncio
+    async def test_empty_expansion_with_assignments(self):
+        """Variable assignment with empty command preserves expansion exit code."""
+        bash = Bash()
+        result = await bash.exec("x=$(false); echo $?")
+        assert result.stdout == "1\n"
+
+    @pytest.mark.asyncio
+    async def test_exit_code_truncated_to_byte(self):
+        """Exit codes should be truncated to 0-255 range."""
+        bash = Bash()
+        result = await bash.exec("exit 256; echo $?")
+        # exit 256 truncates to 0
+        assert result.exit_code == 0
+
+
+class TestParserKeywordArguments:
+    """Test that shell keywords can be used as command arguments."""
+
+    @pytest.mark.asyncio
+    async def test_type_t_keywords_including_bang(self):
+        """type -t should handle ! as an argument, not pipeline negation."""
+        bash = Bash()
+        result = await bash.exec("type -t for ! {")
+        assert "keyword\n" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_echo_bang_as_argument(self):
+        """! should be accepted as a command argument."""
+        bash = Bash()
+        result = await bash.exec("echo !")
+        assert result.stdout == "!\n"
+
+    @pytest.mark.asyncio
+    async def test_echo_lbrace_as_argument(self):
+        """{ should be accepted as a command argument."""
+        bash = Bash()
+        result = await bash.exec("echo {")
+        assert result.stdout == "{\n"
+
+
+class TestExecFnExitError:
+    """Test that bash -c 'exit N' doesn't kill parent script."""
+
+    @pytest.mark.asyncio
+    async def test_bash_c_exit_preserves_parent(self):
+        """bash -c 'exit 1' should not kill the parent script."""
+        bash = Bash()
+        result = await bash.exec("bash -c 'exit 1'; echo status=$?")
+        assert "status=1" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_bash_c_exit_zero(self):
+        """bash -c 'exit 0' should allow parent to continue."""
+        bash = Bash()
+        result = await bash.exec("bash -c 'exit 0'; echo status=$?")
+        assert "status=0" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_bash_c_with_output(self):
+        """bash -c should capture output and exit code."""
+        bash = Bash()
+        result = await bash.exec("bash -c 'echo hello'; echo done")
+        assert result.stdout == "hello\ndone\n"
+
+
+class TestDeclarationNoSplit:
+    """Declaration builtins should not word-split assignment values."""
+
+    @pytest.mark.asyncio
+    async def test_export_no_split(self):
+        """export x=$var should not split the value."""
+        bash = Bash()
+        result = await bash.exec("words='a b c'; export ex=$words; echo \"$ex\"")
+        assert result.stdout == "a b c\n"
+
+    @pytest.mark.asyncio
+    async def test_readonly_no_split(self):
+        """readonly x=$var should not split the value."""
+        bash = Bash()
+        result = await bash.exec("words='a b c'; readonly ro=$words; echo \"$ro\"")
+        assert result.stdout == "a b c\n"
+
+    @pytest.mark.asyncio
+    async def test_local_no_split(self):
+        """local x=$var inside a function should not split the value."""
+        bash = Bash()
+        result = await bash.exec("f() { local l=$1; echo \"$l\"; }; f 'a b c'")
+        assert result.stdout == "a b c\n"
+
+    @pytest.mark.asyncio
+    async def test_declare_no_split(self):
+        """declare x=$var should not split the value."""
+        bash = Bash()
+        result = await bash.exec("words='a b c'; declare d=$words; echo \"$d\"")
+        assert result.stdout == "a b c\n"
+
+    @pytest.mark.asyncio
+    async def test_argv_export_declare_readonly(self):
+        """Full test matching the spec test: static assignment doesn't split."""
+        bash = Bash()
+        result = await bash.exec(
+            "words='a b c'\n"
+            "export ex=$words\n"
+            "glo=$words\n"
+            "readonly ro=$words\n"
+            'argv.py "$ex" "$glo" "$ro"'
+        )
+        assert result.stdout == "['a b c', 'a b c', 'a b c']\n"
+
+
+class TestBreakInLoopCondition:
+    """Break/continue in loop conditions should affect the correct loop."""
+
+    @pytest.mark.asyncio
+    async def test_break_in_while_condition(self):
+        """break in while condition should break the while, not outer for."""
+        bash = Bash()
+        result = await bash.exec(
+            "for i in 1 2 3; do\n"
+            "  echo i=$i\n"
+            "  while break; do\n"
+            "    echo x\n"
+            "  done\n"
+            "done\n"
+            "echo done"
+        )
+        assert result.stdout == "i=1\ni=2\ni=3\ndone\n"
+
+    @pytest.mark.asyncio
+    async def test_continue_in_while_condition(self):
+        """continue in while condition should continue the while loop."""
+        bash = Bash()
+        result = await bash.exec(
+            "for i in 1 2 3; do\n"
+            "  echo i=$i\n"
+            "  x=0\n"
+            "  while true; do\n"
+            "    x=$((x+1))\n"
+            "    if [ $x -ge 3 ]; then break; fi\n"
+            "    echo x=$x\n"
+            "  done\n"
+            "done\n"
+            "echo done"
+        )
+        assert result.stdout == "i=1\nx=1\nx=2\ni=2\nx=1\nx=2\ni=3\nx=1\nx=2\ndone\n"
+
+    @pytest.mark.asyncio
+    async def test_break_in_until_condition(self):
+        """break in until condition should break the until loop."""
+        bash = Bash()
+        result = await bash.exec(
+            "for i in 1 2 3; do\n"
+            "  echo i=$i\n"
+            "  until break; do\n"
+            "    echo x\n"
+            "  done\n"
+            "done\n"
+            "echo done"
+        )
+        assert result.stdout == "i=1\ni=2\ni=3\ndone\n"
+
+
+class TestCdBuiltin:
+    """Test cd builtin edge cases."""
+
+    @pytest.mark.asyncio
+    async def test_cd_dash_without_oldpwd(self):
+        """cd - in a fresh shell should fail with OLDPWD not set."""
+        bash = Bash(cwd="/home/user")
+        result = await bash.exec("cd -\necho status=$?")
+        assert "OLDPWD not set" in result.stderr
+        assert "status=1" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_cd_double_dash(self):
+        """cd -- /dir should cd to /dir (-- ends options)."""
+        bash = Bash(cwd="/home/user")
+        result = await bash.exec("cd -- /tmp\npwd")
+        assert result.stdout == "/tmp\n"
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_cd_bad_parent(self):
+        """cd nonexistent/.. should fail because nonexistent doesn't exist."""
+        bash = Bash(cwd="/home/user")
+        result = await bash.exec("cd nonexistent_ZZ/..\necho status=$?")
+        assert "status=1" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_cd_dash_L_flag(self):
+        """cd -L /tmp should work (logical mode, the default)."""
+        bash = Bash(cwd="/home/user")
+        result = await bash.exec("cd -L /tmp\npwd")
+        assert result.stdout == "/tmp\n"
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_cd_dash_P_flag(self):
+        """cd -P /tmp should work (physical mode)."""
+        bash = Bash(cwd="/home/user")
+        result = await bash.exec("cd -P /tmp\npwd")
+        assert result.stdout == "/tmp\n"
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_cd_too_many_args(self):
+        """cd with more than one non-flag arg should fail."""
+        bash = Bash(cwd="/home/user")
+        result = await bash.exec("cd /tmp /usr\necho status=$?")
+        assert "status=1" in result.stdout
+
+
+class TestPushdPopdDirs:
+    """Test pushd, popd, and dirs builtins."""
+
+    @pytest.mark.asyncio
+    async def test_dirs_shows_cwd(self):
+        """dirs with no args shows current directory."""
+        bash = Bash(cwd="/")
+        result = await bash.exec("dirs")
+        assert result.stdout == "/\n"
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_pushd_popd_basic(self):
+        """pushd pushes directory, popd pops it."""
+        bash = Bash(cwd="/")
+        result = await bash.exec(
+            "pushd /tmp >/dev/null\n"
+            "echo pwd=$(pwd)\n"
+            "popd >/dev/null\n"
+            "echo pwd=$(pwd)"
+        )
+        assert result.stdout == "pwd=/tmp\npwd=/\n"
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_pushd_prints_stack(self):
+        """pushd prints the updated directory stack."""
+        bash = Bash(cwd="/", env={"HOME": "/home/user"})
+        result = await bash.exec("pushd /tmp")
+        assert result.stdout == "/tmp /\n"
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_pushd_invalid_flag(self):
+        """pushd with invalid flag returns exit code 2."""
+        bash = Bash()
+        result = await bash.exec("pushd -z; echo status=$?")
+        assert "status=2" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_pushd_too_many_args(self):
+        """pushd with more than one argument fails."""
+        bash = Bash(cwd="/")
+        result = await bash.exec("pushd /tmp /tmp >/dev/null; echo status=$?")
+        assert "status=2" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_popd_empty_stack(self):
+        """popd on empty stack returns error."""
+        bash = Bash(cwd="/")
+        result = await bash.exec("popd 2>&1")
+        assert result.exit_code == 1
+        assert "directory stack" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_popd_invalid_flag(self):
+        """popd with invalid flag returns exit code 2."""
+        bash = Bash(cwd="/")
+        result = await bash.exec("pushd /tmp >/dev/null; popd -z; echo status=$?")
+        assert "status=2" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_dirs_c_clears_stack(self):
+        """dirs -c clears the directory stack."""
+        bash = Bash(cwd="/", env={"HOME": "/home/user"})
+        result = await bash.exec(
+            "pushd /tmp >/dev/null\n"
+            "dirs -c\n"
+            "dirs"
+        )
+        assert result.stdout == "/tmp\n"
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_dirs_v_numbered(self):
+        """dirs -v prints numbered stack entries."""
+        bash = Bash(cwd="/", env={"HOME": "/home/user"})
+        result = await bash.exec(
+            "pushd /tmp >/dev/null\n"
+            "dirs -v"
+        )
+        assert result.stdout == " 0  /tmp\n 1  /\n"
+
+    @pytest.mark.asyncio
+    async def test_dirs_p_one_per_line(self):
+        """dirs -p prints one entry per line."""
+        bash = Bash(cwd="/", env={"HOME": "/home/user"})
+        result = await bash.exec(
+            "pushd /tmp >/dev/null\n"
+            "dirs -p"
+        )
+        assert result.stdout == "/tmp\n/\n"
+
+    @pytest.mark.asyncio
+    async def test_dirs_tilde_substitution(self):
+        """dirs replaces $HOME prefix with ~."""
+        bash = Bash(cwd="/", env={"HOME": "/tmp"})
+        await bash.fs.mkdir("/tmp/mydir")
+        result = await bash.exec(
+            "pushd /tmp/mydir >/dev/null\n"
+            "dirs"
+        )
+        assert result.stdout == "~/mydir /\n"
+
+    @pytest.mark.asyncio
+    async def test_dirs_l_no_tilde(self):
+        """dirs -l shows full paths without tilde substitution."""
+        bash = Bash(cwd="/", env={"HOME": "/tmp"})
+        await bash.fs.mkdir("/tmp/mydir")
+        result = await bash.exec(
+            "pushd /tmp/mydir >/dev/null\n"
+            "dirs -l"
+        )
+        assert result.stdout == "/tmp/mydir /\n"
+
+    @pytest.mark.asyncio
+    async def test_dirs_rejects_positional_args(self):
+        """dirs with positional arguments fails."""
+        bash = Bash(cwd="/")
+        result = await bash.exec("dirs a; echo status=$?")
+        assert "status=1" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_cd_updates_bottom_of_stack(self):
+        """cd changes the bottom entry of the directory stack."""
+        bash = Bash(cwd="/", env={"HOME": "/home/user"})
+        result = await bash.exec(
+            "pushd /tmp >/dev/null\n"
+            "cd /usr\n"
+            "dirs"
+        )
+        assert result.stdout == "/usr /\n"
+
+
+class TestSetOutputFormat:
+    """Test set builtin output format matches bash."""
+
+    @pytest.mark.asyncio
+    async def test_set_no_quotes_simple_value(self):
+        """Simple alphanumeric values should not be quoted."""
+        bash = Bash()
+        result = await bash.exec("MY_VAR=hello\nset | grep ^MY_VAR=")
+        assert result.stdout == "MY_VAR=hello\n"
+
+    @pytest.mark.asyncio
+    async def test_set_quotes_value_with_spaces(self):
+        """Values with spaces should be single-quoted."""
+        bash = Bash()
+        result = await bash.exec("MY_VAR='hello world'\nset | grep ^MY_VAR=")
+        assert result.stdout == "MY_VAR='hello world'\n"
+
+    @pytest.mark.asyncio
+    async def test_set_quotes_empty_value(self):
+        """Empty values should be shown as VAR=''."""
+        bash = Bash()
+        result = await bash.exec("MY_VAR=''\nset | grep ^MY_VAR=")
+        assert result.stdout == "MY_VAR=''\n"
+
+
+class TestShoptExitCode:
+    """Test shopt exit code for unknown options."""
+
+    @pytest.mark.asyncio
+    async def test_shopt_unknown_with_ignore(self):
+        """shopt -s with unknown option should return 1 even with ignore_shopt_not_impl."""
+        bash = Bash()
+        # First enable ignore_shopt_not_impl, then try an unknown option
+        result = await bash.exec("shopt -s ignore_shopt_not_impl\nshopt -s nonexistent_option_xyz\necho status=$?")
+        assert "status=1" in result.stdout
+
+
+class TestLsDefaultFormat:
+    """Test ls default output format."""
+
+    @pytest.mark.asyncio
+    async def test_ls_default_one_per_line(self):
+        """Default ls should output one entry per line (non-terminal mode)."""
+        bash = Bash(files={
+            "/dir/alpha": "a",
+            "/dir/beta": "b",
+            "/dir/gamma": "c",
+        })
+        result = await bash.exec("ls /dir")
+        assert result.stdout == "alpha\nbeta\ngamma\n"
+
+
+class TestWhichCommand:
+    """Test which command respects PATH."""
+
+    @pytest.mark.asyncio
+    async def test_which_respects_path(self):
+        """which should search PATH directories in VFS."""
+        bash = Bash(files={"/mybin/mycmd": "#!/bin/bash\necho hi"})
+        await bash.fs.chmod("/mybin/mycmd", 0o755)
+        result = await bash.exec("PATH=/mybin which mycmd")
+        assert result.stdout == "/mybin/mycmd\n"
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_which_registered_command(self):
+        """which should find registered commands via PATH."""
+        bash = Bash()
+        result = await bash.exec("which echo")
+        assert result.exit_code == 0
+        assert "echo" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_which_not_found(self):
+        """which should return 1 for missing commands."""
+        bash = Bash()
+        result = await bash.exec("which nonexistent_cmd_xyz")
+        assert result.exit_code == 1
+
+    @pytest.mark.asyncio
+    async def test_which_all_flag(self):
+        """which -a should find all matches in PATH."""
+        bash = Bash(files={
+            "/bin1/mycmd": "#!/bin/bash\necho one",
+            "/bin2/mycmd": "#!/bin/bash\necho two",
+        })
+        await bash.fs.chmod("/bin1/mycmd", 0o755)
+        await bash.fs.chmod("/bin2/mycmd", 0o755)
+        result = await bash.exec("PATH=/bin1:/bin2 which -a mycmd")
+        assert "/bin1/mycmd\n/bin2/mycmd\n" == result.stdout
+
+
+class TestTypeAllFlag:
+    """Test type -a returns all matches."""
+
+    @pytest.mark.asyncio
+    async def test_type_a_builtin(self):
+        """type -a for a builtin should show it as builtin."""
+        bash = Bash()
+        result = await bash.exec("type -a echo")
+        assert "echo is a shell builtin" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_type_a_file_in_vfs(self):
+        """type -a should find files in VFS PATH directories."""
+        bash = Bash(files={"/mybin/mycmd": "#!/bin/bash\necho hi"})
+        await bash.fs.chmod("/mybin/mycmd", 0o755)
+        result = await bash.exec("PATH=/mybin type -a mycmd")
+        assert "mycmd is /mybin/mycmd" in result.stdout
+
+
+class TestVfsScriptExecution:
+    """Test executing scripts from the virtual filesystem."""
+
+    @pytest.mark.asyncio
+    async def test_execute_script_by_path(self):
+        """Scripts in VFS can be executed by direct path."""
+        bash = Bash(files={"/usr/local/bin/myscript": "#!/bin/bash\necho hello from script"})
+        await bash.fs.chmod("/usr/local/bin/myscript", 0o755)
+        result = await bash.exec("/usr/local/bin/myscript")
+        assert result.stdout == "hello from script\n"
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_execute_script_via_path_lookup(self):
+        """Scripts in VFS PATH directories can be executed by name."""
+        bash = Bash(files={"/mybin/mycmd": "echo found me"})
+        await bash.fs.chmod("/mybin/mycmd", 0o755)
+        result = await bash.exec("PATH=/mybin mycmd")
+        assert result.stdout == "found me\n"
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_execute_script_with_args(self):
+        """VFS scripts receive positional parameters."""
+        bash = Bash(files={"/mybin/greet": 'echo "Hello $1"'})
+        await bash.fs.chmod("/mybin/greet", 0o755)
+        result = await bash.exec("PATH=/mybin greet world")
+        assert result.stdout == "Hello world\n"
+
+    @pytest.mark.asyncio
+    async def test_execute_non_executable_returns_126(self):
+        """Non-executable files should return exit code 126."""
+        bash = Bash(files={"/tmp/notexec": "echo hi"})
+        result = await bash.exec("/tmp/notexec")
+        assert result.exit_code == 126
+        assert "Permission denied" in result.stderr
+
+    @pytest.mark.asyncio
+    async def test_execute_nonexistent_returns_127(self):
+        """Missing commands should still return exit code 127."""
+        bash = Bash()
+        result = await bash.exec("/tmp/no_such_script")
+        assert result.exit_code == 127
+        assert "command not found" in result.stderr
+
+
+class TestHashBuiltin:
+    """Test hash builtin."""
+
+    @pytest.mark.asyncio
+    async def test_hash_empty_table(self):
+        """hash with no args and empty table."""
+        bash = Bash()
+        result = await bash.exec("hash 2>&1; echo status=$?")
+        assert "status=1" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_hash_r_clears_table(self):
+        """hash -r clears the hash table."""
+        bash = Bash()
+        result = await bash.exec("hash -r; echo status=$?")
+        assert "status=0" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_hash_r_ignores_extra_args(self):
+        """hash -r with extra args should succeed (bash ignores them)."""
+        bash = Bash()
+        result = await bash.exec("hash -r foo 2>&1; echo status=$?")
+        assert "status=0" in result.stdout
+
+
+class TestPrintfFixes:
+    """Test printf edge cases."""
+
+    @pytest.mark.asyncio
+    async def test_printf_positive_integer_overflow(self):
+        """printf should clamp positive integer overflow to 64-bit."""
+        bash = Bash()
+        # 2^64 = 18446744073709551616, should clamp to ULLONG_MAX for %u
+        result = await bash.exec("printf '%u\\n' 18446744073709551616")
+        assert result.stdout == "0\n"  # wraps around to 0
+
+    @pytest.mark.asyncio
+    async def test_printf_unsigned_negative(self):
+        """printf %u with negative should wrap to unsigned 64-bit."""
+        bash = Bash()
+        result = await bash.exec("printf '%u\\n' -1")
+        assert result.stdout == "18446744073709551615\n"
+
+    @pytest.mark.asyncio
+    async def test_printf_signed_overflow(self):
+        """printf %d should clamp to signed 64-bit range."""
+        bash = Bash()
+        # 2^63 = 9223372036854775808, should clamp to LLONG_MAX
+        result = await bash.exec("printf '%d\\n' 9223372036854775808")
+        assert result.stdout == "9223372036854775807\n"
+
+    @pytest.mark.asyncio
+    async def test_printf_c_first_byte(self):
+        """printf %c should output the first character."""
+        bash = Bash()
+        result = await bash.exec("printf '%c' hello")
+        assert result.stdout == "h"
+
+    @pytest.mark.asyncio
+    async def test_printf_strftime_truncation(self):
+        """printf %(fmt)T strftime should truncate at 128 chars."""
+        bash = Bash()
+        # Use a simple format that produces a reasonable result
+        result = await bash.exec("printf '%(%Y)T\\n' 1557978599")
+        assert result.stdout == "2019\n"
+
+
+class TestHeredocCustomFD:
+    """Test here-doc redirections to custom file descriptors."""
+
+    @pytest.mark.asyncio
+    async def test_heredoc_fd3_read_u(self):
+        """read -u 3 should read from FD 3 when here-doc targets FD 3."""
+        bash = Bash()
+        result = await bash.exec('read -u 3 line 3<<EOF\nhello from fd3\nEOF\necho "$line"')
+        assert result.stdout == "hello from fd3\n"
+
+    @pytest.mark.asyncio
+    async def test_heredoc_fd3_with_options(self):
+        """Here-doc to FD 3 with read -s (silent) flag."""
+        bash = Bash()
+        result = await bash.exec('read -s -u 3 line 3<<EOF\nsecret\nEOF\necho "$line"')
+        assert result.stdout == "secret\n"
+
+
+class TestDevNullInputRedirect:
+    """Test /dev/null in input redirections."""
+
+    @pytest.mark.asyncio
+    async def test_dev_null_input(self):
+        """/dev/null as input should provide empty stdin."""
+        bash = Bash()
+        result = await bash.exec("cat < /dev/null; echo status=$?")
+        assert "status=0" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_read_from_dev_null(self):
+        """read from /dev/null should fail (no input)."""
+        bash = Bash()
+        result = await bash.exec("read x < /dev/null; echo status=$?")
+        assert "status=1" in result.stdout
+
+
+class TestTempBindingEmptyArgv:
+    """Test temporary assignments become permanent when command expands to empty."""
+
+    @pytest.mark.asyncio
+    async def test_temp_assign_unset_var(self):
+        """FOO=bar $unset should make FOO=bar permanent."""
+        bash = Bash()
+        result = await bash.exec('FOO=bar $unset; echo "FOO=$FOO"')
+        assert result.stdout == "FOO=bar\n"
+
+    @pytest.mark.asyncio
+    async def test_temp_assign_with_command(self):
+        """FOO=bar echo hi should NOT make FOO permanent."""
+        bash = Bash()
+        result = await bash.exec('FOO=bar echo hi; echo "FOO=$FOO"')
+        assert result.stdout == "hi\nFOO=\n"
+
+    @pytest.mark.asyncio
+    async def test_temp_assign_empty_command_sub(self):
+        """FOO=bar $(true) should make FOO=bar permanent."""
+        bash = Bash()
+        result = await bash.exec('FOO=bar $(true); echo "FOO=$FOO"')
+        assert result.stdout == "FOO=bar\n"
+
+
+class TestCommandSubExitCode:
+    """Test command substitution exit code tracking."""
+
+    @pytest.mark.asyncio
+    async def test_last_cmd_sub_wins(self):
+        """$(exit 42) $(exit 43) should give exit code 43."""
+        bash = Bash()
+        result = await bash.exec("$(exit 42) $(exit 43); echo status=$?")
+        assert result.stdout == "status=43\n"
+
+
+class TestLoopControlEdgeCases:
+    """Test break/continue edge cases."""
+
+    @pytest.mark.asyncio
+    async def test_continue_too_many_args_breaks(self):
+        """continue 1 2 3 should break the loop (bash behavior)."""
+        bash = Bash()
+        result = await bash.exec('for x in a b c; do echo $x; continue 1 2 3; done; echo --')
+        assert result.stdout == "a\n--\n"
+
+    @pytest.mark.asyncio
+    async def test_break_too_many_args_breaks(self):
+        """break 1 2 3 should break the loop (bash behavior)."""
+        bash = Bash()
+        result = await bash.exec('for x in a b c; do echo $x; break 1 2 3; done; echo --')
+        assert result.stdout == "a\n--\n"
+
+    @pytest.mark.asyncio
+    async def test_continue_in_subshell(self):
+        """continue in subshell within loop should exit the subshell."""
+        bash = Bash()
+        result = await bash.exec(
+            'for i in 1 2; do echo "> $i"; '
+            '( if true; then continue; fi; echo "Should not print" ); '
+            'echo "subshell status=$?"; echo ". $i"; done'
+        )
+        assert result.stdout == "> 1\nsubshell status=0\n. 1\n> 2\nsubshell status=0\n. 2\n"

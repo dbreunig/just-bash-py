@@ -8,9 +8,78 @@ from typing import Any
 
 from .builtins import call_builtin
 from .types import (
+    ArrayDestructure,
     AstNode,
     EvalContext,
+    FuncDef,
+    JqError,
+    ObjectDestructure,
 )
+
+
+class BreakException(Exception):
+    """Exception for label/break control flow."""
+
+    def __init__(self, name: str, values: list | None = None):
+        self.name = name
+        self.values: list = values or []
+        super().__init__(f"break {name}")
+
+
+def _pattern_matches(
+    pattern: str | ArrayDestructure | ObjectDestructure,
+    value: Any,
+) -> bool:
+    """Check if a value matches a destructuring pattern type."""
+    if isinstance(pattern, str):
+        return True  # Simple $var matches anything
+    if isinstance(pattern, ArrayDestructure):
+        return isinstance(value, list)
+    if isinstance(pattern, ObjectDestructure):
+        return isinstance(value, dict)
+    return True
+
+
+def _bind_pattern(
+    pattern: str | ArrayDestructure | ObjectDestructure,
+    value: Any,
+    base_vars: dict[str, Any],
+) -> dict[str, Any]:
+    """Bind a value to a destructuring pattern, returning updated vars dict."""
+    if isinstance(pattern, str):
+        return {**base_vars, pattern: value}
+    elif isinstance(pattern, ArrayDestructure):
+        new_vars = dict(base_vars)
+        for i, elem in enumerate(pattern.elements):
+            v = value[i] if isinstance(value, list) and i < len(value) else None
+            new_vars = _bind_pattern(elem, v, new_vars)
+        return new_vars
+    elif isinstance(pattern, ObjectDestructure):
+        new_vars = dict(base_vars)
+        for key, pat in pattern.entries:
+            v = value.get(key) if isinstance(value, dict) else None
+            new_vars = _bind_pattern(pat, v, new_vars)
+        return new_vars
+    return base_vars
+
+
+def _jq_type(v: Any) -> str:
+    """Return the jq type name for a value."""
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "boolean"
+    if isinstance(v, int):
+        return "number"
+    if isinstance(v, float):
+        return "number"
+    if isinstance(v, str):
+        return "string"
+    if isinstance(v, list):
+        return "array"
+    if isinstance(v, dict):
+        return "object"
+    return "unknown"
 
 
 def evaluate(
@@ -39,6 +108,7 @@ def evaluate(
             env=ctx.env,
             root=value,
             current_path=[],
+            funcs=ctx.funcs,
         )
 
     return _eval_node(value, ast, ctx)
@@ -57,10 +127,11 @@ def _eval_node(value: Any, ast: AstNode, ctx: EvalContext) -> list[Any]:
         results = []
         for v in bases:
             if isinstance(v, dict):
-                result = v.get(node.name)
-                results.append(result if result is not None else None)
-            else:
+                results.append(v.get(node.name))
+            elif v is None:
                 results.append(None)
+            else:
+                raise ValueError(f"Cannot index {_jq_type(v)} with string \"{node.name}\"")
         return results
 
     elif node_type == "Index":
@@ -87,8 +158,11 @@ def _eval_node(value: Any, ast: AstNode, ctx: EvalContext) -> list[Any]:
         bases = _eval_node(value, node.base, ctx) if node.base else [value]
         results = []
         for v in bases:
-            if not isinstance(v, (list, str)):
+            if v is None:
                 results.append(None)
+                continue
+            if not isinstance(v, (list, str)):
+                raise ValueError(f"Cannot slice {_jq_type(v)}")
                 continue
             length = len(v)
             starts = _eval_node(value, node.start, ctx) if node.start else [0]
@@ -109,6 +183,10 @@ def _eval_node(value: Any, ast: AstNode, ctx: EvalContext) -> list[Any]:
                 results.extend(v)
             elif isinstance(v, dict):
                 results.extend(v.values())
+            elif v is None:
+                raise ValueError("Cannot iterate over null")
+            else:
+                raise ValueError(f"Cannot iterate over {_jq_type(v)} ({json.dumps(v)})")
         return results
 
     elif node_type == "Pipe":
@@ -116,12 +194,19 @@ def _eval_node(value: Any, ast: AstNode, ctx: EvalContext) -> list[Any]:
         left_results = _eval_node(value, node.left, ctx)
         results = []
         for v in left_results:
-            results.extend(_eval_node(v, node.right, ctx))
+            try:
+                results.extend(_eval_node(v, node.right, ctx))
+            except BreakException as e:
+                e.values = results + e.values
+                raise
         return results
 
     elif node_type == "Comma":
         node = ast  # type: CommaNode
-        left_results = _eval_node(value, node.left, ctx)
+        try:
+            left_results = _eval_node(value, node.left, ctx)
+        except BreakException as e:
+            raise
         right_results = _eval_node(value, node.right, ctx)
         return left_results + right_results
 
@@ -202,28 +287,88 @@ def _eval_node(value: Any, ast: AstNode, ctx: EvalContext) -> list[Any]:
         node = ast  # type: TryNode
         try:
             return _eval_node(value, node.body, ctx)
-        except Exception:
+        except JqError as e:
             if node.catch:
-                return _eval_node(value, node.catch, ctx)
+                return _eval_node(e.value, node.catch, ctx)
+            return []
+        except Exception as e:
+            if node.catch:
+                error_val = str(e)
+                return _eval_node(error_val, node.catch, ctx)
             return []
 
     elif node_type == "Call":
         node = ast  # type: CallNode
+        # Check user-defined functions first
+        func_key = f"{node.name}/{len(node.args)}"
+        func_def = ctx.funcs.get(func_key) or ctx.funcs.get(node.name)
+        if func_def:
+            new_funcs = dict(ctx.funcs)
+            # In jq, function args are filters (thunks). When the param is
+            # referenced in the body, it acts as a zero-arg function that
+            # evaluates the arg expression with the current input.
+            for i, param_name in enumerate(func_def.args):
+                if i < len(node.args):
+                    new_funcs[param_name] = FuncDef(
+                        name=param_name, args=[], body=node.args[i]
+                    )
+            new_ctx = EvalContext(
+                vars=dict(ctx.vars),
+                limits=ctx.limits,
+                env=ctx.env,
+                root=ctx.root,
+                current_path=ctx.current_path,
+                funcs=new_funcs,
+            )
+            return _eval_node(value, func_def.body, new_ctx)
         return call_builtin(value, node.name, node.args, ctx, _eval_node)
 
     elif node_type == "VarBind":
         node = ast  # type: VarBindNode
         values = _eval_node(value, node.value, ctx)
         results = []
+        all_patterns = [node.name] + (node.alt_patterns or [])
         for v in values:
-            new_ctx = EvalContext(
-                vars={**ctx.vars, node.name: v},
-                limits=ctx.limits,
-                env=ctx.env,
-                root=ctx.root,
-                current_path=ctx.current_path,
-            )
-            results.extend(_eval_node(value, node.body, new_ctx))
+            if len(all_patterns) > 1:
+                # ?// alternative patterns - try each until one matches
+                matched = False
+                for pat in all_patterns:
+                    if _pattern_matches(pat, v):
+                        new_vars = _bind_pattern(pat, v, ctx.vars)
+                        new_ctx = EvalContext(
+                            vars=new_vars,
+                            limits=ctx.limits,
+                            env=ctx.env,
+                            root=ctx.root,
+                            current_path=ctx.current_path,
+                            funcs=ctx.funcs,
+                        )
+                        results.extend(_eval_node(value, node.body, new_ctx))
+                        matched = True
+                        break
+                if not matched:
+                    # None matched, use last pattern binding with nulls
+                    new_vars = _bind_pattern(all_patterns[-1], v, ctx.vars)
+                    new_ctx = EvalContext(
+                        vars=new_vars,
+                        limits=ctx.limits,
+                        env=ctx.env,
+                        root=ctx.root,
+                        current_path=ctx.current_path,
+                        funcs=ctx.funcs,
+                    )
+                    results.extend(_eval_node(value, node.body, new_ctx))
+            else:
+                new_vars = _bind_pattern(node.name, v, ctx.vars)
+                new_ctx = EvalContext(
+                    vars=new_vars,
+                    limits=ctx.limits,
+                    env=ctx.env,
+                    root=ctx.root,
+                    current_path=ctx.current_path,
+                    funcs=ctx.funcs,
+                )
+                results.extend(_eval_node(value, node.body, new_ctx))
         return results
 
     elif node_type == "VarRef":
@@ -281,16 +426,17 @@ def _eval_node(value: Any, ast: AstNode, ctx: EvalContext) -> list[Any]:
     elif node_type == "Reduce":
         node = ast  # type: ReduceNode
         items = _eval_node(value, node.expr, ctx)
-        accumulator = (
-            _eval_node(value, node.init, ctx)[0] if _eval_node(value, node.init, ctx) else None
-        )
+        init_results = _eval_node(value, node.init, ctx)
+        accumulator = init_results[0] if init_results else None
         for item in items:
+            new_vars = _bind_pattern(node.var_name, item, ctx.vars)
             new_ctx = EvalContext(
-                vars={**ctx.vars, node.var_name: item},
+                vars=new_vars,
                 limits=ctx.limits,
                 env=ctx.env,
                 root=ctx.root,
                 current_path=ctx.current_path,
+                funcs=ctx.funcs,
             )
             update_results = _eval_node(accumulator, node.update, new_ctx)
             accumulator = update_results[0] if update_results else None
@@ -299,15 +445,18 @@ def _eval_node(value: Any, ast: AstNode, ctx: EvalContext) -> list[Any]:
     elif node_type == "Foreach":
         node = ast  # type: ForeachNode
         items = _eval_node(value, node.expr, ctx)
-        state = _eval_node(value, node.init, ctx)[0] if _eval_node(value, node.init, ctx) else None
+        init_results = _eval_node(value, node.init, ctx)
+        state = init_results[0] if init_results else None
         results = []
         for item in items:
+            new_vars = _bind_pattern(node.var_name, item, ctx.vars)
             new_ctx = EvalContext(
-                vars={**ctx.vars, node.var_name: item},
+                vars=new_vars,
                 limits=ctx.limits,
                 env=ctx.env,
                 root=ctx.root,
                 current_path=ctx.current_path,
+                funcs=ctx.funcs,
             )
             state_results = _eval_node(state, node.update, new_ctx)
             state = state_results[0] if state_results else None
@@ -317,6 +466,34 @@ def _eval_node(value: Any, ast: AstNode, ctx: EvalContext) -> list[Any]:
             else:
                 results.append(state)
         return results
+
+    elif node_type == "Def":
+        node = ast  # type: DefNode
+        # Register the function and continue with rest
+        func_key = f"{node.name}/{len(node.args)}"
+        new_ctx = EvalContext(
+            vars=ctx.vars,
+            limits=ctx.limits,
+            env=ctx.env,
+            root=ctx.root,
+            current_path=ctx.current_path,
+            funcs={**ctx.funcs, func_key: FuncDef(node.name, node.args, node.body),
+                   node.name: FuncDef(node.name, node.args, node.body)},
+        )
+        return _eval_node(value, node.rest, new_ctx)
+
+    elif node_type == "Label":
+        node = ast  # type: LabelNode
+        try:
+            return _eval_node(value, node.body, ctx)
+        except BreakException as e:
+            if e.name == node.name:
+                return e.values
+            raise
+
+    elif node_type == "Break":
+        node = ast  # type: BreakNode
+        raise BreakException(node.name)
 
     raise ValueError(f"Unknown AST node type: {node_type}")
 
@@ -378,7 +555,12 @@ def _eval_binary_op(
     for lv in left_vals:
         for rv in right_vals:
             if op == "+":
-                if isinstance(lv, (int, float)) and isinstance(rv, (int, float)):
+                # jq: null + x = x, x + null = x
+                if lv is None:
+                    results.append(rv)
+                elif rv is None:
+                    results.append(lv)
+                elif isinstance(lv, (int, float)) and isinstance(rv, (int, float)):
                     results.append(lv + rv)
                 elif isinstance(lv, str) and isinstance(rv, str):
                     results.append(lv + rv)
@@ -408,7 +590,15 @@ def _eval_binary_op(
                     results.append(None)
             elif op == "/":
                 if isinstance(lv, (int, float)) and isinstance(rv, (int, float)):
-                    results.append(lv / rv if rv != 0 else None)
+                    if rv == 0:
+                        results.append(None)
+                    else:
+                        result = lv / rv
+                        # jq returns integer when both operands are ints and division is exact
+                        if isinstance(lv, int) and isinstance(rv, int) and result == int(result):
+                            results.append(int(result))
+                        else:
+                            results.append(result)
                 elif isinstance(lv, str) and isinstance(rv, str):
                     results.append(lv.split(rv))
                 else:

@@ -220,6 +220,24 @@ def _decode_ansi_c_escapes(s: str) -> str:
                 else:
                     result.append(chr(val))
                 i = j
+            elif c == "c":
+                # Control character escape: \cX produces chr(ord(X) & 0x1F)
+                # Special case: \c? produces DEL (0x7F)
+                if i + 2 < len(s):
+                    ctrl_char = s[i + 2]
+                    if ctrl_char == "?":
+                        result.append("\x7f")
+                    else:
+                        val = ord(ctrl_char) & 0x1F
+                        if val == 0:
+                            pass  # NUL bytes are stripped
+                        else:
+                            result.append(chr(val))
+                    i += 3
+                else:
+                    # \c at end of string - treat as literal
+                    result.append("\\c")
+                    i += 2
             else:
                 # Unknown escape: keep backslash + char
                 result.append("\\")
@@ -470,7 +488,8 @@ class Parser:
                 content_word = self._parse_word_from_string(
                     content_token.value,
                     quoted=False,
-                    single_quoted=heredoc_info["quoted"]
+                    single_quoted=heredoc_info["quoted"],
+                    in_heredoc=not heredoc_info["quoted"],
                 )
                 heredoc_node = AST.here_doc(
                     heredoc_info["delimiter"],
@@ -570,10 +589,13 @@ class Parser:
             return None
 
         commands: list[CommandNode] = [command]
+        pipe_amp_list: list[bool] = []
 
         # Parse additional commands with pipe
         while self._check(TokenType.PIPE, TokenType.PIPE_AMP):
             self._check_iteration_limit()
+            is_pipe_amp = self._check(TokenType.PIPE_AMP)
+            pipe_amp_list.append(is_pipe_amp)
             self._advance()
             self._skip_newlines()
 
@@ -582,7 +604,7 @@ class Parser:
                 raise self._error("Expected command after pipe")
             commands.append(next_command)
 
-        return AST.pipeline(commands, negated)
+        return AST.pipeline(commands, negated, pipe_amp=tuple(pipe_amp_list))
 
     def _parse_command(self) -> Optional[CommandNode]:
         """Parse a command (simple, compound, or function definition)."""
@@ -714,6 +736,10 @@ class Parser:
                 TokenType.CASE,
                 TokenType.ESAC,
                 TokenType.FUNCTION,
+                # Keywords that are only special at command start position:
+                TokenType.BANG,
+                TokenType.LBRACE,
+                TokenType.TIME,
             ):
                 args.append(self._parse_word())
                 continue
@@ -834,6 +860,9 @@ class Parser:
                 TokenType.GREATAND,
                 TokenType.LESSGREAT,
                 TokenType.CLOBBER,
+                TokenType.DLESS,
+                TokenType.DLESSDASH,
+                TokenType.TLESS,
             ):
                 # Check if immediately adjacent (no whitespace)
                 # Number ends at column + len(value), redirect should start there
@@ -1066,6 +1095,10 @@ class Parser:
                 break
             redirections.append(redir)
 
+        # Resolve pending heredocs for for loop redirections
+        if self.pending_heredocs:
+            redirections = self._resolve_pending_heredocs(redirections)
+
         return AST.for_node(variable, words, body, redirections)
 
     def _parse_c_style_for(self) -> CStyleForNode:
@@ -1076,21 +1109,44 @@ class Parser:
         # Collect everything between (( and )) as raw text
         expr_text = ""
         depth = 1
+        paren_depth = 0  # Track regular parenthesis nesting
 
         while depth > 0 and not self._check(TokenType.EOF):
             if self._check(TokenType.DPAREN_START):
-                depth += 1
-                expr_text += "(("
+                if paren_depth > 0:
+                    # Inside regular parens, (( is just two open parens
+                    paren_depth += 2
+                    expr_text += "(("
+                else:
+                    depth += 1
+                    expr_text += "(("
                 self._advance()
             elif self._check(TokenType.DPAREN_END):
-                depth -= 1
-                if depth > 0:
+                if paren_depth >= 2:
+                    # Both ) close regular parens
+                    paren_depth -= 2
                     expr_text += "))"
-                self._advance()
+                    self._advance()
+                elif paren_depth == 1:
+                    # First ) closes regular paren, second is for-loop terminator
+                    paren_depth = 0
+                    expr_text += ")"
+                    depth -= 1
+                    if depth > 0:
+                        expr_text += ")"
+                    self._advance()
+                else:
+                    depth -= 1
+                    if depth > 0:
+                        expr_text += "))"
+                    self._advance()
             elif self._check(TokenType.LPAREN):
+                paren_depth += 1
                 expr_text += "("
                 self._advance()
             elif self._check(TokenType.RPAREN):
+                if paren_depth > 0:
+                    paren_depth -= 1
                 expr_text += ")"
                 self._advance()
             else:
@@ -1188,6 +1244,10 @@ class Parser:
                 break
             redirections.append(redir)
 
+        # Resolve pending heredocs for while loop redirections
+        if self.pending_heredocs:
+            redirections = self._resolve_pending_heredocs(redirections)
+
         return AST.while_node(condition, body, redirections)
 
     def _parse_until(self) -> UntilNode:
@@ -1217,6 +1277,10 @@ class Parser:
             if not redir:
                 break
             redirections.append(redir)
+
+        # Resolve pending heredocs for until loop redirections
+        if self.pending_heredocs:
+            redirections = self._resolve_pending_heredocs(redirections)
 
         return AST.until_node(condition, body, redirections)
 
@@ -1330,6 +1394,10 @@ class Parser:
                 break
             redirections.append(redir)
 
+        # Resolve pending heredocs for subshell redirections
+        if self.pending_heredocs:
+            redirections = self._resolve_pending_heredocs(redirections)
+
         return AST.subshell(body, redirections)
 
     def _parse_group(self) -> GroupNode:
@@ -1350,6 +1418,10 @@ class Parser:
             if not redir:
                 break
             redirections.append(redir)
+
+        # Resolve pending heredocs for group redirections
+        if self.pending_heredocs:
+            redirections = self._resolve_pending_heredocs(redirections)
 
         return AST.group(body, redirections)
 
@@ -1674,9 +1746,9 @@ class Parser:
                 all_parts.extend(inner_parts)
         return AST.word(all_parts)
 
-    def _parse_word_from_string(self, value: str, quoted: bool = False, single_quoted: bool = False, in_assignment: bool = False) -> WordNode:
+    def _parse_word_from_string(self, value: str, quoted: bool = False, single_quoted: bool = False, in_assignment: bool = False, in_heredoc: bool = False) -> WordNode:
         """Parse a string into a WordNode with appropriate parts."""
-        parts = self._parse_word_parts(value, quoted, single_quoted, in_assignment=in_assignment)
+        parts = self._parse_word_parts(value, quoted, single_quoted, in_assignment=in_assignment, in_heredoc=in_heredoc)
         # Wrap double-quoted content in DoubleQuotedPart to preserve quote context
         if quoted and not single_quoted:
             return AST.word([DoubleQuotedPart(parts=tuple(parts))])
@@ -1688,7 +1760,7 @@ class Parser:
                 return AST.word([SingleQuotedPart(value="")])
         return AST.word(parts)
 
-    def _parse_word_parts(self, value: str, quoted: bool = False, single_quoted: bool = False, in_assignment: bool = False) -> list[WordPart]:
+    def _parse_word_parts(self, value: str, quoted: bool = False, single_quoted: bool = False, in_assignment: bool = False, in_heredoc: bool = False) -> list[WordPart]:
         """Parse word parts from a string value."""
         # Single-quoted strings are completely literal - no expansions
         if single_quoted:
@@ -1810,7 +1882,7 @@ class Parser:
                     j += 1
                 param_content = value[start : j - 1]
                 # Parse the parameter expansion content
-                parts.append(self._parse_parameter_expansion(param_content))
+                parts.append(self._parse_parameter_expansion(param_content, in_double_quotes=quoted))
                 i = j
                 continue
 
@@ -1894,7 +1966,7 @@ class Parser:
                 continue
 
             # Handle single-quoted strings - completely literal, no expansions
-            if c == "'" and not quoted:
+            if c == "'" and not quoted and not in_heredoc:
                 flush_literal()
                 j = i + 1
                 while j < len(value) and value[j] != "'":
@@ -1905,7 +1977,8 @@ class Parser:
                 continue
 
             # Handle double-quoted strings - expansions occur but no word splitting
-            if c == '"' and not quoted:
+            # In heredoc context, quotes are literal characters
+            if c == '"' and not quoted and not in_heredoc:
                 flush_literal()
                 j = i + 1
                 # Find matching close quote, respecting escapes
@@ -1930,30 +2003,47 @@ class Parser:
 
             # Handle tilde expansion at start or after : in assignments
             if c == "~" and not quoted and (i == 0 or (in_assignment and i > 0 and value[i - 1] == ":")):
-                flush_literal()
                 # Check for ~user, ~+, ~-
                 j = i + 1
                 if j < len(value) and value[j] in "+-":
-                    # ~+ or ~-
-                    parts.append(TildeExpansionPart(user=value[j]))
-                    i = j + 1
+                    # ~+ or ~- must be followed by / : or end
+                    end_j = j + 1
+                    if end_j >= len(value) or value[end_j] in "/:" or (in_assignment and value[end_j] == ":"):
+                        flush_literal()
+                        parts.append(TildeExpansionPart(user=value[j]))
+                        i = end_j
+                        continue
                 else:
                     while j < len(value) and (value[j].isalnum() or value[j] == "_"):
                         j += 1
-                    if j > i + 1:
-                        user = value[i + 1:j]
-                        parts.append(TildeExpansionPart(user=user))
-                    else:
-                        parts.append(TildeExpansionPart(user=None))
-                    i = j
-                continue
+                    # Tilde is only valid if followed by / : or end of value
+                    if j >= len(value) or value[j] == "/" or (in_assignment and value[j] == ":"):
+                        flush_literal()
+                        if j > i + 1:
+                            user = value[i + 1:j]
+                            parts.append(TildeExpansionPart(user=user))
+                        else:
+                            parts.append(TildeExpansionPart(user=None))
+                        i = j
+                        continue
+                # Not a valid tilde expansion, fall through to literal
 
-            # Handle escape sequences (only in unquoted context - lexer already handled quoted escapes)
-            if c == "\\" and i + 1 < len(value) and not quoted:
-                flush_literal()
-                parts.append(EscapedPart(value=value[i + 1]))
-                i += 2
-                continue
+            # Handle escape sequences
+            if c == "\\" and i + 1 < len(value):
+                next_c = value[i + 1]
+                if not quoted:
+                    # Outside quotes, backslash escapes any character
+                    flush_literal()
+                    parts.append(EscapedPart(value=next_c))
+                    i += 2
+                    continue
+                elif next_c in "$`":
+                    # Inside double quotes, lexer preserved \$ and \` as two chars;
+                    # resolve them to EscapedPart so expansion produces just the char
+                    flush_literal()
+                    parts.append(EscapedPart(value=next_c))
+                    i += 2
+                    continue
 
             # Regular character
             literal_buffer += c
@@ -1962,7 +2052,7 @@ class Parser:
         flush_literal()
         return parts if parts else [AST.literal("")]
 
-    def _parse_parameter_expansion(self, content: str) -> ParameterExpansionPart:
+    def _parse_parameter_expansion(self, content: str, in_double_quotes: bool = False) -> ParameterExpansionPart:
         """Parse the content inside ${...} into a ParameterExpansionPart.
 
         Handles:
@@ -1989,13 +2079,81 @@ class Parser:
 
         # Handle length operator ${#VAR}
         if content.startswith("#"):
-            param = content[1:]
+            rest = content[1:]
+            # Parse the parameter name after #
+            if not rest:
+                # ${#} = number of positional parameters
+                return ParameterExpansionPart(parameter="", operation=LengthOp())
+            if rest[0] in '@*?!#-$':
+                param = rest[0]
+                remaining = rest[1:]
+            elif rest[0].isdigit():
+                param = rest[0]
+                remaining = rest[1:]
+            else:
+                # Variable name
+                j = 0
+                while j < len(rest) and (rest[j].isalnum() or rest[j] == '_'):
+                    j += 1
+                if j == 0:
+                    # No valid name - store full content for runtime error
+                    return ParameterExpansionPart(parameter=content, operation=LengthOp())
+                param = rest[:j]
+                remaining = rest[j:]
+                # Allow array subscript: ${#arr[@]}, ${#arr[0]}
+                if remaining.startswith('['):
+                    bracket_depth = 1
+                    k = 1
+                    while k < len(remaining) and bracket_depth > 0:
+                        if remaining[k] == '[':
+                            bracket_depth += 1
+                        elif remaining[k] == ']':
+                            bracket_depth -= 1
+                        k += 1
+                    param = rest[:j + k]
+                    remaining = remaining[k:]
+            # After ${#param}, no other operators are allowed - mark for runtime error
+            if remaining:
+                # Store original content; expansion will detect and raise BadSubstitutionError
+                return ParameterExpansionPart(parameter=content, operation=LengthOp())
             return ParameterExpansionPart(parameter=param, operation=LengthOp())
 
         # Find the parameter name (alphanumeric, _, or special chars)
         i = 0
         # Handle special parameters like @, *, ?, $, #, !, -, 0-9
-        if content and content[0] in "@*?$#!-0123456789":
+        if content and content[0] == "!" and len(content) > 1 and (content[1].isalpha() or content[1] == '_'):
+            # ${!varname...} - indirection prefix
+            j = 1
+            while j < len(content) and (content[j].isalnum() or content[j] == '_'):
+                j += 1
+            if j < len(content) and content[j] == '[':
+                # Array subscript: ${!arr[@]} or ${!arr[subscript]}
+                bracket_depth = 1
+                j += 1
+                while j < len(content) and bracket_depth > 0:
+                    if content[j] == '[':
+                        bracket_depth += 1
+                    elif content[j] == ']':
+                        bracket_depth -= 1
+                    j += 1
+                param = content[:j]
+                i = j
+            elif j < len(content) and content[j] in '@*' and j + 1 == len(content):
+                # Prefix expansion: ${!prefix@} or ${!prefix*}
+                param = content[:j + 1]
+                i = j + 1
+            else:
+                # Indirection with possible operation: ${!ref}, ${!ref-default}, etc.
+                param = content[:j]
+                i = j
+        elif content and content[0] == "!" and len(content) > 1 and content[1].isdigit():
+            # ${!1} etc - indirect via positional parameter
+            j = 1
+            while j < len(content) and content[j].isdigit():
+                j += 1
+            param = content[:j]
+            i = j
+        elif content and content[0] in "@*?$#!-0123456789":
             param = content[0]
             i = 1
         else:
@@ -2021,50 +2179,52 @@ class Parser:
         rest = content[i:]
 
         # Handle :- := :? :+ (with colon = check empty too)
+        # When inside double quotes, pass quoted=True so single quotes become literal
+        dq = in_double_quotes
         if rest.startswith(":-"):
-            word = self._parse_word_from_string(rest[2:])
+            word = self._parse_word_from_string(rest[2:], quoted=dq)
             return ParameterExpansionPart(
                 parameter=param,
                 operation=DefaultValueOp(word=word, check_empty=True),
             )
         if rest.startswith("-"):
-            word = self._parse_word_from_string(rest[1:])
+            word = self._parse_word_from_string(rest[1:], quoted=dq)
             return ParameterExpansionPart(
                 parameter=param,
                 operation=DefaultValueOp(word=word, check_empty=False),
             )
         if rest.startswith(":="):
-            word = self._parse_word_from_string(rest[2:])
+            word = self._parse_word_from_string(rest[2:], quoted=dq)
             return ParameterExpansionPart(
                 parameter=param,
                 operation=AssignDefaultOp(word=word, check_empty=True),
             )
         if rest.startswith("="):
-            word = self._parse_word_from_string(rest[1:])
+            word = self._parse_word_from_string(rest[1:], quoted=dq)
             return ParameterExpansionPart(
                 parameter=param,
                 operation=AssignDefaultOp(word=word, check_empty=False),
             )
         if rest.startswith(":?"):
-            word = self._parse_word_from_string(rest[2:])
+            word = self._parse_word_from_string(rest[2:], quoted=dq)
             return ParameterExpansionPart(
                 parameter=param,
                 operation=ErrorIfUnsetOp(word=word, check_empty=True),
             )
         if rest.startswith("?"):
-            word = self._parse_word_from_string(rest[1:])
+            word = self._parse_word_from_string(rest[1:], quoted=dq)
             return ParameterExpansionPart(
                 parameter=param,
                 operation=ErrorIfUnsetOp(word=word, check_empty=False),
             )
         if rest.startswith(":+"):
-            word = self._parse_word_from_string(rest[2:])
+            word = self._parse_word_from_string(rest[2:], quoted=dq)
             return ParameterExpansionPart(
                 parameter=param,
                 operation=UseAlternativeOp(word=word, check_empty=True),
             )
         if rest.startswith("+"):
-            word = self._parse_word_from_string(rest[1:])
+            word = self._parse_word_from_string(rest[1:], quoted=dq)
             return ParameterExpansionPart(
                 parameter=param,
                 operation=UseAlternativeOp(word=word, check_empty=False),
@@ -2076,26 +2236,38 @@ class Parser:
             parts_str = rest[1:]
             colon_pos = parts_str.find(":")
             if colon_pos >= 0:
-                offset_str = parts_str[:colon_pos]
-                length_str = parts_str[colon_pos + 1:]
+                offset_raw = parts_str[:colon_pos]
+                length_raw = parts_str[colon_pos + 1:]
+                # Try to parse as int; if not, store raw string for arithmetic evaluation
                 try:
-                    offset = int(offset_str) if offset_str else 0
-                    length = int(length_str) if length_str else None
-                    return ParameterExpansionPart(
-                        parameter=param,
-                        operation=SubstringOp(offset=offset, length=length),
-                    )
+                    offset = int(offset_raw) if offset_raw else 0
                 except ValueError:
-                    pass  # Not a valid substring, fall through
+                    offset = 0
+                try:
+                    length = int(length_raw) if length_raw else None
+                except ValueError:
+                    length = None
+                return ParameterExpansionPart(
+                    parameter=param,
+                    operation=SubstringOp(
+                        offset=offset, length=length,
+                        offset_str=offset_raw if offset_raw else None,
+                        length_str=length_raw if length_raw else None,
+                    ),
+                )
             else:
                 try:
                     offset = int(parts_str) if parts_str else 0
-                    return ParameterExpansionPart(
-                        parameter=param,
-                        operation=SubstringOp(offset=offset, length=None),
-                    )
                 except ValueError:
-                    pass
+                    offset = 0
+                return ParameterExpansionPart(
+                    parameter=param,
+                    operation=SubstringOp(
+                        offset=offset, length=None,
+                        offset_str=parts_str if parts_str else None,
+                        length_str=None,
+                    ),
+                )
 
         # Handle pattern removal ${VAR#pattern} ${VAR##pattern} ${VAR%pattern} ${VAR%%pattern}
         if rest.startswith("##"):
@@ -2185,29 +2357,38 @@ class Parser:
             )
 
         # Handle case modification ${VAR^} ${VAR^^} ${VAR,} ${VAR,,}
+        # Optionally followed by a pattern: ${VAR^^pattern} ${VAR,,pattern}
         if rest.startswith("^^"):
+            pat_str = rest[2:]
+            pat = AST.word([LiteralPart(value=pat_str)]) if pat_str else None
             return ParameterExpansionPart(
                 parameter=param,
-                operation=CaseModificationOp(direction="upper", all=True),
+                operation=CaseModificationOp(direction="upper", all=True, pattern=pat),
             )
         if rest.startswith("^"):
+            pat_str = rest[1:]
+            pat = AST.word([LiteralPart(value=pat_str)]) if pat_str else None
             return ParameterExpansionPart(
                 parameter=param,
-                operation=CaseModificationOp(direction="upper", all=False),
+                operation=CaseModificationOp(direction="upper", all=False, pattern=pat),
             )
         if rest.startswith(",,"):
+            pat_str = rest[2:]
+            pat = AST.word([LiteralPart(value=pat_str)]) if pat_str else None
             return ParameterExpansionPart(
                 parameter=param,
-                operation=CaseModificationOp(direction="lower", all=True),
+                operation=CaseModificationOp(direction="lower", all=True, pattern=pat),
             )
         if rest.startswith(","):
+            pat_str = rest[1:]
+            pat = AST.word([LiteralPart(value=pat_str)]) if pat_str else None
             return ParameterExpansionPart(
                 parameter=param,
-                operation=CaseModificationOp(direction="lower", all=False),
+                operation=CaseModificationOp(direction="lower", all=False, pattern=pat),
             )
 
-        # Handle transforms ${VAR@Q} ${VAR@a} ${VAR@A} ${VAR@E} ${VAR@P} ${VAR@K}
-        if rest.startswith("@") and len(rest) >= 2 and rest[1] in "QaAEPK":
+        # Handle transforms ${VAR@Q} ${VAR@a} ${VAR@A} ${VAR@E} ${VAR@P} ${VAR@K} ${VAR@u} ${VAR@U} ${VAR@L}
+        if rest.startswith("@") and len(rest) >= 2 and rest[1] in "QaAEPKkuUL":
             op_char = rest[1]
             return ParameterExpansionPart(
                 parameter=param,

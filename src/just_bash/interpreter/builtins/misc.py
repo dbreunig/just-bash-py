@@ -37,6 +37,30 @@ async def handle_false(
     return _result("", "", 1)
 
 
+async def _search_path_vfs(ctx: "InterpreterContext", name: str) -> list[str]:
+    """Search PATH directories in VFS for a file.
+
+    Returns list of display paths (dir_entry/name as they appear in PATH).
+    """
+    path_str = ctx.state.env.get("PATH", "")
+    if not path_str:
+        return []
+
+    results = []
+    for dir_entry in path_str.split(":"):
+        if not dir_entry:
+            dir_entry = "."
+        display = f"{dir_entry}/{name}"
+        resolved = ctx.fs.resolve_path(ctx.state.cwd, display)
+        try:
+            if await ctx.fs.exists(resolved):
+                if not await ctx.fs.is_directory(resolved):
+                    results.append(display)
+        except Exception:
+            pass
+    return results
+
+
 async def handle_type(
     ctx: "InterpreterContext", args: list[str]
 ) -> "ExecResult":
@@ -52,6 +76,7 @@ async def handle_type(
       -t    Output a single word: alias, keyword, function, builtin, file, or ''
     """
     from .alias import get_aliases
+    from .declare import _format_function_def
 
     # Parse options
     show_all = False
@@ -88,11 +113,11 @@ async def handle_type(
     if not names:
         return _result("", "bash: type: usage: type [-afptP] name [name ...]\n", 1)
 
-    # Keywords
+    # Keywords (matching bash's list)
     keywords = {
         "if", "then", "else", "elif", "fi", "case", "esac", "for", "select",
         "while", "until", "do", "done", "in", "function", "time", "coproc",
-        "{", "}", "!", "[[", "]]"
+        "{", "}", "!", "[[", "]]",
     }
 
     # Get builtins (includes commands that bash treats as builtins)
@@ -100,10 +125,12 @@ async def handle_type(
     # Commands that are implemented externally but should be reported as builtins
     _builtin_command_names = {
         "echo", "printf", "read", "pwd", "test", "[", "kill", "enable",
-        "help", "hash", "ulimit", "umask", "jobs", "fg", "bg", "disown",
+        "help", "ulimit", "umask", "jobs", "fg", "bg", "disown",
         "suspend", "logout", "dirs", "pushd", "popd", "times", "trap",
         "caller", "complete", "compgen", "compopt",
     }
+
+    from ...commands import COMMAND_NAMES
 
     # Get aliases
     aliases = get_aliases(ctx)
@@ -112,76 +139,142 @@ async def handle_type(
     functions = getattr(ctx.state, 'functions', {})
 
     output = []
+    stderr_output = []
     exit_code = 0
 
     for name in names:
         found = False
 
-        # Check alias (unless -f)
+        # -P: force PATH search only, skip everything else
+        if force_path:
+            file_found = await _find_file_in_path(ctx, name)
+            if file_found:
+                found = True
+                for p in file_found:
+                    if type_only:
+                        output.append("file")
+                    else:
+                        output.append(p)
+                    if not show_all:
+                        break
+            if not found:
+                exit_code = 1
+            continue
+
+        # -p: search PATH, but don't error for known non-file types
+        if path_only:
+            file_found = await _find_file_in_path(ctx, name)
+            if file_found:
+                found = True
+                for p in file_found:
+                    output.append(p)
+                    if not show_all:
+                        break
+            else:
+                # Known non-file types: not an error, just no output
+                is_known = (name in aliases or name in keywords
+                            or name in functions
+                            or name in BUILTINS or name in _builtin_command_names
+                            or name in COMMAND_NAMES)
+                if is_known:
+                    found = True
+            if not found:
+                exit_code = 1
+            continue
+
+        # Normal / -a / -t / -f mode
+
+        # 1. Check alias (unless -f)
         if not no_functions and name in aliases:
             found = True
             if type_only:
                 output.append("alias")
-            elif path_only:
-                pass  # -p doesn't show aliases
             else:
                 output.append(f"{name} is aliased to `{aliases[name]}'")
             if not show_all:
                 continue
 
-        # Check keyword
+        # 2. Check keyword
         if name in keywords:
             found = True
             if type_only:
                 output.append("keyword")
-            elif not path_only:
+            else:
                 output.append(f"{name} is a shell keyword")
             if not show_all:
                 continue
 
-        # Check function (unless -f or -P)
-        if not no_functions and not force_path and name in functions:
+        # 3. Check function (unless -f)
+        if not no_functions and name in functions:
             found = True
             if type_only:
                 output.append("function")
-            elif not path_only:
+            else:
                 output.append(f"{name} is a function")
+                output.append(_format_function_def(name, functions[name]))
             if not show_all:
                 continue
 
-        # Check builtin (unless -P)
-        if not force_path and (name in BUILTINS or name in _builtin_command_names):
+        # 4. Check builtin
+        if name in BUILTINS or name in _builtin_command_names:
             found = True
             if type_only:
                 output.append("builtin")
-            elif not path_only:
+            else:
                 output.append(f"{name} is a shell builtin")
             if not show_all:
                 continue
 
-        # Check command registry
-        from ...commands import COMMAND_NAMES
-        if name in COMMAND_NAMES and name not in _builtin_command_names:
+        # 5. Check files - PATH search or direct path
+        file_found = await _find_file_in_path(ctx, name)
+        if file_found:
+            for p in file_found:
+                found = True
+                if type_only:
+                    output.append("file")
+                else:
+                    output.append(f"{name} is {p}")
+                if not show_all:
+                    break
+        elif not found and name in COMMAND_NAMES and name not in _builtin_command_names:
+            # Fallback: command registry (for commands without PATH entry)
             found = True
             if type_only:
                 output.append("file")
-            elif path_only:
-                output.append(name)
             else:
                 output.append(f"{name} is {name}")
             if not show_all:
                 continue
 
         if not found:
-            if type_only:
-                pass  # bash outputs nothing for type -t on not-found commands
-            else:
-                output.append(f"bash: type: {name}: not found")
+            if not type_only:
+                stderr_output.append(f"bash: type: {name}: not found")
             exit_code = 1
 
-    if output:
-        return _result("\n".join(output) + "\n", "", exit_code)
-    return _result("", "", exit_code)
+    stdout = "\n".join(output) + "\n" if output else ""
+    stderr = "\n".join(stderr_output) + "\n" if stderr_output else ""
+    return _result(stdout, stderr, exit_code)
+
+
+async def _find_file_in_path(ctx: "InterpreterContext", name: str) -> list[str]:
+    """Find a command in PATH or by direct path.
+
+    Returns list of display paths where the file was found.
+    """
+    if "/" in name:
+        # Direct path - check if exists, is a regular file, and is executable
+        resolved = ctx.fs.resolve_path(ctx.state.cwd, name)
+        try:
+            if await ctx.fs.exists(resolved):
+                if not await ctx.fs.is_directory(resolved):
+                    stat = await ctx.fs.stat(resolved)
+                    if stat.mode & 0o111:
+                        return [name]
+        except Exception:
+            pass
+        return []
+    else:
+        return await _search_path_vfs(ctx, name)
 
 
 async def handle_command(
@@ -230,33 +323,88 @@ async def handle_command(
 
     cmd_name = cmd_args[0]
 
-    # Handle -v or -V: describe the command
+    # Handle -v or -V: describe the command(s)
     if describe or verbose:
         from . import BUILTINS
         from ...commands import COMMAND_NAMES
 
+        # Commands that are implemented externally but should be reported as builtins
+        _builtin_command_names = {
+            "echo", "printf", "read", "pwd", "test", "[", "kill", "enable",
+            "help", "hash", "ulimit", "umask", "jobs", "fg", "bg", "disown",
+            "suspend", "logout", "dirs", "pushd", "popd", "times", "trap",
+            "caller", "complete", "compgen", "compopt",
+        }
+
+        keywords = {
+            "if", "then", "else", "elif", "fi", "case", "esac", "for", "select",
+            "while", "until", "do", "done", "in", "function", "time", "coproc",
+            "{", "}", "!", "[[", "]]",
+        }
+
         functions = getattr(ctx.state, 'functions', {})
 
-        if cmd_name in functions:
-            if verbose:
-                return _result(f"{cmd_name} is a function\n", "", 0)
-            else:
-                return _result(f"{cmd_name}\n", "", 0)
-        elif cmd_name in BUILTINS:
-            if verbose:
-                return _result(f"{cmd_name} is a shell builtin\n", "", 0)
-            else:
-                return _result(f"{cmd_name}\n", "", 0)
-        elif cmd_name in COMMAND_NAMES:
-            if verbose:
-                return _result(f"{cmd_name} is {cmd_name}\n", "", 0)
-            else:
-                return _result(f"{cmd_name}\n", "", 0)
-        else:
-            return _result("", f"bash: command: {cmd_name}: not found\n", 1)
+        # command -v/-V can take multiple names
+        output = []
+        exit_code_cmd = 0
+
+        for cn in cmd_args:
+            cn_found = False
+            if cn in keywords:
+                cn_found = True
+                if verbose:
+                    output.append(f"{cn} is a shell keyword")
+                else:
+                    output.append(cn)
+            elif cn in functions:
+                cn_found = True
+                if verbose:
+                    output.append(f"{cn} is a function")
+                else:
+                    output.append(cn)
+            elif cn in BUILTINS or cn in _builtin_command_names:
+                cn_found = True
+                if verbose:
+                    output.append(f"{cn} is a shell builtin")
+                else:
+                    output.append(cn)
+
+            if not cn_found:
+                # Search PATH for files
+                file_paths = await _find_file_in_path(ctx, cn)
+                if file_paths:
+                    cn_found = True
+                    p = file_paths[0]
+                    if verbose:
+                        output.append(f"{cn} is {p}")
+                    else:
+                        output.append(p)
+                elif cn in COMMAND_NAMES:
+                    cn_found = True
+                    if verbose:
+                        output.append(f"{cn} is {cn}")
+                    else:
+                        output.append(cn)
+
+            if not cn_found:
+                if verbose:
+                    output.append(f"bash: command: {cn}: not found")
+                exit_code_cmd = 1
+
+        if output:
+            return _result("\n".join(output) + "\n", "", exit_code_cmd)
+        return _result("", "", exit_code_cmd)
 
     # Execute the command, bypassing functions
-    # Store current function state and temporarily hide the function
+    # If cmd is a builtin, call it directly so control flow exceptions
+    # (ExitError, ReturnError, etc.) propagate instead of being caught by exec_fn
+    from . import BUILTINS
+
+    if cmd_name in BUILTINS:
+        handler = BUILTINS[cmd_name]
+        return await handler(ctx, cmd_args[1:])
+
+    # For non-builtins, use exec_fn with function bypassing
     functions = getattr(ctx.state, 'functions', {})
     hidden_func = functions.pop(cmd_name, None)
 

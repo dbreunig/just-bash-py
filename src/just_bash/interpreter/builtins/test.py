@@ -250,6 +250,10 @@ async def _unary_test(ctx: "InterpreterContext", op: str, arg: str) -> bool:
                           for k in env.keys())
             key = f"{base_name}_{subscript}"
             return key in env
+        # Dynamic variables that are always set
+        if arg in ("SHELLOPTS", "BASHOPTS", "RANDOM", "LINENO", "SECONDS",
+                   "BASH_VERSION", "BASHPID"):
+            return True
         return arg in env
 
     # Shell option test: -o checks if an option is enabled

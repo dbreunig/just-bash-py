@@ -34,25 +34,55 @@ async def handle_source(ctx: "InterpreterContext", args: list[str]) -> "ExecResu
             exit_code=2,
         )
 
+    # Skip -- separator
+    if args[0] == "--":
+        args = args[1:]
+        if not args:
+            return ExecResult(
+                stdout="",
+                stderr="bash: source: filename argument required\n",
+                exit_code=2,
+            )
+
     filename = args[0]
     script_args = args[1:]
 
     # Resolve path
-    path = ctx.fs.resolve_path(ctx.state.cwd, filename)
+    content = None
+    path = None
 
-    # Read file
-    try:
-        content = await ctx.fs.read_file(path)
-    except FileNotFoundError:
+    if "/" in filename:
+        # Contains slash - resolve directly relative to cwd
+        path = ctx.fs.resolve_path(ctx.state.cwd, filename)
+        try:
+            content = await ctx.fs.read_file(path)
+        except Exception:
+            pass
+    else:
+        # No slash - search PATH directories (bash behavior)
+        path_var = ctx.state.env.get("PATH", "")
+        for dir_entry in path_var.split(":"):
+            if not dir_entry:
+                continue
+            candidate = ctx.fs.resolve_path(ctx.state.cwd, dir_entry + "/" + filename)
+            try:
+                content = await ctx.fs.read_file(candidate)
+                path = candidate
+                break
+            except Exception:
+                continue
+        if content is None:
+            # Fallback: try current directory (common interactive behavior)
+            path = ctx.fs.resolve_path(ctx.state.cwd, filename)
+            try:
+                content = await ctx.fs.read_file(path)
+            except Exception:
+                pass
+
+    if content is None:
         return ExecResult(
             stdout="",
             stderr=f"bash: source: {filename}: No such file or directory\n",
-            exit_code=1,
-        )
-    except Exception as e:
-        return ExecResult(
-            stdout="",
-            stderr=f"bash: source: {filename}: {e}\n",
             exit_code=1,
         )
 
@@ -90,8 +120,16 @@ async def handle_source(ctx: "InterpreterContext", args: list[str]) -> "ExecResu
     try:
         # Parse and execute
         from ...parser import parse
+        from ...parser.parser import ParseException
 
-        ast = parse(content)
+        try:
+            ast = parse(content)
+        except ParseException as e:
+            return ExecResult(
+                stdout="",
+                stderr=f"bash: {filename}: {e}\n",
+                exit_code=1,
+            )
         result = await ctx.execute_script(ast)
         return result
     finally:
@@ -114,6 +152,14 @@ async def handle_source(ctx: "InterpreterContext", args: list[str]) -> "ExecResu
 async def handle_eval(ctx: "InterpreterContext", args: list[str]) -> "ExecResult":
     """Execute the eval builtin."""
     from ...types import ExecResult
+    from ..errors import BreakError, ContinueError, ReturnError, ExitError, ErrexitError
+
+    if not args:
+        return ExecResult(stdout="", stderr="", exit_code=0)
+
+    # Skip leading -- (eval accepts and ignores it)
+    if args and args[0] == "--":
+        args = args[1:]
 
     if not args:
         return ExecResult(stdout="", stderr="", exit_code=0)
@@ -128,6 +174,9 @@ async def handle_eval(ctx: "InterpreterContext", args: list[str]) -> "ExecResult
         ast = parse(command)
         result = await ctx.execute_script(ast)
         return result
+    except (BreakError, ContinueError, ReturnError, ExitError, ErrexitError):
+        # Control flow exceptions must propagate through eval
+        raise
     except Exception as e:
         return ExecResult(
             stdout="",

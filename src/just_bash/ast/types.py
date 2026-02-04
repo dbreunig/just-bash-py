@@ -76,6 +76,8 @@ class PipelineNode:
     commands: tuple["CommandNode", ...] = ()
     negated: bool = False
     line: Optional[int] = None
+    # Track which pipes are |& (merge stderr): True = |&, False = |
+    pipe_amp: tuple[bool, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -426,6 +428,9 @@ class SubstringOp:
     type: Literal["Substring"] = field(default="Substring", repr=False)
     offset: Optional["ArithmeticExpressionNode"] = None
     length: Optional["ArithmeticExpressionNode"] = None
+    # Raw strings for arithmetic evaluation (handles $var, expressions, etc.)
+    offset_str: Optional[str] = None
+    length_str: Optional[str] = None
 
 
 @dataclass(frozen=True)

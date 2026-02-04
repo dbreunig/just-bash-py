@@ -52,6 +52,9 @@ async def handle_declare(ctx: "InterpreterContext", args: list[str]) -> "ExecRes
         "export": False,       # -x: export
     }
 
+    # Track attributes to remove (via + prefix)
+    remove_attrs: set[str] = set()
+
     names: list[str] = []
 
     i = 0
@@ -62,7 +65,19 @@ async def handle_declare(ctx: "InterpreterContext", args: list[str]) -> "ExecRes
             names.extend(args[i + 1:])
             break
 
-        if arg.startswith("-") and len(arg) > 1 and arg[1] != "-":
+        if arg.startswith("+") and len(arg) > 1:
+            # Parse + options (remove attributes)
+            valid_plus = {"a", "A", "f", "F", "g", "i", "l", "n", "r", "t", "u", "x"}
+            for c in arg[1:]:
+                if c in valid_plus:
+                    remove_attrs.add(c)
+                else:
+                    return _result(
+                        "",
+                        f"bash: declare: +{c}: invalid option\n",
+                        2
+                    )
+        elif arg.startswith("-") and len(arg) > 1 and arg[1] != "-":
             # Parse short options
             for c in arg[1:]:
                 if c == "a":
@@ -110,6 +125,37 @@ async def handle_declare(ctx: "InterpreterContext", args: list[str]) -> "ExecRes
     if options["print"]:
         return _print_declarations(ctx, names, options)
 
+    # Handle attribute removal via + prefix
+    if remove_attrs and names:
+        from ..types import VariableStore
+        exit_code = 0
+        stderr_parts = []
+        for name_arg in names:
+            # Parse name and optional value
+            if "=" in name_arg:
+                eq_idx = name_arg.index("=")
+                name = name_arg[:eq_idx]
+                value_str = name_arg[eq_idx + 1:]
+            else:
+                name = name_arg
+                value_str = None
+
+            if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", name):
+                stderr_parts.append(f"bash: declare: `{name_arg}': not a valid identifier\n")
+                exit_code = 1
+                continue
+
+            if isinstance(ctx.state.env, VariableStore):
+                for attr in remove_attrs:
+                    ctx.state.env.remove_attribute(name, attr)
+                    if attr == "r" and hasattr(ctx.state, 'readonly_vars'):
+                        ctx.state.readonly_vars.discard(name)
+
+            if value_str is not None:
+                ctx.state.env[name] = value_str
+
+        return _result("", "".join(stderr_parts), exit_code)
+
     # No names: list variables with matching attributes
     if not names:
         return _list_variables(ctx, options)
@@ -151,18 +197,17 @@ async def handle_declare(ctx: "InterpreterContext", args: list[str]) -> "ExecRes
                 ctx.state.env.set_attribute(name, "n")
             continue
 
-        # Handle readonly attribute
+        # Set readonly attribute (don't continue - allow other attributes too)
         if options["readonly"] and isinstance(ctx.state.env, VariableStore):
             ctx.state.env.set_attribute(name, "r")
             ctx.state.readonly_vars.add(name) if hasattr(ctx.state, 'readonly_vars') else None
-            if value_str is not None:
-                ctx.state.env[name] = value_str
-            continue
 
-        # Handle export attribute
-        if options["export"]:
-            if isinstance(ctx.state.env, VariableStore):
-                ctx.state.env.set_attribute(name, "x")
+        # Set export attribute (don't continue - allow other attributes too)
+        if options["export"] and isinstance(ctx.state.env, VariableStore):
+            ctx.state.env.set_attribute(name, "x")
+
+        # If only readonly/export with no array/integer/etc, handle value and continue
+        if (options["readonly"] or options["export"]) and not options["array"] and not options["assoc"] and not options["integer"] and not options["lowercase"] and not options["uppercase"]:
             if value_str is not None:
                 ctx.state.env[name] = value_str
             continue
@@ -343,22 +388,29 @@ def _eval_integer(expr: str, ctx: "InterpreterContext") -> int:
 
 
 def _get_attr_flags(env, name: str, ctx: "InterpreterContext") -> str:
-    """Get the declare attribute flags for a variable."""
+    """Get the declare attribute flags for a variable.
+
+    Flags are output in bash canonical order: aAilnrtux
+    """
     from ..types import VariableStore
     flags = ""
+
+    # Check array type first (a/A come first in bash output)
+    is_array = env.get(f"{name}__is_array")
+    if is_array == "assoc":
+        flags += "A"
+    elif is_array == "indexed":
+        flags += "a"
+
     if isinstance(env, VariableStore):
         attrs = env.get_attributes(name)
-        for attr in "rxilunt":
+        # Output remaining flags in bash canonical order
+        for attr in "ilnrtux":
             if attr in attrs:
                 flags += attr
     elif name in ctx.state.readonly_vars:
         flags += "r"
-    # Check array type
-    is_array = env.get(f"{name}__is_array")
-    if is_array == "assoc":
-        flags += "A"
-    elif is_array:
-        flags += "a"
+
     return flags
 
 
@@ -367,7 +419,7 @@ def _format_array_decl(env, name: str, flags: str) -> str:
     is_assoc = env.get(f"{name}__is_array") == "assoc"
     prefix = f"{name}_"
     elements = []
-    for key in sorted(env.keys()):
+    for key in env.keys():
         if key.startswith(prefix) and not key.startswith(f"{name}__"):
             idx_part = key[len(prefix):]
             val = env[key]
@@ -378,9 +430,12 @@ def _format_array_decl(env, name: str, flags: str) -> str:
         try:
             elements.sort(key=lambda x: int(x[0]))
         except ValueError:
-            pass
+            elements.sort()
+    else:
+        # Associative arrays: sort by key alphabetically
+        elements.sort(key=lambda x: x[0])
 
-    flag_str = f"-{flags}" if flags else "-a"
+    flag_str = f"-{flags}" if flags else ("-A" if is_assoc else "-a")
     pairs = " ".join(f'[{idx}]="{val}"' for idx, val in elements)
     if elements:
         return f"declare {flag_str} {name}=({pairs})"
@@ -426,16 +481,18 @@ def _print_declarations(ctx: "InterpreterContext", names: list[str], options: di
         seen = set()
         for key in sorted(env.keys()):
             if "__" in key:
-                # Extract base name from array keys like arr_0, arr__is_array
                 continue
             if key.startswith("_"):
                 continue
             if key in ("?", "#", "$", "!", "-", "*", "@"):
                 continue
-            # Skip positional params and single-digit keys
             if key.isdigit():
                 continue
-
+            # Skip array element keys (e.g., arr_0)
+            if "_" in key:
+                base = key[:key.rindex("_")]
+                if f"{base}__is_array" in env:
+                    continue
             seen.add(key)
 
         # Also add arrays
@@ -450,20 +507,20 @@ def _print_declarations(ctx: "InterpreterContext", names: list[str], options: di
             if decl:
                 lines.append(decl)
     else:
+        stderr_parts = []
         for name in names:
             decl = _format_var_decl(env, name, ctx)
             if decl:
                 lines.append(decl)
             else:
-                # Variable not found
-                lines_err = f"bash: declare: {name}: not found\n"
+                stderr_parts.append(f"bash: declare: {name}: not found\n")
                 exit_code = 1
 
+        stdout = "\n".join(lines) + "\n" if lines else ""
+        return _result(stdout, "".join(stderr_parts), exit_code)
+
     stdout = "\n".join(lines) + "\n" if lines else ""
-    stderr = ""
-    if exit_code != 0 and not lines:
-        stderr = f"bash: declare: {names[0]}: not found\n" if names else ""
-    return _result(stdout, stderr, exit_code)
+    return _result(stdout, "", exit_code)
 
 
 def _handle_functions(ctx: "InterpreterContext", names: list[str], options: dict) -> "ExecResult":
@@ -477,7 +534,8 @@ def _handle_functions(ctx: "InterpreterContext", names: list[str], options: dict
         if names:
             for name in names:
                 if name in functions:
-                    lines.append(f"declare -f {name}")
+                    # With specific names, print just the name
+                    lines.append(name)
                 else:
                     exit_code = 1
         else:
@@ -601,7 +659,11 @@ def _word_to_source(word) -> str:
 
 
 def _list_variables(ctx: "InterpreterContext", options: dict) -> "ExecResult":
-    """List variables with matching attributes."""
+    """List variables with matching attributes.
+
+    'declare' (no -p) uses simple name=value format.
+    Only 'declare -p' uses 'declare -- name="value"' format.
+    """
     env = ctx.state.env
     lines = []
 
@@ -626,8 +688,7 @@ def _list_variables(ctx: "InterpreterContext", options: dict) -> "ExecResult":
                 seen.add(arr_name)
 
     for name in sorted(seen):
-        decl = _format_var_decl(env, name, ctx)
-        if decl:
-            lines.append(decl)
+        if name in env:
+            lines.append(f"{name}={env[name]}")
 
     return _result("\n".join(lines) + "\n" if lines else "", "", 0)

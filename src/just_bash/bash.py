@@ -30,6 +30,7 @@ from .commands import create_command_registry
 from .fs import InMemoryFs
 from .interpreter import ExitError, Interpreter, InterpreterState, ShellOptions, VariableStore
 from .parser import parse, unescape_html_entities
+from .parser.parser import ParseException
 from .types import (
     Command,
     ExecResult,
@@ -114,7 +115,7 @@ class Bash:
         self._initial_state = InterpreterState(
             env=default_env,
             cwd=cwd,
-            previous_dir=cwd,
+            previous_dir="",
             options=ShellOptions(
                 errexit=errexit,
                 pipefail=pipefail,
@@ -167,7 +168,15 @@ class Bash:
             script = unescape_html_entities(script)
 
         # Parse the script
-        ast = parse(script)
+        try:
+            ast = parse(script)
+        except ParseException as e:
+            return ExecResult(
+                stdout="",
+                stderr=f"bash: {e}\n",
+                exit_code=2,
+                env=dict(self._interpreter.state.env),
+            )
 
         # Update state if env/cwd provided
         if env:

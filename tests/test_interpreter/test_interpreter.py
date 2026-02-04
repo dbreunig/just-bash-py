@@ -54,7 +54,7 @@ class TestBasicExecution:
         bash = Bash()
         result = await bash.exec("nonexistent_command")
         assert "command not found" in result.stderr
-        assert result.exit_code == 1
+        assert result.exit_code == 127
 
 
 class TestVariableAssignments:

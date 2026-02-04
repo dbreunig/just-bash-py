@@ -79,6 +79,9 @@ class TokenType(Enum):
     NULL = auto()
     REDUCE = auto()
     FOREACH = auto()
+    DEF = auto()
+    LABEL = auto()
+    BREAK = auto()
 
     # Special
     DOTDOT = auto()  # ..
@@ -102,6 +105,15 @@ class QueryExecutionLimits:
 
 
 @dataclass
+class FuncDef:
+    """A user-defined function."""
+
+    name: str
+    args: list[str]  # parameter names
+    body: "AstNode"
+
+
+@dataclass
 class EvalContext:
     """Evaluation context with variables, limits, and environment."""
 
@@ -110,6 +122,7 @@ class EvalContext:
     env: dict[str, str] = field(default_factory=dict)
     root: Any = None
     current_path: list[str | int] = field(default_factory=list)
+    funcs: dict[str, "FuncDef"] = field(default_factory=dict)
 
 
 # AST Node Types
@@ -272,11 +285,12 @@ class CallNode:
 
 @dataclass
 class VarBindNode:
-    """Variable binding (expr as $var | body)"""
+    """Variable binding (expr as $var | body) or destructuring (expr as [$a,$b] | body)"""
 
-    name: str
+    name: "str | ArrayDestructure | ObjectDestructure"
     value: "AstNode"
     body: "AstNode"
+    alt_patterns: "list[str | ArrayDestructure | ObjectDestructure]" = field(default_factory=list)
     type: str = field(default="VarBind", init=False)
 
 
@@ -322,11 +336,60 @@ class UpdateOpNode:
 
 
 @dataclass
+class DefNode:
+    """Function definition (def name: body; rest)"""
+
+    name: str
+    args: list[str]  # parameter names (without $)
+    body: "AstNode"
+    rest: "AstNode"
+    type: str = field(default="Def", init=False)
+
+
+@dataclass
+class LabelNode:
+    """Label expression (label $name | body)"""
+
+    name: str
+    body: "AstNode"
+    type: str = field(default="Label", init=False)
+
+
+@dataclass
+class BreakNode:
+    """Break expression (break $name)"""
+
+    name: str
+    type: str = field(default="Break", init=False)
+
+
+# Destructuring pattern types
+@dataclass
+class ArrayDestructure:
+    """Array destructuring pattern [$a, $b, ...]"""
+
+    elements: list["DestructurePattern"]
+    type: str = field(default="ArrayDestructure", init=False)
+
+
+@dataclass
+class ObjectDestructure:
+    """Object destructuring pattern {key: $var, ...}"""
+
+    entries: list[tuple[str, "DestructurePattern"]]
+    type: str = field(default="ObjectDestructure", init=False)
+
+
+# A pattern is either a simple variable name or a destructuring pattern
+DestructurePattern = Union[str, ArrayDestructure, ObjectDestructure]
+
+
+@dataclass
 class ReduceNode:
     """Reduce expression"""
 
     expr: "AstNode"
-    var_name: str
+    var_name: "str | ArrayDestructure | ObjectDestructure"
     init: "AstNode"
     update: "AstNode"
     type: str = field(default="Reduce", init=False)
@@ -337,7 +400,7 @@ class ForeachNode:
     """Foreach expression"""
 
     expr: "AstNode"
-    var_name: str
+    var_name: "str | ArrayDestructure | ObjectDestructure"
     init: "AstNode"
     update: "AstNode"
     extract: "AstNode | None" = None
@@ -370,4 +433,17 @@ AstNode = Union[
     UpdateOpNode,
     ReduceNode,
     ForeachNode,
+    DefNode,
+    LabelNode,
+    BreakNode,
+    ArrayDestructure,
+    ObjectDestructure,
 ]
+
+
+class JqError(Exception):
+    """Error raised by jq error() function, carrying the error value."""
+
+    def __init__(self, value: Any):
+        self.value = value
+        super().__init__(str(value))

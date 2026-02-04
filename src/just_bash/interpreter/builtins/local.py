@@ -71,11 +71,12 @@ async def handle_local(ctx: "InterpreterContext", args: list[str]) -> "ExecResul
             remaining_args.append(arg)
 
     for arg in remaining_args:
-        if "=" in arg:
+        has_assignment = "=" in arg
+        if has_assignment:
             name, value = arg.split("=", 1)
         else:
             name = arg
-            value = ""
+            value = None  # No assignment - don't reset existing value
 
         # Validate identifier
         if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", name):
@@ -95,7 +96,7 @@ async def handle_local(ctx: "InterpreterContext", args: list[str]) -> "ExecResul
             ctx.state.env.save_metadata_in_scope(name)
 
         # Handle array initialization
-        if (is_array or is_assoc) and value.startswith("(") and value.endswith(")"):
+        if (is_array or is_assoc) and value is not None and value.startswith("(") and value.endswith(")"):
             # Save existing array keys before overwriting
             _save_array_in_scope(ctx, name, current_scope)
 
@@ -113,11 +114,16 @@ async def handle_local(ctx: "InterpreterContext", args: list[str]) -> "ExecResul
             _save_array_in_scope(ctx, name, current_scope)
             array_key = f"{name}__is_array"
             ctx.state.env[array_key] = "assoc" if is_assoc else "indexed"
-            if "=" in arg:
+            if has_assignment:
                 # Simple value assignment - set element 0
-                ctx.state.env[f"{name}_0"] = value
+                ctx.state.env[f"{name}_0"] = value or ""
+        elif has_assignment:
+            # Simple variable with value
+            ctx.state.env[name] = value or ""
         else:
-            # Simple variable
-            ctx.state.env[name] = value
+            # local without assignment - just mark as local, don't change value
+            # If variable doesn't exist yet, set to empty string
+            if name not in ctx.state.env:
+                ctx.state.env[name] = ""
 
     return ExecResult(stdout="", stderr="", exit_code=0)
