@@ -16,7 +16,7 @@ This is a Python port of [just-bash](https://github.com/vercel-labs/just-bash), 
 - **Flexible filesystems** - In-memory, real filesystem access, copy-on-write overlays, or mount multiple sources
 - **70+ commands** - grep, sed, awk, jq, curl, and more
 - **Full bash syntax** - Pipes, redirections, variables, arrays, functions, control flow
-- **32 shell builtins** - cd, export, declare, test, and more
+- **36 shell builtins** - cd, export, declare, test, pushd, popd, and more
 - **Async execution** - Built on asyncio for non-blocking operation
 - **Security limits** - Prevent infinite loops, excessive recursion, runaway execution
 
@@ -306,9 +306,10 @@ bash = Bash(unescape_html=False)
 
 ```
 :         .         [         alias     break     builtin   cd        command
-continue  declare   eval      exec      exit      export    false     let
-local     mapfile   readarray readonly  return    set       shift     shopt
-source    test      true      type      typeset   unalias   unset     wait
+continue  declare   dirs      eval      exec      exit      export    false
+hash      let       local     mapfile   popd      pushd     readarray readonly
+return    set       shift     shopt     source    test      true      type
+typeset   unalias   unset     wait
 ```
 
 ## Available Commands
@@ -394,12 +395,13 @@ bash      sh
 
 ## Test Results
 
-Test suite history per commit (spec_tests excluded). Each `█` ≈ 53 tests.
+Test suite history per commit (spec_tests excluded). Each `█` ≈ 55 tests.
 
 ```
 Commit   Date         Passed  Failed  Skipped  Graph
 c816182  2026-01-25     2641       3        2  ████████████████████████████████████████████████▒░
 e91d4d8  2026-01-26     2643       2        2  ████████████████████████████████████████████████▒░
+ca69ff0  2026-02-04     2757       0        2  █████████████████████████████████████████████████░
 ```
 
 `█` passed · `▒` failed · `░` skipped
