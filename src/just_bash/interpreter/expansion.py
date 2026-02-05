@@ -1940,6 +1940,133 @@ def _find_brace_in_literal_parts(parts: list) -> tuple[int, int, int, str] | Non
     return None
 
 
+def _apply_array_operation_list(
+    ctx: "InterpreterContext",
+    arr_name: str,
+    operation,
+    is_star: bool,
+) -> Optional[list[str]]:
+    """Apply an operation to array elements and return as list (for [@]) or joined (for [*]).
+
+    Returns None if the operation isn't one that we handle specially (e.g., DefaultValue).
+    For [@], returns list of separate values.
+    For [*], returns list with single IFS-joined value.
+    """
+    # Only handle operations we support: None (no op), Substring, PatternRemoval,
+    # PatternReplacement, CaseModification. For others (DefaultValue, UseAlternative,
+    # Transform, etc.), return None so normal expansion code handles them.
+    if operation is not None and operation.type not in (
+        "Substring", "PatternRemoval", "PatternReplacement", "CaseModification"
+    ):
+        return None
+
+    elements = get_array_elements(ctx, arr_name)
+    values = [v for _, v in elements]
+    ifs = ctx.state.env.get("IFS", " \t\n")
+    sep = ifs[0] if ifs else ""
+
+    if operation is None:
+        # No operation, just return the values
+        if not elements:
+            return [] if not is_star else [""]
+        if is_star:
+            return [sep.join(values)]
+        return values
+
+    # For operations we handle, empty array returns empty
+    if not elements:
+        return [] if not is_star else [""]
+
+    if operation.type == "Substring":
+        # Evaluate offset/length
+        if hasattr(operation, 'offset_str') and operation.offset_str is not None:
+            offset = _eval_array_subscript(ctx, operation.offset_str)
+        else:
+            offset = operation.offset if hasattr(operation, 'offset') else 0
+        if hasattr(operation, 'length_str') and operation.length_str is not None:
+            length = _eval_array_subscript(ctx, operation.length_str)
+        else:
+            length = operation.length if hasattr(operation, 'length') else None
+
+        # Handle negative offset
+        if offset < 0:
+            offset = max(0, len(values) + offset)
+
+        if length is not None:
+            if length < 0:
+                end_pos = len(values) + length
+                sliced = values[offset:max(offset, end_pos)]
+            else:
+                sliced = values[offset:offset + length]
+        else:
+            sliced = values[offset:]
+
+        if is_star:
+            return [sep.join(sliced)]
+        return sliced
+
+    elif operation.type == "PatternRemoval":
+        pattern = expand_word(ctx, operation.pattern) if operation.pattern else ""
+        greedy = operation.greedy
+        from_end = operation.side == "suffix"
+        extglob_on = ctx.state.env.get("__shopt_extglob__", "0") == "1"
+        regex_pat = glob_to_regex(pattern, greedy=True, from_end=from_end, extglob=extglob_on)
+
+        results = []
+        for val in values:
+            results.append(_apply_pattern_removal(val, regex_pat, pattern, greedy, from_end))
+
+        if is_star:
+            return [sep.join(results)]
+        return results
+
+    elif operation.type == "PatternReplacement":
+        pattern = expand_word(ctx, operation.pattern) if operation.pattern else ""
+        replacement = expand_word(ctx, operation.replacement) if operation.replacement else ""
+        replace_all = operation.all
+        anchor = getattr(operation, 'anchor', None)
+        extglob_on = ctx.state.env.get("__shopt_extglob__", "0") == "1"
+
+        # Empty pattern handling
+        if not pattern:
+            if anchor == "start":
+                results = [replacement + v for v in values]
+            elif anchor == "end":
+                results = [v + replacement for v in values]
+            else:
+                results = values
+        else:
+            regex_pattern = glob_to_regex(pattern, greedy=True, extglob=extglob_on)
+            results = []
+            for val in values:
+                results.append(_apply_pattern_replacement(val, regex_pattern, pattern, replacement, replace_all, anchor))
+
+        if is_star:
+            return [sep.join(results)]
+        return results
+
+    elif operation.type == "CaseModification":
+        results = []
+        for val in values:
+            if operation.direction == "upper":
+                if operation.all:
+                    results.append(val.upper())
+                else:
+                    results.append(val[0].upper() + val[1:] if val else "")
+            else:
+                if operation.all:
+                    results.append(val.lower())
+                else:
+                    results.append(val[0].lower() + val[1:] if val else "")
+
+        if is_star:
+            return [sep.join(results)]
+        return results
+
+    # Operation not handled specially
+    return None
+
+
 async def expand_word_with_glob(
     ctx: "InterpreterContext",
     word: WordNode,
@@ -2044,22 +2171,22 @@ async def expand_word_with_glob(
                 return {"values": [sep.join(params)] if params else [""], "quoted": True}
 
             # "${arr[@]}" - return each array element as separate word
+            # Also handle operations like ${arr[@]:1:2}, ${arr[@]#pat}, etc.
             array_at_match = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\[@\]$', param_part.parameter)
-            if array_at_match and param_part.operation is None:
+            if array_at_match:
                 arr_name = array_at_match.group(1)
-                elements = get_array_elements(ctx, arr_name)
-                if not elements:
-                    return {"values": [], "quoted": True}
-                return {"values": [val for _, val in elements], "quoted": True}
+                result = _apply_array_operation_list(ctx, arr_name, param_part.operation, is_star=False)
+                if result is not None:
+                    return {"values": result, "quoted": True}
 
             # "${arr[*]}" - join with first char of IFS
+            # Also handle operations like ${arr[*]:1:2}, ${arr[*]#pat}, etc.
             array_star_match = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\[\*\]$', param_part.parameter)
-            if array_star_match and param_part.operation is None:
+            if array_star_match:
                 arr_name = array_star_match.group(1)
-                elements = get_array_elements(ctx, arr_name)
-                ifs = ctx.state.env.get("IFS", " \t\n")
-                sep = ifs[0] if ifs else ""
-                return {"values": [sep.join(val for _, val in elements)] if elements else [""], "quoted": True}
+                result = _apply_array_operation_list(ctx, arr_name, param_part.operation, is_star=True)
+                if result is not None:
+                    return {"values": result, "quoted": True}
 
             # "${!arr[@]}" / "${!arr[*]}" - return array keys as separate words or joined
             if param_part.parameter.startswith("!") and param_part.operation is None:

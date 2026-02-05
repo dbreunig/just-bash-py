@@ -7787,3 +7787,84 @@ class TestWordSplitLiteralPreservation:
         bash = Bash()
         result = await bash.exec('IFS=x; argv.py "${v:-AxBxC}"x')
         assert result.stdout == "['AxBxCx']\n"
+
+
+class TestArraySlicingAsArguments:
+    """Test that array slicing ${a[@]:offset:length} produces separate arguments."""
+
+    @pytest.mark.asyncio
+    async def test_array_slice_produces_separate_args(self):
+        '''a=(1 2 3); argv.py "${a[@]:1:2}" should produce ['2', '3'].'''
+        bash = Bash()
+        result = await bash.exec('a=(1 2 3); argv.py "${a[@]:1:2}"')
+        assert result.stdout == "['2', '3']\n"
+
+    @pytest.mark.asyncio
+    async def test_array_slice_from_start(self):
+        '''a=(a b c d e); argv.py "${a[@]:0:3}" should produce ['a', 'b', 'c'].'''
+        bash = Bash()
+        result = await bash.exec('a=(a b c d e); argv.py "${a[@]:0:3}"')
+        assert result.stdout == "['a', 'b', 'c']\n"
+
+    @pytest.mark.asyncio
+    async def test_array_slice_to_end(self):
+        '''a=(1 2 3 4); argv.py "${a[@]:2}" should produce ['3', '4'].'''
+        bash = Bash()
+        result = await bash.exec('a=(1 2 3 4); argv.py "${a[@]:2}"')
+        assert result.stdout == "['3', '4']\n"
+
+    @pytest.mark.asyncio
+    async def test_array_slice_negative_offset(self):
+        '''a=(1 2 3 4 5); argv.py "${a[@]: -2}" should produce ['4', '5'].'''
+        bash = Bash()
+        result = await bash.exec('a=(1 2 3 4 5); argv.py "${a[@]: -2}"')
+        assert result.stdout == "['4', '5']\n"
+
+    @pytest.mark.asyncio
+    async def test_array_slice_with_spaces_in_elements(self):
+        '''a=("a b" "c d" "e f"); argv.py "${a[@]:1:2}" should produce ['c d', 'e f'].'''
+        bash = Bash()
+        result = await bash.exec('a=("a b" "c d" "e f"); argv.py "${a[@]:1:2}"')
+        assert result.stdout == "['c d', 'e f']\n"
+
+    @pytest.mark.asyncio
+    async def test_array_slice_empty_result(self):
+        '''a=(1 2 3); argv.py X"${a[@]:5:2}"Y should produce ['XY'].'''
+        bash = Bash()
+        result = await bash.exec('a=(1 2 3); argv.py X"${a[@]:5:2}"Y')
+        assert result.stdout == "['XY']\n"
+
+    @pytest.mark.asyncio
+    async def test_array_slice_star_joins(self):
+        '''a=(1 2 3 4); argv.py "${a[*]:1:2}" should produce ['2 3'] (joined).'''
+        bash = Bash()
+        result = await bash.exec('a=(1 2 3 4); argv.py "${a[*]:1:2}"')
+        assert result.stdout == "['2 3']\n"
+
+    @pytest.mark.asyncio
+    async def test_array_slice_star_custom_ifs(self):
+        '''IFS=:; a=(1 2 3 4); argv.py "${a[*]:1:2}" should produce ['2:3'].'''
+        bash = Bash()
+        result = await bash.exec('IFS=:; a=(1 2 3 4); argv.py "${a[*]:1:2}"')
+        assert result.stdout == "['2:3']\n"
+
+    @pytest.mark.asyncio
+    async def test_array_pattern_removal_separate_args(self):
+        '''a=(aXb cXd eXf); argv.py "${a[@]#*X}" should produce ['b', 'd', 'f'].'''
+        bash = Bash()
+        result = await bash.exec('a=(aXb cXd eXf); argv.py "${a[@]#*X}"')
+        assert result.stdout == "['b', 'd', 'f']\n"
+
+    @pytest.mark.asyncio
+    async def test_array_pattern_replacement_separate_args(self):
+        '''a=(abc def ghi); argv.py "${a[@]/e/E}" should produce ['abc', 'dEf', 'ghi'].'''
+        bash = Bash()
+        result = await bash.exec('a=(abc def ghi); argv.py "${a[@]/e/E}"')
+        assert result.stdout == "['abc', 'dEf', 'ghi']\n"
+
+    @pytest.mark.asyncio
+    async def test_array_case_modification_separate_args(self):
+        '''a=(abc DEF gHi); argv.py "${a[@]^^}" should produce ['ABC', 'DEF', 'GHI'].'''
+        bash = Bash()
+        result = await bash.exec('a=(abc DEF gHi); argv.py "${a[@]^^}"')
+        assert result.stdout == "['ABC', 'DEF', 'GHI']\n"
