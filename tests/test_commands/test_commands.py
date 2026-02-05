@@ -7694,3 +7694,96 @@ class TestLoopControlEdgeCases:
             'echo "subshell status=$?"; echo ". $i"; done'
         )
         assert result.stdout == "> 1\nsubshell status=0\n. 1\n> 2\nsubshell status=0\n. 2\n"
+
+
+class TestQuotingInParameterExpansionDefaults:
+    """Test that quotes inside ${var:-default} are respected for word splitting."""
+
+    @pytest.mark.asyncio
+    async def test_single_quotes_in_default_protect_from_splitting(self):
+        """${Unset:-'a b c'} should produce single word 'a b c'."""
+        bash = Bash()
+        result = await bash.exec("argv.py ${Unset:-'a b c'}")
+        assert result.stdout == "['a b c']\n"
+
+    @pytest.mark.asyncio
+    async def test_double_quotes_in_default_protect_from_splitting(self):
+        """${Unset:-"a b c"} should produce single word 'a b c'."""
+        bash = Bash()
+        result = await bash.exec('argv.py ${Unset:-"a b c"}')
+        assert result.stdout == "['a b c']\n"
+
+    @pytest.mark.asyncio
+    async def test_inner_double_quotes_in_outer_double_quotes_removed(self):
+        '''"${Unset-"b"}" should produce 'b' not '"b"'.'''
+        bash = Bash()
+        result = await bash.exec('argv.py "${Unset-"b"}"')
+        assert result.stdout == "['b']\n"
+
+    @pytest.mark.asyncio
+    async def test_multiple_quoted_words_in_default(self):
+        """${Unset:-"a b" "c d"} should produce two words."""
+        bash = Bash()
+        result = await bash.exec('argv.py ${Unset:-"a b" "c d"}')
+        assert result.stdout == "['a b', 'c d']\n"
+
+    @pytest.mark.asyncio
+    async def test_nested_defaults_with_quotes(self):
+        """Nested ${a:-${a:-"1 2" "3 4"}5 "6 7"} should preserve quoted words."""
+        bash = Bash()
+        result = await bash.exec('argv.py ${a:-${a:-"1 2" "3 4"}5 "6 7"}')
+        assert result.stdout == "['1 2', '3 45', '6 7']\n"
+
+    @pytest.mark.asyncio
+    async def test_mixed_quotes_in_default(self):
+        """${Unset:-'a'"b"'c'} should produce 'abc'."""
+        bash = Bash()
+        result = await bash.exec('argv.py ${Unset:-\'a\'"b"\'c\'}')
+        assert result.stdout == "['abc']\n"
+
+    @pytest.mark.asyncio
+    async def test_alternate_value_with_quotes(self):
+        """${var:+'a b'} should produce 'a b' when var is set."""
+        bash = Bash()
+        result = await bash.exec(r"var=x; argv.py ${var:+'a b'}")
+        assert result.stdout == "['a b']\n"
+
+    @pytest.mark.asyncio
+    async def test_empty_literal_preserved_in_default(self):
+        '''${Unset:-""} should produce one empty word.'''
+        bash = Bash()
+        result = await bash.exec('argv.py ${Unset:-""}')
+        assert result.stdout == "['']\n"
+
+    @pytest.mark.asyncio
+    async def test_empty_var_and_empty_string_suffix(self):
+        '''$empty"" where empty="" should produce one empty word.'''
+        bash = Bash()
+        result = await bash.exec('empty=""; argv.py 1 $empty"" 2')
+        assert result.stdout == "['1', '', '2']\n"
+
+
+class TestWordSplitLiteralPreservation:
+    """Test that literal parts adjacent to expansions are handled correctly."""
+
+    @pytest.mark.asyncio
+    async def test_literal_colon_after_ifs_split(self):
+        """IFS=: with ${word}:b - colon is IFS, so 'a:' splits to 'a' and ''."""
+        bash = Bash()
+        # Note: bash 3.2 and our impl treat the literal : as IFS delimiter
+        result = await bash.exec("IFS=':'; word='a:'; argv.py ${word}:b")
+        assert result.stdout == "['a', '', 'b']\n"
+
+    @pytest.mark.asyncio
+    async def test_literal_after_expansion_trailing(self):
+        """${word}: with trailing literal after expansion."""
+        bash = Bash()
+        result = await bash.exec("IFS=':'; word='a:'; argv.py ${word}:")
+        assert result.stdout == "['a', '']\n"
+
+    @pytest.mark.asyncio
+    async def test_quoted_default_not_further_split(self):
+        '''"${v:-AxBxC}"x should not be split even with IFS=x.'''
+        bash = Bash()
+        result = await bash.exec('IFS=x; argv.py "${v:-AxBxC}"x')
+        assert result.stdout == "['AxBxCx']\n"

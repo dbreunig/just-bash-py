@@ -1746,21 +1746,37 @@ class Parser:
                 all_parts.extend(inner_parts)
         return AST.word(all_parts)
 
-    def _parse_word_from_string(self, value: str, quoted: bool = False, single_quoted: bool = False, in_assignment: bool = False, in_heredoc: bool = False) -> WordNode:
-        """Parse a string into a WordNode with appropriate parts."""
-        parts = self._parse_word_parts(value, quoted, single_quoted, in_assignment=in_assignment, in_heredoc=in_heredoc)
-        # Wrap double-quoted content in DoubleQuotedPart to preserve quote context
-        if quoted and not single_quoted:
-            return AST.word([DoubleQuotedPart(parts=tuple(parts))])
+    def _parse_word_from_string(self, value: str, quoted: bool = False, single_quoted: bool = False, in_assignment: bool = False, in_heredoc: bool = False, in_param_expansion: bool = False) -> WordNode:
+        """Parse a string into a WordNode with appropriate parts.
+
+        Parameters:
+        - quoted: True if the content came from a double-quoted context
+        - single_quoted: True if the content came from single quotes
+        - in_param_expansion: True if parsing inside ${...} operation word
+          (don't wrap in DoubleQuotedPart; inner quotes define structure)
+        """
+        if in_param_expansion:
+            # For parameter expansion default values, parse allowing inner quotes
+            # to be recognized, but suppress glob expansion
+            parts = self._parse_word_parts(value, quoted=False, single_quoted=single_quoted, in_assignment=in_assignment, in_heredoc=in_heredoc, suppress_glob=quoted)
+        else:
+            # For regular tokens, parse with the quoted context
+            parts = self._parse_word_parts(value, quoted=quoted, single_quoted=single_quoted, in_assignment=in_assignment, in_heredoc=in_heredoc)
+
         # Wrap single-quoted content in SingleQuotedPart
         if single_quoted:
             if len(parts) == 1 and isinstance(parts[0], LiteralPart):
                 return AST.word([SingleQuotedPart(value=parts[0].value)])
             elif len(parts) == 0:
                 return AST.word([SingleQuotedPart(value="")])
+
+        # Wrap double-quoted content in DoubleQuotedPart (unless in param expansion)
+        if quoted and not single_quoted and not in_param_expansion:
+            return AST.word([DoubleQuotedPart(parts=tuple(parts))])
+
         return AST.word(parts)
 
-    def _parse_word_parts(self, value: str, quoted: bool = False, single_quoted: bool = False, in_assignment: bool = False, in_heredoc: bool = False) -> list[WordPart]:
+    def _parse_word_parts(self, value: str, quoted: bool = False, single_quoted: bool = False, in_assignment: bool = False, in_heredoc: bool = False, suppress_glob: bool = False) -> list[WordPart]:
         """Parse word parts from a string value."""
         # Single-quoted strings are completely literal - no expansions
         if single_quoted:
@@ -1994,8 +2010,8 @@ class Parser:
                 i = j + 1 if j < len(value) else j
                 continue
 
-            # Handle glob patterns (only if unquoted)
-            if not quoted and c in "*?[":
+            # Handle glob patterns (only if unquoted and not suppressed)
+            if not quoted and not suppress_glob and c in "*?[":
                 flush_literal()
                 parts.append(GlobPart(pattern=c))
                 i += 1
@@ -2179,52 +2195,53 @@ class Parser:
         rest = content[i:]
 
         # Handle :- := :? :+ (with colon = check empty too)
-        # When inside double quotes, pass quoted=True so single quotes become literal
+        # When inside double quotes, pass quoted=True and in_param_expansion=True
+        # so inner quotes are recognized but don't get wrapped again
         dq = in_double_quotes
         if rest.startswith(":-"):
-            word = self._parse_word_from_string(rest[2:], quoted=dq)
+            word = self._parse_word_from_string(rest[2:], quoted=dq, in_param_expansion=True)
             return ParameterExpansionPart(
                 parameter=param,
                 operation=DefaultValueOp(word=word, check_empty=True),
             )
         if rest.startswith("-"):
-            word = self._parse_word_from_string(rest[1:], quoted=dq)
+            word = self._parse_word_from_string(rest[1:], quoted=dq, in_param_expansion=True)
             return ParameterExpansionPart(
                 parameter=param,
                 operation=DefaultValueOp(word=word, check_empty=False),
             )
         if rest.startswith(":="):
-            word = self._parse_word_from_string(rest[2:], quoted=dq)
+            word = self._parse_word_from_string(rest[2:], quoted=dq, in_param_expansion=True)
             return ParameterExpansionPart(
                 parameter=param,
                 operation=AssignDefaultOp(word=word, check_empty=True),
             )
         if rest.startswith("="):
-            word = self._parse_word_from_string(rest[1:], quoted=dq)
+            word = self._parse_word_from_string(rest[1:], quoted=dq, in_param_expansion=True)
             return ParameterExpansionPart(
                 parameter=param,
                 operation=AssignDefaultOp(word=word, check_empty=False),
             )
         if rest.startswith(":?"):
-            word = self._parse_word_from_string(rest[2:], quoted=dq)
+            word = self._parse_word_from_string(rest[2:], quoted=dq, in_param_expansion=True)
             return ParameterExpansionPart(
                 parameter=param,
                 operation=ErrorIfUnsetOp(word=word, check_empty=True),
             )
         if rest.startswith("?"):
-            word = self._parse_word_from_string(rest[1:], quoted=dq)
+            word = self._parse_word_from_string(rest[1:], quoted=dq, in_param_expansion=True)
             return ParameterExpansionPart(
                 parameter=param,
                 operation=ErrorIfUnsetOp(word=word, check_empty=False),
             )
         if rest.startswith(":+"):
-            word = self._parse_word_from_string(rest[2:], quoted=dq)
+            word = self._parse_word_from_string(rest[2:], quoted=dq, in_param_expansion=True)
             return ParameterExpansionPart(
                 parameter=param,
                 operation=UseAlternativeOp(word=word, check_empty=True),
             )
         if rest.startswith("+"):
-            word = self._parse_word_from_string(rest[1:], quoted=dq)
+            word = self._parse_word_from_string(rest[1:], quoted=dq, in_param_expansion=True)
             return ParameterExpansionPart(
                 parameter=param,
                 operation=UseAlternativeOp(word=word, check_empty=False),

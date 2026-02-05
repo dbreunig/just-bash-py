@@ -728,8 +728,8 @@ async def _expand_part_segments(
         return segments
 
     elif isinstance(part, ParameterExpansionPart):
-        value = await expand_parameter_async(ctx, part, in_double_quotes)
-        return [ExpandedSegment(text=value, quoted=in_double_quotes)]
+        # Use segment-based expansion to preserve quoting in default/alternate values
+        return await expand_parameter_segments_async(ctx, part, in_double_quotes)
 
     elif isinstance(part, TildeExpansionPart):
         if in_double_quotes:
@@ -844,11 +844,13 @@ def _split_segments_on_ifs(
     words: list[str] = []
     current: list[str] = []
     had_content = False  # Track if we've seen any non-IFS content
+    had_quoted_segment = False  # Track if we've seen any quoted segment (even empty)
 
     # Build a flat list of (char, splittable) pairs
     chars: list[tuple[str, bool]] = []
     for seg in segments:
         if seg.quoted:
+            had_quoted_segment = True
             for c in seg.text:
                 chars.append((c, False))
         else:
@@ -912,7 +914,9 @@ def _split_segments_on_ifs(
             had_content = True
             i += 1
 
-    if current or had_content:
+    # Include final word if we have content, or if we had a quoted segment
+    # (quoted empty string "" should produce one empty word)
+    if current or had_content or (had_quoted_segment and not words):
         words.append("".join(current))
 
     return words
@@ -1440,6 +1444,124 @@ async def expand_parameter_async(ctx: "InterpreterContext", part: ParameterExpan
     """Expand a parameter expansion asynchronously."""
     # For now, use sync version - async needed for command substitution in default values
     return expand_parameter(ctx, part, in_double_quotes)
+
+
+async def expand_parameter_segments_async(
+    ctx: "InterpreterContext", part: ParameterExpansionPart, in_double_quotes: bool = False
+) -> list[ExpandedSegment]:
+    """Expand a parameter expansion into segments preserving quoting context.
+
+    For operations like DefaultValue and UseAlternative that use the operation.word,
+    this preserves the quoting context from the word (e.g., ${Unset:-'a b c'} keeps
+    'a b c' as a single quoted segment).
+
+    For other operations (Length, Substring, PatternRemoval, etc.), the result
+    is a single segment inheriting the quoting context from in_double_quotes.
+    """
+    parameter = part.parameter
+    operation = part.operation
+
+    # Handle variable indirection: ${!var}
+    if parameter.startswith("!"):
+        indirect_name = parameter[1:]
+
+        # ${!arr[@]} or ${!arr[*]} - get array keys
+        array_keys_match = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\[[@*]\]$', indirect_name)
+        if array_keys_match:
+            arr_name = array_keys_match.group(1)
+            keys = get_array_keys(ctx, arr_name)
+            return [ExpandedSegment(text=" ".join(keys), quoted=in_double_quotes)]
+
+        # ${!prefix*} or ${!prefix@} - get variable names starting with prefix
+        prefix_match = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)[@*]$', indirect_name)
+        if prefix_match:
+            prefix = prefix_match.group(1)
+            matching = [k for k in ctx.state.env.keys()
+                       if k.startswith(prefix) and not "__" in k]
+            return [ExpandedSegment(text=" ".join(sorted(matching)), quoted=in_double_quotes)]
+
+        # ${!var} - variable indirection
+        from .types import VariableStore
+        env = ctx.state.env
+        if (isinstance(env, VariableStore)
+                and re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', indirect_name)
+                and env.is_nameref(indirect_name)):
+            meta = env._metadata.get(indirect_name)
+            if meta and meta.nameref_target:
+                return [ExpandedSegment(text=meta.nameref_target, quoted=in_double_quotes)]
+            return []
+
+        # Standard indirect: ${!var} uses value of var as variable name
+        ref_name = get_variable(ctx, indirect_name, False)
+        if operation:
+            if ref_name:
+                parameter = ref_name
+            else:
+                parameter = "__indirect_unset__"
+        else:
+            if ref_name:
+                value = get_variable(ctx, ref_name, False)
+                return [ExpandedSegment(text=value, quoted=in_double_quotes)]
+            return []
+
+    # Check if operation handles unset variables
+    skip_nounset = operation and operation.type in (
+        "DefaultValue", "AssignDefault", "UseAlternative", "ErrorIfUnset"
+    )
+
+    value = get_variable(ctx, parameter, not skip_nounset)
+
+    if not operation:
+        return [ExpandedSegment(text=value, quoted=in_double_quotes)]
+
+    # Check if variable is unset
+    array_param_match = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\[[@*]\]$', parameter)
+    if array_param_match:
+        arr_name = array_param_match.group(1)
+        elements = get_array_elements(ctx, arr_name)
+        is_unset = len(elements) == 0
+    elif re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', parameter) and f"{parameter}__is_array" in ctx.state.env:
+        elements = get_array_elements(ctx, parameter)
+        is_unset = len(elements) == 0
+    else:
+        is_unset = parameter not in ctx.state.env
+    is_empty = value == ""
+
+    # Handle operations that use operation.word - preserve quoting
+    if operation.type == "DefaultValue":
+        use_default = is_unset or (operation.check_empty and is_empty)
+        if use_default and operation.word:
+            # Recursively expand the default word, preserving quoting
+            return await expand_word_segments(ctx, operation.word)
+        return [ExpandedSegment(text=value, quoted=in_double_quotes)]
+
+    elif operation.type == "AssignDefault":
+        use_default = is_unset or (operation.check_empty and is_empty)
+        if use_default and operation.word:
+            # Get segments for the default, then flatten for assignment
+            segments = await expand_word_segments(ctx, operation.word)
+            default_value = "".join(seg.text for seg in segments)
+            ctx.state.env[parameter] = default_value
+            return segments
+        return [ExpandedSegment(text=value, quoted=in_double_quotes)]
+
+    elif operation.type == "ErrorIfUnset":
+        should_error = is_unset or (operation.check_empty and is_empty)
+        if should_error:
+            message = await expand_word_async(ctx, operation.word) if operation.word else f"{parameter}: parameter null or not set"
+            raise ExitError(1, "", f"bash: {message}\n")
+        return [ExpandedSegment(text=value, quoted=in_double_quotes)]
+
+    elif operation.type == "UseAlternative":
+        use_alt = not (is_unset or (operation.check_empty and is_empty))
+        if use_alt and operation.word:
+            # Recursively expand the alternate word, preserving quoting
+            return await expand_word_segments(ctx, operation.word)
+        return []
+
+    # For all other operations, use the string-based expansion
+    result = expand_parameter(ctx, part, in_double_quotes)
+    return [ExpandedSegment(text=result, quoted=in_double_quotes)]
 
 
 def expand_brace_range(start: int, end: int, step: int = 1) -> list[str]:
@@ -2006,9 +2128,6 @@ async def expand_word_with_glob(
                 return {"values": [], "quoted": False}
 
         # Perform IFS word splitting
-        if value == "":
-            return {"values": [], "quoted": False}
-
         # Check if the word contained parameter/command expansion that should be split
         has_expansion = any(
             isinstance(p, (ParameterExpansionPart, CommandSubstitutionPart, ArithmeticExpansionPart))
@@ -2020,6 +2139,10 @@ async def expand_word_with_glob(
                 # Split on IFS characters using segment-aware splitting
                 words = _split_segments_on_ifs(segments, ifs)
                 return {"values": words, "quoted": False}
+
+        # Empty unquoted value produces no words
+        if value == "":
+            return {"values": [], "quoted": False}
 
     return {"values": [value], "quoted": all_quoted}
 
