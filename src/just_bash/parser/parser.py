@@ -702,7 +702,14 @@ class Parser:
                             array_str += " "
                         first = False
                         elem_tok = self._current()
-                        array_str += elem_tok.value
+                        # Preserve quotes for empty values to distinguish from missing values
+                        if elem_tok.quoted and elem_tok.value == "":
+                            if elem_tok.single_quoted:
+                                array_str += "''"
+                            else:
+                                array_str += '""'
+                        else:
+                            array_str += elem_tok.value
                         self._advance()
 
                     if self._check(TokenType.RPAREN):
@@ -1757,8 +1764,9 @@ class Parser:
         """
         if in_param_expansion:
             # For parameter expansion default values, parse allowing inner quotes
-            # to be recognized, but suppress glob expansion
-            parts = self._parse_word_parts(value, quoted=False, single_quoted=single_quoted, in_assignment=in_assignment, in_heredoc=in_heredoc, suppress_glob=quoted)
+            # to be recognized, but suppress glob expansion.
+            # When inside double quotes (quoted=True), single quotes are literal.
+            parts = self._parse_word_parts(value, quoted=False, single_quoted=single_quoted, in_assignment=in_assignment, in_heredoc=in_heredoc, suppress_glob=quoted, literal_single_quotes=quoted)
         else:
             # For regular tokens, parse with the quoted context
             parts = self._parse_word_parts(value, quoted=quoted, single_quoted=single_quoted, in_assignment=in_assignment, in_heredoc=in_heredoc)
@@ -1776,8 +1784,13 @@ class Parser:
 
         return AST.word(parts)
 
-    def _parse_word_parts(self, value: str, quoted: bool = False, single_quoted: bool = False, in_assignment: bool = False, in_heredoc: bool = False, suppress_glob: bool = False) -> list[WordPart]:
-        """Parse word parts from a string value."""
+    def _parse_word_parts(self, value: str, quoted: bool = False, single_quoted: bool = False, in_assignment: bool = False, in_heredoc: bool = False, suppress_glob: bool = False, literal_single_quotes: bool = False) -> list[WordPart]:
+        """Parse word parts from a string value.
+
+        Parameters:
+        - literal_single_quotes: If True, treat single quotes as literal characters
+          (not quote markers). Used when parsing inside double-quoted parameter expansion.
+        """
         # Single-quoted strings are completely literal - no expansions
         if single_quoted:
             return [AST.literal(value)] if value else []
@@ -1982,7 +1995,8 @@ class Parser:
                 continue
 
             # Handle single-quoted strings - completely literal, no expansions
-            if c == "'" and not quoted and not in_heredoc:
+            # Skip if literal_single_quotes is set (inside double-quoted param expansion)
+            if c == "'" and not quoted and not in_heredoc and not literal_single_quotes:
                 flush_literal()
                 j = i + 1
                 while j < len(value) and value[j] != "'":

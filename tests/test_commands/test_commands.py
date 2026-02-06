@@ -7914,3 +7914,64 @@ class TestQuotedEmptyExpansionPreservation:
         bash = Bash()
         result = await bash.exec('argv.py "${with_icc+set}" = set')
         assert result.stdout == "['', '=', 'set']\n"
+
+
+class TestSingleQuotesInDoubleQuotedExpansion:
+    """Test that single quotes inside double-quoted parameter expansion are literal.
+
+    In bash, single quotes inside double quotes are literal characters, not quote markers.
+    So "${Unset:-'b'}" should produce 'b' (with the quotes), not b.
+    But ${Unset:-'b'} (unquoted) should recognize single quotes and produce b.
+    """
+
+    @pytest.mark.asyncio
+    async def test_double_quoted_expansion_with_single_quotes_literal(self):
+        '''Single quotes in "${Unset:-'b'}" should be preserved as literal.'''
+        bash = Bash()
+        result = await bash.exec('argv.py "${Unset:-\'b\'}"')
+        # The argument should be the literal string 'b' with single quotes
+        import ast
+        args = ast.literal_eval(result.stdout.strip())
+        assert args == ["'b'"]
+
+    @pytest.mark.asyncio
+    async def test_unquoted_expansion_with_single_quotes_stripped(self):
+        '''Single quotes in ${Unset:-'b'} (unquoted) should be recognized.'''
+        bash = Bash()
+        result = await bash.exec("argv.py ${Unset:-'b'}")
+        assert result.stdout == "['b']\n"
+
+    @pytest.mark.asyncio
+    async def test_double_quoted_expansion_with_nested_double_quotes(self):
+        '''Double quotes in "${Unset:-"b"}" should still be recognized.'''
+        bash = Bash()
+        # The inner "b" is a nested quoted string that resolves to just b
+        result = await bash.exec('argv.py "${Unset:-"b"}"')
+        assert result.stdout == "['b']\n"
+
+    @pytest.mark.asyncio
+    async def test_unquoted_expansion_with_double_quotes(self):
+        '''Double quotes in ${Unset:-"b"} should be recognized.'''
+        bash = Bash()
+        result = await bash.exec('argv.py ${Unset:-"b"}')
+        assert result.stdout == "['b']\n"
+
+    @pytest.mark.asyncio
+    async def test_single_quotes_in_alternative(self):
+        '''Single quotes in "${x+'b'}" should be literal when x is set.'''
+        bash = Bash()
+        result = await bash.exec('x=1; argv.py "${x+\'alt\'}"')
+        # The argument should be the literal string 'alt' with single quotes
+        import ast
+        args = ast.literal_eval(result.stdout.strip())
+        assert args == ["'alt'"]
+
+    @pytest.mark.asyncio
+    async def test_multiple_quoted_values(self):
+        '''Complex case with single quotes in default value.'''
+        bash = Bash()
+        result = await bash.exec('argv.py "${a:-\'x\'}" "${b:-\'y\'}"')
+        # Both arguments should contain literal single quotes
+        import ast
+        args = ast.literal_eval(result.stdout.strip())
+        assert args == ["'x'", "'y'"]

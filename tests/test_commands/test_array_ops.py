@@ -55,6 +55,26 @@ echo "${arr[1]}"
         assert lines[0] == "hello world"
         assert lines[1] == "foo bar"
 
+    @pytest.mark.asyncio
+    async def test_declare_array_with_empty_strings(self):
+        """declare -a should preserve empty string elements."""
+        bash = Bash()
+        result = await bash.exec('''
+declare -a A=('' x "" '')
+argv.py "${A[@]}"
+''')
+        assert result.stdout == "['', 'x', '', '']\n"
+
+    @pytest.mark.asyncio
+    async def test_array_with_empty_strings(self):
+        """Regular array assignment should preserve empty string elements."""
+        bash = Bash()
+        result = await bash.exec('''
+A=('' x "" '')
+argv.py "${A[@]}"
+''')
+        assert result.stdout == "['', 'x', '', '']\n"
+
 
 class TestArrayLocalScope:
     """Test local array in functions."""
