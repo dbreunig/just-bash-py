@@ -7868,3 +7868,49 @@ class TestArraySlicingAsArguments:
         bash = Bash()
         result = await bash.exec('a=(abc DEF gHi); argv.py "${a[@]^^}"')
         assert result.stdout == "['ABC', 'DEF', 'GHI']\n"
+
+
+class TestQuotedEmptyExpansionPreservation:
+    """Test that quoted empty expansion results preserve an empty argument."""
+
+    @pytest.mark.asyncio
+    async def test_quoted_unset_alternative_produces_empty(self):
+        '''"${unset_var+set}" should produce [''] when unset_var is unset.'''
+        bash = Bash()
+        result = await bash.exec('argv.py "${unset_var+set}"')
+        assert result.stdout == "['']\n"
+
+    @pytest.mark.asyncio
+    async def test_unquoted_unset_alternative_is_elided(self):
+        '''${unset_var+set} should produce [] when unset_var is unset.'''
+        bash = Bash()
+        result = await bash.exec('argv.py ${unset_var+set}')
+        assert result.stdout == "[]\n"
+
+    @pytest.mark.asyncio
+    async def test_quoted_set_alternative_produces_value(self):
+        '''"${x+set}" should produce ['set'] when x is set.'''
+        bash = Bash()
+        result = await bash.exec('x=1; argv.py "${x+set}"')
+        assert result.stdout == "['set']\n"
+
+    @pytest.mark.asyncio
+    async def test_quoted_empty_var_produces_empty(self):
+        '''"$empty" should produce [''] when empty="".'''
+        bash = Bash()
+        result = await bash.exec('empty=""; argv.py "$empty"')
+        assert result.stdout == "['']\n"
+
+    @pytest.mark.asyncio
+    async def test_quoted_unset_default_empty_produces_empty(self):
+        '''"${unset:-}" should produce [''] (empty default used).'''
+        bash = Bash()
+        result = await bash.exec('argv.py "${unset:-}"')
+        assert result.stdout == "['']\n"
+
+    @pytest.mark.asyncio
+    async def test_full_regression_case(self):
+        '''argv.py "${with_icc+set}" = set should produce ['', '=', 'set'].'''
+        bash = Bash()
+        result = await bash.exec('argv.py "${with_icc+set}" = set')
+        assert result.stdout == "['', '=', 'set']\n"

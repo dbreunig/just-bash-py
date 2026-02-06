@@ -1530,9 +1530,22 @@ async def expand_parameter_segments_async(
     # Handle operations that use operation.word - preserve quoting
     if operation.type == "DefaultValue":
         use_default = is_unset or (operation.check_empty and is_empty)
-        if use_default and operation.word:
-            # Recursively expand the default word, preserving quoting
-            return await expand_word_segments(ctx, operation.word)
+        if use_default:
+            if operation.word and operation.word.parts:
+                # Recursively expand the default word, preserving quoting
+                segments = await expand_word_segments(ctx, operation.word)
+                # When in double quotes, mark all segments as quoted
+                # and ensure at least one empty segment for empty result
+                if in_double_quotes:
+                    if not segments:
+                        return [ExpandedSegment(text="", quoted=True)]
+                    return [ExpandedSegment(text=seg.text, quoted=True) for seg in segments]
+                return segments
+            else:
+                # Empty default like ${var:-} - if in double quotes, preserve empty
+                if in_double_quotes:
+                    return [ExpandedSegment(text="", quoted=True)]
+                return []
         return [ExpandedSegment(text=value, quoted=in_double_quotes)]
 
     elif operation.type == "AssignDefault":
@@ -1554,9 +1567,23 @@ async def expand_parameter_segments_async(
 
     elif operation.type == "UseAlternative":
         use_alt = not (is_unset or (operation.check_empty and is_empty))
-        if use_alt and operation.word:
-            # Recursively expand the alternate word, preserving quoting
-            return await expand_word_segments(ctx, operation.word)
+        if use_alt:
+            if operation.word and operation.word.parts:
+                # Recursively expand the alternate word, preserving quoting
+                segments = await expand_word_segments(ctx, operation.word)
+                # If expansion produced nothing but we're in double quotes,
+                # return an empty quoted segment
+                if not segments and in_double_quotes:
+                    return [ExpandedSegment(text="", quoted=True)]
+                return segments
+            else:
+                # Empty alternate like ${var:+} with var set - if in double quotes, preserve empty
+                if in_double_quotes:
+                    return [ExpandedSegment(text="", quoted=True)]
+                return []
+        # Variable is unset/empty, don't use alternate - if in double quotes, preserve empty
+        if in_double_quotes:
+            return [ExpandedSegment(text="", quoted=True)]
         return []
 
     # For all other operations, use the string-based expansion
@@ -2215,8 +2242,12 @@ async def expand_word_with_glob(
     # Expand word to segments (primary expansion, handles command substitution etc.)
     segments = await expand_word_segments(ctx, word)
     value = _segments_to_string(segments)
-    # A word is "all quoted" only if every segment is quoted AND there's at least one segment
-    all_quoted = bool(segments) and all(seg.quoted for seg in segments)
+    # A word is "all quoted" if:
+    # 1. Every segment is quoted AND there's at least one segment, OR
+    # 2. The word was syntactically quoted (has_quoted) and the expansion is empty
+    #    This handles cases like "${unset_var+alt}" where unset_var is unset - the
+    #    double quotes should still preserve an empty argument.
+    all_quoted = (bool(segments) and all(seg.quoted for seg in segments)) or (has_quoted and not segments)
 
     # String-level brace expansion fallback for unquoted words where braces
     # span across multiple parts (e.g., {$x,other} where $x is a ParameterExpansionPart)
