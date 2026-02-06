@@ -2296,6 +2296,28 @@ async def expand_word_with_glob(
             if ifs:
                 # Split on IFS characters using segment-aware splitting
                 words = _split_segments_on_ifs(segments, ifs)
+                # After word splitting, glob-expand each word
+                noglob = getattr(ctx.state.options, 'noglob', False)
+                if not noglob:
+                    expanded_words = []
+                    for w in words:
+                        if any(c in w for c in "*?["):
+                            matches = await glob_expand(ctx, w)
+                            if matches:
+                                expanded_words.extend(matches)
+                            else:
+                                # No match - check nullglob/failglob
+                                env = ctx.state.env
+                                if env.get("__shopt_nullglob__") == "1":
+                                    pass  # Skip this word
+                                elif env.get("__shopt_failglob__") == "1":
+                                    ctx.state.expansion_stderr = f"bash: no match: {w}\n"
+                                    ctx.state.expansion_exit_code = 1
+                                else:
+                                    expanded_words.append(w)  # Keep pattern literally
+                        else:
+                            expanded_words.append(w)
+                    return {"values": expanded_words, "quoted": False}
                 return {"values": words, "quoted": False}
 
         # Empty unquoted value produces no words

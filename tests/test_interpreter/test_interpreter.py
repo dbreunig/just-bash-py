@@ -338,3 +338,54 @@ class TestSynchronousRun:
         bash = Bash(files={"/data.txt": "apple\nbanana\napple\ncherry\n"})
         result = bash.run("cat /data.txt | sort | uniq")
         assert result.stdout == "apple\nbanana\ncherry\n"
+
+
+class TestGlobExpansionAfterWordSplit:
+    """Test that glob expansion happens after IFS word splitting."""
+
+    @pytest.mark.asyncio
+    async def test_single_glob_in_variable(self):
+        """A single glob pattern in a variable should expand."""
+        bash = Bash()
+        await bash.exec("touch /tmp/a.txt /tmp/b.txt")
+        result = await bash.exec('x="/tmp/*.txt"; echo $x')
+        assert "/tmp/a.txt" in result.stdout
+        assert "/tmp/b.txt" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_multiple_globs_in_variable(self):
+        """Multiple glob patterns space-separated in a variable should all expand."""
+        bash = Bash()
+        await bash.exec("touch /tmp/a.A /tmp/b.B")
+        result = await bash.exec('x="/tmp/*.A /tmp/*.B"; echo $x')
+        assert "/tmp/a.A" in result.stdout
+        assert "/tmp/b.B" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_glob_from_nested_expansion(self):
+        """Glob from nested variable expansion should expand."""
+        bash = Bash()
+        await bash.exec("touch /tmp/a.A /tmp/aa.A /tmp/b.B")
+        result = await bash.exec('''
+f="/tmp/*.A"
+g="$f /tmp/*.B"
+echo $g
+''')
+        assert "/tmp/a.A" in result.stdout
+        assert "/tmp/aa.A" in result.stdout
+        assert "/tmp/b.B" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_glob_with_no_match_stays_literal(self):
+        """Glob pattern with no matches should stay literal (default behavior)."""
+        bash = Bash()
+        result = await bash.exec('x="/nonexistent/*.xyz"; echo $x')
+        assert result.stdout == "/nonexistent/*.xyz\n"
+
+    @pytest.mark.asyncio
+    async def test_noglob_prevents_expansion(self):
+        """With set -o noglob, glob patterns should not expand."""
+        bash = Bash()
+        await bash.exec("touch /tmp/a.txt /tmp/b.txt")
+        result = await bash.exec('set -o noglob; x="/tmp/*.txt"; echo $x')
+        assert result.stdout == "/tmp/*.txt\n"
