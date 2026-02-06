@@ -389,3 +389,42 @@ echo $g
         await bash.exec("touch /tmp/a.txt /tmp/b.txt")
         result = await bash.exec('set -o noglob; x="/tmp/*.txt"; echo $x')
         assert result.stdout == "/tmp/*.txt\n"
+
+
+class TestTildeExpansionInParameterDefaults:
+    """Test that tilde expansion respects double quote context in parameter defaults."""
+
+    @pytest.mark.asyncio
+    async def test_tilde_expands_in_unquoted_default(self):
+        """Tilde in ${undef:-~} should expand."""
+        bash = Bash()
+        result = await bash.exec('HOME=/home/bar; echo ${undef:-~}')
+        assert result.stdout == "/home/bar\n"
+
+    @pytest.mark.asyncio
+    async def test_tilde_literal_in_double_quoted_expansion(self):
+        """Tilde in "${undef:-~}" should NOT expand (literal ~)."""
+        bash = Bash()
+        result = await bash.exec('HOME=/home/bar; echo "${undef:-~}"')
+        assert result.stdout == "~\n"
+
+    @pytest.mark.asyncio
+    async def test_quoted_tilde_literal_in_default(self):
+        """Tilde in ${undef:-"~"} should NOT expand."""
+        bash = Bash()
+        result = await bash.exec('HOME=/home/bar; echo ${undef:-"~"}')
+        assert result.stdout == "~\n"
+
+    @pytest.mark.asyncio
+    async def test_tilde_expands_in_alternative(self):
+        """Tilde in ${x:+~/z} should expand when x is set."""
+        bash = Bash()
+        result = await bash.exec('HOME=/home/bar; x=1; echo ${x:+~/z}')
+        assert result.stdout == "/home/bar/z\n"
+
+    @pytest.mark.asyncio
+    async def test_tilde_literal_in_double_quoted_alternative(self):
+        """Tilde in "${x:+~}" should NOT expand when x is set."""
+        bash = Bash()
+        result = await bash.exec('HOME=/home/bar; x=1; echo "${x:+~}"')
+        assert result.stdout == "~\n"

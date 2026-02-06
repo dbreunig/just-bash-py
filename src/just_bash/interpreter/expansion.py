@@ -693,16 +693,19 @@ async def expand_part(ctx: "InterpreterContext", part: WordPart, in_double_quote
 
 
 async def expand_word_segments(
-    ctx: "InterpreterContext", word: WordNode
+    ctx: "InterpreterContext", word: WordNode, in_double_quotes: bool = False
 ) -> list[ExpandedSegment]:
     """Expand a word into a list of segments preserving quoting context.
 
     Each segment carries its text and whether it was quoted (protected from
     IFS splitting and globbing).
+
+    Parameters:
+    - in_double_quotes: If True, suppress tilde expansion (tilde should be literal).
     """
     segments: list[ExpandedSegment] = []
     for part in word.parts:
-        segments.extend(await _expand_part_segments(ctx, part, in_double_quotes=False))
+        segments.extend(await _expand_part_segments(ctx, part, in_double_quotes=in_double_quotes))
     return segments
 
 
@@ -1533,7 +1536,8 @@ async def expand_parameter_segments_async(
         if use_default:
             if operation.word and operation.word.parts:
                 # Recursively expand the default word, preserving quoting
-                segments = await expand_word_segments(ctx, operation.word)
+                # Pass in_double_quotes to suppress tilde expansion when inside double quotes
+                segments = await expand_word_segments(ctx, operation.word, in_double_quotes)
                 # When in double quotes, mark all segments as quoted
                 # and ensure at least one empty segment for empty result
                 if in_double_quotes:
@@ -1552,7 +1556,8 @@ async def expand_parameter_segments_async(
         use_default = is_unset or (operation.check_empty and is_empty)
         if use_default and operation.word:
             # Get segments for the default, then flatten for assignment
-            segments = await expand_word_segments(ctx, operation.word)
+            # Pass in_double_quotes to suppress tilde expansion when inside double quotes
+            segments = await expand_word_segments(ctx, operation.word, in_double_quotes)
             default_value = "".join(seg.text for seg in segments)
             ctx.state.env[parameter] = default_value
             return segments
@@ -1570,7 +1575,8 @@ async def expand_parameter_segments_async(
         if use_alt:
             if operation.word and operation.word.parts:
                 # Recursively expand the alternate word, preserving quoting
-                segments = await expand_word_segments(ctx, operation.word)
+                # Pass in_double_quotes to suppress tilde expansion when inside double quotes
+                segments = await expand_word_segments(ctx, operation.word, in_double_quotes)
                 # If expansion produced nothing but we're in double quotes,
                 # return an empty quoted segment
                 if not segments and in_double_quotes:
