@@ -319,6 +319,18 @@ echo "${arr[@]: -2}"
 ''')
         assert "d e" in result.stdout
 
+    @pytest.mark.asyncio
+    async def test_slice_negative_length_is_error(self):
+        """Negative length in array slice is an error in bash 4.2+."""
+        bash = Bash()
+        result = await bash.exec('''
+a=(1 2 3 4 5)
+echo "${a[@]: 1: -3}"
+''')
+        # Bash returns error for negative length in array slices
+        assert result.exit_code == 1
+        assert "substring expression" in result.stderr.lower() or "bad" in result.stderr.lower()
+
 
 class TestArrayAppend:
     """Test array append operations."""
@@ -484,6 +496,19 @@ echo "${arr[@]}"
         out = result.stdout.strip()
         assert "10" in out
         assert "20" in out
+
+    @pytest.mark.asyncio
+    async def test_assoc_array_quoted_key_with_special_chars(self):
+        """Associative array key with special characters should work."""
+        bash = Bash()
+        result = await bash.exec('''
+declare -A a
+a["aa"]=b
+a["foo"]=bar
+a['a+1']=c
+echo "${a["aa"]}" "${a["foo"]}" "${a["a+1"]}"
+''')
+        assert result.stdout.strip() == "b bar c"
 
 
 class TestLocalArrayWithoutFlag:

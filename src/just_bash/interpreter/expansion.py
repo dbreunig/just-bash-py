@@ -88,7 +88,12 @@ def get_variable(ctx: "InterpreterContext", name: str, check_nounset: bool = Tru
         is_assoc = env.get(f"{arr_name}__is_array") == "assoc"
         if is_assoc:
             # For associative arrays, use subscript as string key directly
-            key = f"{arr_name}_{subscript}"
+            # Strip surrounding quotes from the key
+            lookup_key = subscript
+            if (lookup_key.startswith('"') and lookup_key.endswith('"')) or \
+               (lookup_key.startswith("'") and lookup_key.endswith("'")):
+                lookup_key = lookup_key[1:-1]
+            key = f"{arr_name}_{lookup_key}"
             if key in env:
                 return env[key]
             elif check_nounset and ctx.state.options.nounset:
@@ -1069,8 +1074,8 @@ def expand_parameter(ctx: "InterpreterContext", part: ParameterExpansionPart, in
                 offset = max(0, len(values) + offset)
             if length is not None:
                 if length < 0:
-                    end_pos = len(values) + length
-                    sliced = values[offset:max(offset, end_pos)]
+                    # Negative length in array slices is an error (bash 4.2+)
+                    raise ExitError(1, "", f"bash: {array_match.group(1)}[@]: bad substring expression\n")
                 else:
                     sliced = values[offset:offset + length]
             else:
@@ -2027,8 +2032,8 @@ def _apply_array_operation_list(
 
         if length is not None:
             if length < 0:
-                end_pos = len(values) + length
-                sliced = values[offset:max(offset, end_pos)]
+                # Negative length in array slices is an error (bash 4.2+)
+                raise ExitError(1, "", f"bash: {arr_name}[@]: bad substring expression\n")
             else:
                 sliced = values[offset:offset + length]
         else:

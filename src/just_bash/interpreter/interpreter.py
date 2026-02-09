@@ -802,6 +802,11 @@ class Interpreter:
                         if not is_assoc:
                             from .expansion import _eval_array_subscript
                             subscript = str(_eval_array_subscript(self._ctx, subscript))
+                        else:
+                            # For associative arrays, strip surrounding quotes from the key
+                            if (subscript.startswith('"') and subscript.endswith('"')) or \
+                               (subscript.startswith("'") and subscript.endswith("'")):
+                                subscript = subscript[1:-1]
                     # Resolve nameref for array base name
                     if isinstance(self._state.env, VariableStore) and self._state.env.is_nameref(arr_name):
                         try:
