@@ -212,8 +212,9 @@ async def handle_declare(ctx: "InterpreterContext", args: list[str]) -> "ExecRes
                 ctx.state.env[name] = value_str
             continue
 
-        # Handle array declaration
-        if options["array"] or options["assoc"]:
+        # Handle array declaration - detect (values...) syntax even without -a flag
+        is_array_literal = value_str is not None and value_str.startswith("(") and value_str.endswith(")")
+        if options["array"] or options["assoc"] or is_array_literal:
             # Initialize array if not already set
             array_key = f"{name}__is_array"
             if array_key not in ctx.state.env:

@@ -702,12 +702,12 @@ class Parser:
                             array_str += " "
                         first = False
                         elem_tok = self._current()
-                        # Preserve quotes for empty values to distinguish from missing values
-                        if elem_tok.quoted and elem_tok.value == "":
+                        # Preserve quotes to maintain element boundaries
+                        if elem_tok.quoted:
                             if elem_tok.single_quoted:
-                                array_str += "''"
+                                array_str += "'" + elem_tok.value + "'"
                             else:
-                                array_str += '""'
+                                array_str += '"' + elem_tok.value + '"'
                         else:
                             array_str += elem_tok.value
                         self._advance()

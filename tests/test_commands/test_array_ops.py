@@ -484,3 +484,69 @@ echo "${arr[@]}"
         out = result.stdout.strip()
         assert "10" in out
         assert "20" in out
+
+
+class TestLocalArrayWithoutFlag:
+    """Test local array initialization without -a flag."""
+
+    @pytest.mark.asyncio
+    async def test_local_array_without_flag(self):
+        """local a=(1 2) should work without -a flag."""
+        bash = Bash()
+        result = await bash.exec('''
+f() {
+    local a=(1 2 3)
+    echo "${a[0]} ${a[1]} ${a[2]}"
+}
+f
+''')
+        assert result.stdout.strip() == "1 2 3"
+
+    @pytest.mark.asyncio
+    async def test_local_array_with_quoted_element(self):
+        """local a=(1 '2 3') should preserve quoted element."""
+        bash = Bash()
+        result = await bash.exec('''
+f() {
+    local a=(1 '2 3')
+    argv.py "${a[0]}"
+}
+f
+''')
+        assert result.stdout == "['1']\n"
+
+    @pytest.mark.asyncio
+    async def test_local_array_element_with_space(self):
+        """local a=(1 '2 3') second element has space."""
+        bash = Bash()
+        result = await bash.exec('''
+f() {
+    local a=(1 '2 3')
+    argv.py "${a[1]}"
+}
+f
+''')
+        assert result.stdout == "['2 3']\n"
+
+    @pytest.mark.asyncio
+    async def test_local_array_length(self):
+        """local a=(x y z) should have length 3."""
+        bash = Bash()
+        result = await bash.exec('''
+f() {
+    local a=(x y z)
+    echo ${#a[@]}
+}
+f
+''')
+        assert result.stdout.strip() == "3"
+
+    @pytest.mark.asyncio
+    async def test_declare_array_without_flag(self):
+        """declare a=(1 2) should work without -a flag."""
+        bash = Bash()
+        result = await bash.exec('''
+declare a=(1 2 3)
+echo "${a[0]} ${a[1]} ${a[2]}"
+''')
+        assert result.stdout.strip() == "1 2 3"
