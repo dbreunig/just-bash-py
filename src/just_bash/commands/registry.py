@@ -132,6 +132,7 @@ COMMAND_NAMES = [
     "whoami",
     # Testing utilities
     "argv.py",
+    "printenv.py",
     # Builtins
     "read",
     # Compression
@@ -251,6 +252,7 @@ _command_loaders: list[LazyCommandDef] = [
     LazyCommandDef(name="whoami", load=lambda: _load_whoami()),
     # Testing utilities
     LazyCommandDef(name="argv.py", load=lambda: _load_argv()),
+    LazyCommandDef(name="printenv.py", load=lambda: _load_printenv_py()),
     # Builtins
     LazyCommandDef(name="read", load=lambda: _load_read()),
     LazyCommandDef(name="split", load=lambda: _load_split()),
@@ -725,6 +727,12 @@ async def _load_argv() -> Command:
     """Load the argv.py command."""
     from .argv.argv import ArgvCommand
     return ArgvCommand()
+
+
+async def _load_printenv_py() -> Command:
+    """Load the printenv.py test helper command."""
+    from .printenv_py.printenv_py import PrintenvPyCommand
+    return PrintenvPyCommand()
 
 
 async def _load_read() -> Command:

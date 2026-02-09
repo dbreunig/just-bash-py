@@ -39,13 +39,27 @@ class ArgvCommand:
 class PrintenvCommand:
     """printenv.py - prints environment variable values, one per line.
 
-    Prints "None" for variables that are not set (matching Python's printenv.py).
+    Prints "None" for variables that are not set or not exported
+    (matching Python's printenv.py behavior in subprocess context).
     """
 
     name = "printenv.py"
 
+    def _is_exported(self, ctx: CommandContext, name: str) -> bool:
+        """Check if a variable is exported (visible to subprocesses)."""
+        from just_bash.interpreter.types import VariableStore
+        if isinstance(ctx.env, VariableStore):
+            return "x" in ctx.env.get_attributes(name)
+        # If not a VariableStore, assume all variables are exported
+        return True
+
     async def execute(self, args: list[str], ctx: CommandContext) -> ExecResult:
-        values = [ctx.env.get(name, "None") for name in args]
+        values = []
+        for name in args:
+            if name in ctx.env and self._is_exported(ctx, name):
+                values.append(ctx.env[name])
+            else:
+                values.append("None")
         output = "\n".join(values)
         return ExecResult(
             stdout=f"{output}\n" if output else "",

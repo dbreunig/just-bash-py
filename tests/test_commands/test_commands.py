@@ -3497,6 +3497,32 @@ class TestPrintenvCommand:
         result = await bash.exec("printenv NONEXISTENT_VAR")
         assert result.exit_code == 1
 
+    @pytest.mark.asyncio
+    async def test_printenv_unexported_var(self):
+        """printenv should not see variables that are not exported."""
+        bash = Bash()
+        # Set a variable without exporting it
+        await bash.exec("MY_VAR=value")
+        result = await bash.exec("printenv MY_VAR")
+        assert result.exit_code == 1
+        assert result.stdout == ""
+
+    @pytest.mark.asyncio
+    async def test_printenv_after_export_n(self):
+        """printenv should not see variables after export -n."""
+        bash = Bash()
+        # Export a variable
+        await bash.exec("export MY_VAR=exported")
+        result = await bash.exec("printenv MY_VAR")
+        assert result.stdout.strip() == "exported"
+        # Unexport it with export -n
+        await bash.exec("export -n MY_VAR")
+        result = await bash.exec("printenv MY_VAR")
+        assert result.exit_code == 1
+        # But shell variable should still exist
+        result = await bash.exec("echo $MY_VAR")
+        assert result.stdout.strip() == "exported"
+
 
 class TestHostnameCommand:
     """Test hostname command."""

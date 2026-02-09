@@ -117,9 +117,21 @@ class EnvCommand:
 
 
 class PrintenvCommand:
-    """The printenv command - print environment variables."""
+    """The printenv command - print environment variables.
+
+    This simulates subprocess behavior - only exported variables are visible.
+    """
 
     name = "printenv"
+
+    def _is_exported(self, ctx: CommandContext, name: str) -> bool:
+        """Check if a variable is exported (visible to subprocesses)."""
+        # Import here to avoid circular imports
+        from ...interpreter.types import VariableStore
+        if isinstance(ctx.env, VariableStore):
+            return "x" in ctx.env.get_attributes(name)
+        # If not a VariableStore, assume all variables are exported (backwards compat)
+        return True
 
     async def execute(self, args: list[str], ctx: CommandContext) -> ExecResult:
         """Execute the printenv command."""
@@ -138,20 +150,23 @@ class PrintenvCommand:
                 var_names.append(arg)
 
         if not var_names:
-            # Print all
-            lines = [f"{k}={v}" for k, v in sorted(ctx.env.items())]
+            # Print all exported variables
+            lines = []
+            for k, v in sorted(ctx.env.items()):
+                if self._is_exported(ctx, k):
+                    lines.append(f"{k}={v}")
             return ExecResult(
                 stdout="\n".join(lines) + "\n" if lines else "",
                 stderr="",
                 exit_code=0,
             )
 
-        # Print specific variables
+        # Print specific variables (only if exported)
         output_lines = []
         exit_code = 0
 
         for name in var_names:
-            if name in ctx.env:
+            if name in ctx.env and self._is_exported(ctx, name):
                 output_lines.append(ctx.env[name])
             else:
                 exit_code = 1

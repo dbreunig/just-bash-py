@@ -109,8 +109,14 @@ class Bash:
             "BASH_VERSION": "5.0.0(1)-release",
             "OPTIND": "1",
         })
+        # Mark default environment variables as exported (visible to subprocesses)
+        for var in ("PATH", "HOME", "USER", "SHELL", "PWD", "SHLVL", "BASH_VERSION"):
+            default_env.set_attribute(var, "x")
         if env:
             default_env.update(env)
+            # Mark user-provided env vars as exported
+            for var in env:
+                default_env.set_attribute(var, "x")
 
         self._initial_state = InterpreterState(
             env=default_env,
