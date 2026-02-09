@@ -78,6 +78,14 @@ def _apply_tilde_to_assignment(arg: str, ctx) -> str:
     return arg
 
 
+def _maybe_export_variable(state: "InterpreterState", name: str) -> None:
+    """If allexport is enabled, mark the variable as exported."""
+    if state.options.allexport and isinstance(state.env, VariableStore):
+        # Don't export special/internal variables
+        if not name.startswith("_") and name not in ("?", "#", "$", "!", "-", "*", "@") and not name.isdigit():
+            state.env.set_attribute(name, "x")
+
+
 def _ok() -> ExecResult:
     """Return a successful result."""
     return ExecResult(stdout="", stderr="", exit_code=0)
@@ -714,6 +722,7 @@ class Interpreter:
                     for i, elem in enumerate(assignment.array):
                         elem_value = await expand_word_async(self._ctx, elem)
                         self._state.env[f"{name}_{next_idx + i}"] = elem_value
+                    _maybe_export_variable(self._state, name)
                 else:
                     # a=(1 2 3) - replace array
                     # Clear existing array elements
@@ -742,6 +751,7 @@ class Interpreter:
                         else:
                             self._state.env[f"{name}_{auto_idx}"] = elem_value
                             auto_idx += 1
+                    _maybe_export_variable(self._state, name)
                 continue
 
             # Resolve nameref for the assignment target
@@ -809,6 +819,7 @@ class Interpreter:
                 elif assignment.append:
                     existing = self._state.env.get(name, "")
                     self._state.env[name] = existing + value
+                    _maybe_export_variable(self._state, name)
                 else:
                     # Special handling for SECONDS - reset timer
                     if name == "SECONDS":
@@ -819,6 +830,7 @@ class Interpreter:
                         except (ValueError, TypeError):
                             self._state.seconds_reset_time = time.time()
                     self._state.env[name] = value
+                    _maybe_export_variable(self._state, name)
             else:
                 # Temporary assignment for command
                 temp_assignments[name] = self._state.env.get(name)
