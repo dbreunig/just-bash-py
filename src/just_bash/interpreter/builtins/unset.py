@@ -83,6 +83,21 @@ async def handle_unset(ctx: "InterpreterContext", args: list[str]) -> "ExecResul
                         stderr=f"bash: unset: {arr_name}: cannot unset: readonly variable\n",
                         exit_code=1,
                     )
+                # Evaluate subscript for indexed arrays (handles negative indices)
+                is_assoc = env.get(f"{arr_name}__is_array") == "assoc"
+                if not is_assoc:
+                    from ..expansion import _eval_array_subscript, get_array_elements
+                    try:
+                        idx = _eval_array_subscript(ctx, subscript)
+                        # Handle negative index
+                        if idx < 0:
+                            elements = get_array_elements(ctx, arr_name)
+                            if elements:
+                                max_idx = max(i for i, _ in elements)
+                                idx = max_idx + 1 + idx
+                        subscript = str(idx)
+                    except (ValueError, TypeError):
+                        pass  # Use subscript as-is if evaluation fails
                 # Remove specific array element
                 env.pop(f"{arr_name}_{subscript}", None)
             else:

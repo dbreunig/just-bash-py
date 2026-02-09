@@ -423,6 +423,21 @@ echo "len: ${#arr[@]}"
 ''')
         assert "len: 0" in result.stdout
 
+    @pytest.mark.asyncio
+    async def test_unset_negative_index(self):
+        """Unset element with negative index."""
+        bash = Bash()
+        result = await bash.exec('''
+a=(0 1 2 3)
+unset a[-1]
+echo "len=${#a[@]}"
+unset a[-1]
+echo "len=${#a[@]}"
+''')
+        lines = result.stdout.strip().split('\n')
+        assert lines[0] == "len=3"
+        assert lines[1] == "len=2"
+
 
 class TestArrayInLoop:
     """Test arrays in loops."""
