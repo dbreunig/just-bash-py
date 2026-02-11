@@ -731,8 +731,11 @@ class Interpreter:
                     for k in to_remove:
                         del self._state.env[k]
 
-                    # Mark as array
-                    self._state.env[f"{name}__is_array"] = "indexed"
+                    # Preserve array type if already declared (e.g., declare -A)
+                    # Otherwise mark as indexed
+                    existing_type = self._state.env.get(f"{name}__is_array")
+                    if existing_type not in ("assoc", "associative"):
+                        self._state.env[f"{name}__is_array"] = "indexed"
 
                     # Expand and store each element, handling [idx]=value syntax
                     auto_idx = 0

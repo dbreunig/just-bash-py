@@ -594,6 +594,19 @@ echo "${a["aa"]}" "${a["foo"]}" "${a["a+1"]}"
 ''')
         assert result.stdout.strip() == "b bar c"
 
+    @pytest.mark.asyncio
+    async def test_assoc_array_separate_declaration_and_assignment(self):
+        """Assoc array: declare -A then a=([key]=value) syntax."""
+        bash = Bash()
+        result = await bash.exec('''
+declare -A a
+a=([aa]=b [foo]=bar ['a+1']=c)
+echo ${a["aa"]}
+echo ${a["foo"]}
+echo ${a["a+1"]}
+''')
+        assert result.stdout.strip() == "b\nbar\nc"
+
 
 class TestLocalArrayWithoutFlag:
     """Test local array initialization without -a flag."""
