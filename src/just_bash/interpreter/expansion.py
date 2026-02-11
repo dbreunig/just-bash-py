@@ -433,6 +433,35 @@ def _expand_arith_vars(ctx: "InterpreterContext", expr: str) -> str:
             while j < len(expr) and (expr[j].isalnum() or expr[j] == '_'):
                 j += 1
             var_name = expr[i:j]
+            # Check for array subscript notation: name[subscript]
+            if j < len(expr) and expr[j] == '[':
+                bracket_end = j + 1
+                bracket_depth = 1
+                while bracket_end < len(expr) and bracket_depth > 0:
+                    if expr[bracket_end] == '[':
+                        bracket_depth += 1
+                    elif expr[bracket_end] == ']':
+                        bracket_depth -= 1
+                    bracket_end += 1
+                if bracket_depth == 0:
+                    # Get the subscript content and evaluate it
+                    subscript = expr[j + 1:bracket_end - 1]
+                    idx = _eval_array_subscript(ctx, subscript)
+                    # Handle negative index
+                    if idx < 0:
+                        elements = get_array_elements(ctx, var_name)
+                        if elements:
+                            max_idx = max(elem_i for elem_i, _ in elements)
+                            idx = max_idx + 1 + idx
+                    # Get the array element value
+                    val = ctx.state.env.get(f"{var_name}_{idx}", "0")
+                    try:
+                        result.append(str(int(val)))
+                    except ValueError:
+                        result.append("0")
+                    i = bracket_end
+                    continue
+            # Regular variable
             val = ctx.state.env.get(var_name, "0")
             try:
                 result.append(str(int(val)))
@@ -446,18 +475,90 @@ def _expand_arith_vars(ctx: "InterpreterContext", expr: str) -> str:
 
 
 def _expand_subscript_vars(ctx: "InterpreterContext", subscript: str) -> str:
-    """Expand $VAR and ${VAR} references in array subscript."""
+    """Expand $VAR, ${VAR}, ${arr[idx]}, and $(cmd) references in array subscript."""
     result = []
     i = 0
     while i < len(subscript):
         if subscript[i] == '$':
             if i + 1 < len(subscript):
-                if subscript[i + 1] == '{':
-                    # ${VAR} syntax
-                    j = subscript.find('}', i + 2)
-                    if j != -1:
-                        var_name = subscript[i + 2:j]
-                        val = ctx.state.env.get(var_name, "0")
+                if subscript[i + 1] == '(':
+                    # $(command) substitution - find matching )
+                    paren_depth = 1
+                    j = i + 2
+                    while j < len(subscript) and paren_depth > 0:
+                        if subscript[j] == '(':
+                            paren_depth += 1
+                        elif subscript[j] == ')':
+                            paren_depth -= 1
+                        j += 1
+                    if paren_depth == 0:
+                        cmd_content = subscript[i + 2:j - 1]
+                        # Execute command substitution
+                        import asyncio
+                        try:
+                            import nest_asyncio
+                            nest_asyncio.apply()
+                        except Exception:
+                            pass
+                        # Parse and execute the command
+                        from ..parser.parser import Parser
+                        try:
+                            parser = Parser()
+                            script_node = parser.parse(cmd_content)
+
+                            async def run_cmd():
+                                exec_result = await ctx.execute_script(script_node)
+                                return exec_result.stdout.rstrip('\n')
+
+                            try:
+                                loop = asyncio.get_event_loop()
+                            except RuntimeError:
+                                loop = asyncio.new_event_loop()
+                                asyncio.set_event_loop(loop)
+                            if loop.is_running():
+                                # Create a new task in the running loop
+                                import concurrent.futures
+                                with concurrent.futures.ThreadPoolExecutor() as pool:
+                                    future = pool.submit(asyncio.run, run_cmd())
+                                    val = future.result()
+                            else:
+                                val = loop.run_until_complete(run_cmd())
+                        except Exception:
+                            val = "0"
+                        result.append(val)
+                        i = j
+                        continue
+                elif subscript[i + 1] == '{':
+                    # ${VAR} or ${arr[idx]} syntax - find matching }
+                    bracket_depth = 0
+                    j = i + 2
+                    while j < len(subscript):
+                        if subscript[j] == '{':
+                            bracket_depth += 1
+                        elif subscript[j] == '}':
+                            if bracket_depth == 0:
+                                break
+                            bracket_depth -= 1
+                        j += 1
+                    if j < len(subscript):
+                        content = subscript[i + 2:j]
+                        # Check for array subscript: arr[idx]
+                        arr_match = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\[(.+)\]$', content)
+                        if arr_match:
+                            arr_name = arr_match.group(1)
+                            arr_subscript = arr_match.group(2)
+                            # Recursively expand the subscript
+                            expanded_subscript = _expand_subscript_vars(ctx, arr_subscript)
+                            idx = _eval_array_subscript(ctx, expanded_subscript)
+                            # Handle negative index
+                            if idx < 0:
+                                elements = get_array_elements(ctx, arr_name)
+                                if elements:
+                                    max_idx = max(elem_i for elem_i, _ in elements)
+                                    idx = max_idx + 1 + idx
+                            val = ctx.state.env.get(f"{arr_name}_{idx}", "0")
+                        else:
+                            val = ctx.state.env.get(content, "0")
                         result.append(val)
                         i = j + 1
                         continue

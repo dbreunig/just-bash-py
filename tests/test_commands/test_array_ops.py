@@ -394,6 +394,75 @@ echo "${arr[@]}"
 ''')
         assert "a X c" in result.stdout
 
+    @pytest.mark.asyncio
+    async def test_assign_negative_index(self):
+        """Assign to element with negative index."""
+        bash = Bash()
+        result = await bash.exec('''
+a=(1 2 3)
+a[-1]=X
+echo "${a[@]}"
+''')
+        assert result.stdout.strip() == "1 2 X"
+
+    @pytest.mark.asyncio
+    async def test_append_negative_index(self):
+        """Append to last element with negative index."""
+        bash = Bash()
+        result = await bash.exec('''
+a=(1 '2 3')
+a[-1]+=' 4'
+echo "${a[@]}"
+''')
+        # Element count should be 2, last element should be "2 3 4"
+        assert result.stdout.strip() == "1 2 3 4"
+
+    @pytest.mark.asyncio
+    async def test_assign_negative_index_two(self):
+        """Assign to second-to-last element."""
+        bash = Bash()
+        result = await bash.exec('''
+a=(a b c d)
+a[-2]=X
+echo "${a[@]}"
+''')
+        assert result.stdout.strip() == "a b X d"
+
+    @pytest.mark.asyncio
+    async def test_assign_with_nested_array_index(self):
+        """Assign using array element as index: a[a[1]]=X."""
+        bash = Bash()
+        result = await bash.exec('''
+a=(1 2 3)
+a[a[1]]=X
+echo ${a[@]}
+''')
+        # a[1] is 2, so a[2]=X, result is 1 2 X
+        assert result.stdout.strip() == "1 2 X"
+
+    @pytest.mark.asyncio
+    async def test_assign_with_param_expansion_index(self):
+        """Assign using ${arr[idx]} as index."""
+        bash = Bash()
+        result = await bash.exec('''
+a=(1 '2 3')
+i=(0 1)
+a[${i[1]}]=9
+echo "${a[@]}"
+''')
+        # i[1] is 1, so a[1]=9, result is 1 9
+        assert result.stdout.strip() == "1 9"
+
+    @pytest.mark.asyncio
+    async def test_read_with_command_sub_index(self):
+        """Read array element with command substitution index."""
+        bash = Bash()
+        result = await bash.exec('''
+a=(1 '2 3')
+echo "${a[$(echo 1)]}"
+''')
+        assert result.stdout.strip() == "2 3"
+
 
 class TestArrayUnset:
     """Test unsetting array elements."""

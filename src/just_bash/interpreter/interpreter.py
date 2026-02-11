@@ -800,8 +800,15 @@ class Interpreter:
                     if subscript not in ("@", "*"):
                         is_assoc = self._state.env.get(f"{arr_name}__is_array") in ("assoc", "associative")
                         if not is_assoc:
-                            from .expansion import _eval_array_subscript
-                            subscript = str(_eval_array_subscript(self._ctx, subscript))
+                            from .expansion import _eval_array_subscript, get_array_elements
+                            idx = _eval_array_subscript(self._ctx, subscript)
+                            # Handle negative indices - resolve to actual position
+                            if idx < 0:
+                                elements = get_array_elements(self._ctx, arr_name)
+                                if elements:
+                                    max_idx = max(i for i, _ in elements)
+                                    idx = max_idx + 1 + idx
+                            subscript = str(idx)
                         else:
                             # For associative arrays, strip surrounding quotes from the key
                             if (subscript.startswith('"') and subscript.endswith('"')) or \
