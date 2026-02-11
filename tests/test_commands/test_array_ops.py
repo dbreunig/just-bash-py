@@ -429,6 +429,19 @@ echo "${a[@]}"
         assert result.stdout.strip() == "a b X d"
 
     @pytest.mark.asyncio
+    async def test_assign_negative_out_of_bounds(self):
+        """Negative index that resolves to out-of-bounds should error."""
+        bash = Bash()
+        result = await bash.exec('''
+a[9]=x
+a[-11]=E
+echo "done"
+''')
+        assert "bad array subscript" in result.stderr
+        # Script should still continue after the error
+        assert "done" in result.stdout
+
+    @pytest.mark.asyncio
     async def test_assign_with_nested_array_index(self):
         """Assign using array element as index: a[a[1]]=X."""
         bash = Bash()

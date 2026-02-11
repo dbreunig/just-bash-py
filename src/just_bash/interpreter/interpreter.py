@@ -811,6 +811,20 @@ class Interpreter:
                                 if elements:
                                     max_idx = max(i for i, _ in elements)
                                     idx = max_idx + 1 + idx
+                                    # If still negative, it's out of bounds
+                                    if idx < 0:
+                                        return ExecResult(
+                                            stdout="",
+                                            stderr=f"bash: {arr_name}[{subscript}]: bad array subscript\n",
+                                            exit_code=1,
+                                        )
+                                else:
+                                    # Empty array with negative index is an error
+                                    return ExecResult(
+                                        stdout="",
+                                        stderr=f"bash: {arr_name}[{subscript}]: bad array subscript\n",
+                                        exit_code=1,
+                                    )
                             subscript = str(idx)
                         else:
                             # For associative arrays, strip surrounding quotes from the key
