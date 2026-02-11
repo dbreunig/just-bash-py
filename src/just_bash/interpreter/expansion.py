@@ -43,6 +43,56 @@ class ExpandedSegment:
     quoted: bool  # True = protected from IFS splitting and globbing
 
 
+def _is_file_read_shorthand(body) -> bool:
+    """Check if this is the $(< file) shorthand for reading file contents.
+
+    Returns True if the body is a single command with no name/args and just
+    a single '<' redirection.
+    """
+    from ..ast.types import ScriptNode, StatementNode, PipelineNode, SimpleCommandNode
+
+    if not isinstance(body, ScriptNode) or len(body.statements) != 1:
+        return False
+
+    stmt = body.statements[0]
+    if not isinstance(stmt, StatementNode) or len(stmt.pipelines) != 1:
+        return False
+
+    pipeline = stmt.pipelines[0]
+    if not isinstance(pipeline, PipelineNode) or len(pipeline.commands) != 1:
+        return False
+
+    cmd = pipeline.commands[0]
+    if not isinstance(cmd, SimpleCommandNode):
+        return False
+
+    # Check: no command name, no args, exactly one '<' redirection
+    if cmd.name is not None or len(cmd.args) > 0:
+        return False
+
+    if len(cmd.redirections) != 1:
+        return False
+
+    redir = cmd.redirections[0]
+    return redir.operator == '<' and redir.target is not None
+
+
+async def _get_file_read_path(ctx: "InterpreterContext", body) -> Optional[str]:
+    """Extract the file path from a $(< file) shorthand."""
+    from ..ast.types import ScriptNode
+
+    if not isinstance(body, ScriptNode):
+        return None
+
+    stmt = body.statements[0]
+    pipeline = stmt.pipelines[0]
+    cmd = pipeline.commands[0]
+    redir = cmd.redirections[0]
+
+    # Expand the target path
+    return await expand_word_async(ctx, redir.target)
+
+
 def get_variable(ctx: "InterpreterContext", name: str, check_nounset: bool = True) -> str:
     """Get a variable value from the environment.
 
@@ -669,6 +719,22 @@ async def expand_part(ctx: "InterpreterContext", part: WordPart, in_double_quote
                 results.append(await expand_word_async(ctx, item.word))
         return " ".join(results)
     elif isinstance(part, CommandSubstitutionPart):
+        # Check for $(< file) shorthand - read file directly
+        if _is_file_read_shorthand(part.body):
+            try:
+                file_path = await _get_file_read_path(ctx, part.body)
+                if file_path:
+                    resolved = ctx.fs.resolve_path(ctx.state.cwd, file_path)
+                    content = await ctx.fs.read_file(resolved)
+                    ctx.state.last_exit_code = 0
+                    ctx.state.env["?"] = "0"
+                    ctx.state.expansion_exit_code = 0
+                    return content.rstrip("\n")
+            except Exception:
+                ctx.state.last_exit_code = 1
+                ctx.state.env["?"] = "1"
+                ctx.state.expansion_exit_code = 1
+                return ""
         # Execute the command substitution
         try:
             result = await ctx.execute_script(part.body)
@@ -778,6 +844,22 @@ async def _expand_part_segments(
         return [ExpandedSegment(text=" ".join(results), quoted=in_double_quotes)]
 
     elif isinstance(part, CommandSubstitutionPart):
+        # Check for $(< file) shorthand - read file directly
+        if _is_file_read_shorthand(part.body):
+            try:
+                file_path = await _get_file_read_path(ctx, part.body)
+                if file_path:
+                    resolved = ctx.fs.resolve_path(ctx.state.cwd, file_path)
+                    content = await ctx.fs.read_file(resolved)
+                    ctx.state.last_exit_code = 0
+                    ctx.state.env["?"] = "0"
+                    ctx.state.expansion_exit_code = 0
+                    return [ExpandedSegment(text=content.rstrip("\n"), quoted=in_double_quotes)]
+            except Exception:
+                ctx.state.last_exit_code = 1
+                ctx.state.env["?"] = "1"
+                ctx.state.expansion_exit_code = 1
+                return [ExpandedSegment(text="", quoted=in_double_quotes)]
         try:
             result = await ctx.execute_script(part.body)
             ctx.state.last_exit_code = result.exit_code

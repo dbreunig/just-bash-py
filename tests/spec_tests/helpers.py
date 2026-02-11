@@ -20,13 +20,18 @@ class ArgvCommand:
             has_single_quote = "'" in arg
             has_double_quote = '"' in arg
 
+            # Escape special characters first
+            escaped = arg.replace("\\", "\\\\")
+            escaped = escaped.replace("\n", "\\n")
+            escaped = escaped.replace("\t", "\\t")
+            escaped = escaped.replace("\r", "\\r")
+
             if has_single_quote and not has_double_quote:
                 # Use double quotes when string contains single quotes but no double quotes
-                escaped = arg.replace("\\", "\\\\")
                 formatted.append(f'"{escaped}"')
             else:
-                # Default: use single quotes (escape single quotes and backslashes)
-                escaped = arg.replace("\\", "\\\\").replace("'", "\\'")
+                # Default: use single quotes (escape single quotes)
+                escaped = escaped.replace("'", "\\'")
                 formatted.append(f"'{escaped}'")
 
         return ExecResult(

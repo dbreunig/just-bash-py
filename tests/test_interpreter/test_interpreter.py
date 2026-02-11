@@ -146,6 +146,32 @@ class TestMultipleStatements:
         assert result.stdout == "a\nb\n"
 
 
+class TestCommandSubstitution:
+    """Test command substitution features."""
+
+    @pytest.mark.asyncio
+    async def test_file_read_shorthand(self):
+        """Test $(< file) shorthand for reading file contents."""
+        bash = Bash(files={"/test.txt": "hello\nworld\n"})
+        result = await bash.exec('foo=$(< /test.txt); echo "$foo"')
+        assert result.stdout == "hello\nworld\n"
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_file_read_shorthand_with_variable(self):
+        """Test $(< $file) with variable path."""
+        bash = Bash(files={"/data.txt": "content\n"})
+        result = await bash.exec('f=/data.txt; foo=$(< $f); echo "$foo"')
+        assert result.stdout == "content\n"
+
+    @pytest.mark.asyncio
+    async def test_file_read_strips_trailing_newlines(self):
+        """Command substitution strips trailing newlines."""
+        bash = Bash(files={"/test.txt": "hello\n\n\n"})
+        result = await bash.exec('echo "[$(< /test.txt)]"')
+        assert result.stdout == "[hello]\n"
+
+
 class TestCatCommand:
     """Test cat command."""
 
