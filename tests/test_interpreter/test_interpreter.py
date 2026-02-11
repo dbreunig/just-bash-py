@@ -454,3 +454,61 @@ class TestTildeExpansionInParameterDefaults:
         bash = Bash()
         result = await bash.exec('HOME=/home/bar; x=1; echo "${x:+~}"')
         assert result.stdout == "~\n"
+
+
+class TestNameref:
+    """Test nameref (local -n, declare -n) functionality."""
+
+    @pytest.mark.asyncio
+    async def test_local_nameref_indexed_array(self):
+        """Pass indexed array by reference using local -n."""
+        bash = Bash()
+        result = await bash.exec('''
+show_value() {
+  local -n arr=$1
+  echo "${arr[2]}"
+}
+shadock=(ga bu zo meu)
+show_value shadock
+''')
+        assert result.stdout.strip() == "zo"
+
+    @pytest.mark.asyncio
+    async def test_local_nameref_assoc_array(self):
+        """Pass associative array by reference using local -n."""
+        bash = Bash()
+        result = await bash.exec('''
+show_value() {
+  local -n arr=$1
+  local key=$2
+  echo "${arr[$key]}"
+}
+days=([monday]=eggs [tuesday]=bread [sunday]=jam)
+show_value days sunday
+''')
+        assert result.stdout.strip() == "jam"
+
+    @pytest.mark.asyncio
+    async def test_nameref_array_keys(self):
+        """Get array keys through nameref."""
+        bash = Bash()
+        result = await bash.exec('''
+get_keys() {
+  local -n arr=$1
+  echo "${!arr[@]}"
+}
+data=([a]=1 [b]=2 [c]=3)
+get_keys data
+''')
+        out = result.stdout.strip().split()
+        assert sorted(out) == ["a", "b", "c"]
+
+    @pytest.mark.asyncio
+    async def test_auto_assoc_detection(self):
+        """Array with non-numeric keys auto-detected as associative."""
+        bash = Bash()
+        result = await bash.exec('''
+arr=([foo]=bar [baz]=qux)
+echo "${arr[foo]}"
+''')
+        assert result.stdout.strip() == "bar"

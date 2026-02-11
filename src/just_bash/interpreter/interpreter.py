@@ -732,15 +732,32 @@ class Interpreter:
                         del self._state.env[k]
 
                     # Preserve array type if already declared (e.g., declare -A)
-                    # Otherwise mark as indexed
+                    # Otherwise mark as indexed (may upgrade to assoc if non-numeric keys found)
                     existing_type = self._state.env.get(f"{name}__is_array")
                     if existing_type not in ("assoc", "associative"):
                         self._state.env[f"{name}__is_array"] = "indexed"
 
-                    # Expand and store each element, handling [idx]=value syntax
-                    auto_idx = 0
+                    # First pass: expand elements and check if any non-numeric keys exist
+                    expanded_elements = []
+                    has_non_numeric_key = False
                     for elem in assignment.array:
                         elem_value = await expand_word_async(self._ctx, elem)
+                        bracket_match = _re.match(r'^\[([^\]]+)\]=(.*)$', elem_value)
+                        if bracket_match:
+                            key = bracket_match.group(1)
+                            try:
+                                int(key)
+                            except ValueError:
+                                has_non_numeric_key = True
+                        expanded_elements.append(elem_value)
+
+                    # Upgrade to associative if non-numeric keys found and not already associative
+                    if has_non_numeric_key and self._state.env.get(f"{name}__is_array") == "indexed":
+                        self._state.env[f"{name}__is_array"] = "assoc"
+
+                    # Second pass: store elements
+                    auto_idx = 0
+                    for elem_value in expanded_elements:
                         # Check for [idx]=value syntax (from GlobPart + LiteralPart)
                         bracket_match = _re.match(r'^\[([^\]]+)\]=(.*)$', elem_value)
                         if bracket_match:

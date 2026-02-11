@@ -56,6 +56,7 @@ async def handle_local(ctx: "InterpreterContext", args: list[str]) -> "ExecResul
     # Parse flags
     is_array = False
     is_assoc = False
+    is_nameref = False
     remaining_args = []
 
     for arg in args:
@@ -66,6 +67,8 @@ async def handle_local(ctx: "InterpreterContext", args: list[str]) -> "ExecResul
                     is_array = True
                 elif ch == "A":
                     is_assoc = True
+                elif ch == "n":
+                    is_nameref = True
                 # Other flags like -i, -r, -x are ignored for now
         else:
             remaining_args.append(arg)
@@ -94,6 +97,14 @@ async def handle_local(ctx: "InterpreterContext", args: list[str]) -> "ExecResul
         from ..types import VariableStore
         if isinstance(ctx.state.env, VariableStore):
             ctx.state.env.save_metadata_in_scope(name)
+
+        # Handle nameref
+        if is_nameref and isinstance(ctx.state.env, VariableStore):
+            if value is not None:
+                ctx.state.env.set_nameref(name, value)
+            else:
+                ctx.state.env.set_attribute(name, "n")
+            continue
 
         # Handle array initialization - detect (values...) syntax even without -a flag
         if value is not None and value.startswith("(") and value.endswith(")"):

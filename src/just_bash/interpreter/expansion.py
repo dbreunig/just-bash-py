@@ -137,9 +137,11 @@ def get_variable(ctx: "InterpreterContext", name: str, check_nounset: bool = Tru
         # Check if this is an associative array
         is_assoc = env.get(f"{arr_name}__is_array") == "assoc"
         if is_assoc:
-            # For associative arrays, use subscript as string key directly
+            # For associative arrays, expand the subscript first, then use as string key
+            # First expand any $VAR references
+            expanded_subscript = _expand_subscript_vars(ctx, subscript)
+            lookup_key = expanded_subscript
             # Strip surrounding quotes from the key
-            lookup_key = subscript
             if (lookup_key.startswith('"') and lookup_key.endswith('"')) or \
                (lookup_key.startswith("'") and lookup_key.endswith("'")):
                 lookup_key = lookup_key[1:-1]
@@ -318,8 +320,16 @@ def get_array_elements(ctx: "InterpreterContext", name: str) -> list[tuple[int, 
     For associative arrays, the index is a synthetic sequential number.
     Use get_array_keys() for the actual keys.
     """
-    elements = []
+    # Resolve nameref if applicable
+    from .types import VariableStore
     env = ctx.state.env
+    if isinstance(env, VariableStore) and env.is_nameref(name):
+        try:
+            name = env.resolve_nameref(name)
+        except ValueError:
+            return []
+
+    elements = []
     is_assoc = env.get(f"{name}__is_array") == "assoc"
 
     # Look for name_KEY entries
@@ -346,8 +356,16 @@ def get_array_elements(ctx: "InterpreterContext", name: str) -> list[tuple[int, 
 
 def get_array_elements_assoc(ctx: "InterpreterContext", name: str) -> list[tuple[str, str]]:
     """Get all elements of an associative array as (key, value) pairs."""
-    elements = []
+    # Resolve nameref if applicable
+    from .types import VariableStore
     env = ctx.state.env
+    if isinstance(env, VariableStore) and env.is_nameref(name):
+        try:
+            name = env.resolve_nameref(name)
+        except ValueError:
+            return []
+
+    elements = []
     prefix = f"{name}_"
     for key, value in env.items():
         if key.startswith(prefix) and not key.startswith(f"{name}__"):
@@ -579,8 +597,16 @@ def _expand_subscript_vars(ctx: "InterpreterContext", subscript: str) -> str:
 
 def get_array_keys(ctx: "InterpreterContext", name: str) -> list[str]:
     """Get all keys of an array (indices for indexed arrays, keys for associative)."""
-    keys = []
+    # Resolve nameref if applicable
+    from .types import VariableStore
     env = ctx.state.env
+    if isinstance(env, VariableStore) and env.is_nameref(name):
+        try:
+            name = env.resolve_nameref(name)
+        except ValueError:
+            return []
+
+    keys = []
     prefix = f"{name}_"
 
     for key in env:
