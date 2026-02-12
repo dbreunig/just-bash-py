@@ -512,3 +512,20 @@ arr=([foo]=bar [baz]=qux)
 echo "${arr[foo]}"
 ''')
         assert result.stdout.strip() == "bar"
+
+    @pytest.mark.asyncio
+    async def test_typeset_minus_n_plus_n(self):
+        """Test typeset -n to convert to nameref and +n to remove."""
+        bash = Bash()
+        result = await bash.exec('''
+x=foo
+ref=x
+echo ref=$ref
+typeset -n ref
+echo ref=$ref
+x=bar
+echo ref=$ref
+typeset +n ref
+echo ref=$ref
+''')
+        assert result.stdout == "ref=x\nref=foo\nref=bar\nref=x\n"

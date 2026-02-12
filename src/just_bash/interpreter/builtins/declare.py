@@ -147,7 +147,15 @@ async def handle_declare(ctx: "InterpreterContext", args: list[str]) -> "ExecRes
 
             if isinstance(ctx.state.env, VariableStore):
                 for attr in remove_attrs:
-                    ctx.state.env.remove_attribute(name, attr)
+                    # Special handling for removing nameref attribute
+                    if attr == "n" and ctx.state.env.is_nameref(name):
+                        # Restore nameref_target as the variable's value
+                        meta = ctx.state.env._metadata.get(name)
+                        if meta and meta.nameref_target:
+                            ctx.state.env[name] = meta.nameref_target
+                        ctx.state.env.clear_nameref(name)
+                    else:
+                        ctx.state.env.remove_attribute(name, attr)
                     if attr == "r" and hasattr(ctx.state, 'readonly_vars'):
                         ctx.state.readonly_vars.discard(name)
 
@@ -193,8 +201,13 @@ async def handle_declare(ctx: "InterpreterContext", args: list[str]) -> "ExecRes
             if value_str is not None:
                 ctx.state.env.set_nameref(name, value_str)
             else:
-                # declare -n without value just marks as nameref type
-                ctx.state.env.set_attribute(name, "n")
+                # declare -n without explicit value - use existing value as target
+                existing_value = ctx.state.env.get(name)
+                if existing_value:
+                    ctx.state.env.set_nameref(name, existing_value)
+                else:
+                    # No existing value - just mark as nameref type
+                    ctx.state.env.set_attribute(name, "n")
             continue
 
         # Set readonly attribute (don't continue - allow other attributes too)
