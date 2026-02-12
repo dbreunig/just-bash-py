@@ -1773,7 +1773,28 @@ async def expand_parameter_segments_async(
             # Pass in_double_quotes to suppress tilde expansion when inside double quotes
             segments = await expand_word_segments(ctx, operation.word, in_double_quotes)
             default_value = "".join(seg.text for seg in segments)
-            ctx.state.env[parameter] = default_value
+            # Handle array subscript assignment like ${arr[0]=x}
+            array_match = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\[(.+)\]$', parameter)
+            if array_match:
+                arr_name = array_match.group(1)
+                subscript = array_match.group(2)
+                # Ensure array marker exists
+                if f"{arr_name}__is_array" not in ctx.state.env:
+                    ctx.state.env[f"{arr_name}__is_array"] = "indexed"
+                is_assoc = ctx.state.env.get(f"{arr_name}__is_array") == "assoc"
+                if is_assoc:
+                    # For associative arrays, use the subscript as-is
+                    expanded_subscript = _expand_subscript_vars(ctx, subscript)
+                    if (expanded_subscript.startswith('"') and expanded_subscript.endswith('"')) or \
+                       (expanded_subscript.startswith("'") and expanded_subscript.endswith("'")):
+                        expanded_subscript = expanded_subscript[1:-1]
+                    ctx.state.env[f"{arr_name}_{expanded_subscript}"] = default_value
+                else:
+                    # For indexed arrays, evaluate as arithmetic
+                    idx = _eval_array_subscript(ctx, subscript)
+                    ctx.state.env[f"{arr_name}_{idx}"] = default_value
+            else:
+                ctx.state.env[parameter] = default_value
             return segments
         return [ExpandedSegment(text=value, quoted=in_double_quotes)]
 
