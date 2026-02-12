@@ -631,6 +631,10 @@ class Interpreter:
 
     async def _execute_conditional(self, node: ConditionalCommandNode) -> ExecResult:
         """Execute a conditional command [[ ... ]]."""
+        # Update currentLine for $LINENO
+        if node.line is not None:
+            self._state.current_line = node.line
+
         if node.expression is None:
             return _result("", "", 0)
 
@@ -642,6 +646,10 @@ class Interpreter:
 
     async def _execute_arithmetic(self, node: ArithmeticCommandNode) -> ExecResult:
         """Execute an arithmetic command (( ... ))."""
+        # Update currentLine for $LINENO
+        if node.line is not None:
+            self._state.current_line = node.line
+
         if node.expression is None:
             return _result("", "", 1)
 
