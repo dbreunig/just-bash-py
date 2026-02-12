@@ -782,14 +782,23 @@ class Interpreter:
                     _maybe_export_variable(self._state, name)
                 continue
 
-            # Resolve nameref for the assignment target
+            # Handle nameref for the assignment target
+            _is_nameref_without_target = False
+            _original_nameref_name = name
             if (isinstance(self._state.env, VariableStore)
                     and not _array_lhs
                     and self._state.env.is_nameref(name)):
-                try:
-                    name = self._state.env.resolve_nameref(name)
-                except ValueError:
-                    pass
+                # Check if nameref has a target
+                meta = self._state.env._metadata.get(name)
+                if meta and meta.nameref_target:
+                    # Has target - resolve and assign to target
+                    try:
+                        name = self._state.env.resolve_nameref(name)
+                    except ValueError:
+                        pass
+                else:
+                    # No target - we'll set the assigned value as the target
+                    _is_nameref_without_target = True
 
             # Expand assignment value
             value = ""
@@ -883,7 +892,12 @@ class Interpreter:
                             self._state.seconds_reset_time = time.time() - offset
                         except (ValueError, TypeError):
                             self._state.seconds_reset_time = time.time()
-                    self._state.env[name] = value
+                    # Check if we're assigning to a nameref without a target
+                    if _is_nameref_without_target and isinstance(self._state.env, VariableStore):
+                        # Set the value as the nameref target
+                        self._state.env.set_nameref(_original_nameref_name, value)
+                    else:
+                        self._state.env[name] = value
                     _maybe_export_variable(self._state, name)
             else:
                 # Temporary assignment for command
