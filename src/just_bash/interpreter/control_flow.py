@@ -152,6 +152,10 @@ async def execute_c_style_for(ctx: "InterpreterContext", node: CStyleForNode) ->
     exit_code = 0
     iterations = 0
 
+    # Set LINENO to the for loop line for condition evaluation
+    if node.line is not None:
+        ctx.state.current_line = node.line
+
     # Execute init
     if node.init:
         await evaluate_arithmetic(ctx, node.init.expression)
@@ -166,8 +170,10 @@ async def execute_c_style_for(ctx: "InterpreterContext", node: CStyleForNode) ->
                     "iterations",
                 )
 
-            # Check condition
+            # Check condition - update LINENO to for loop line each time
             if node.condition:
+                if node.line is not None:
+                    ctx.state.current_line = node.line
                 cond_result = await evaluate_arithmetic(ctx, node.condition.expression)
                 if cond_result == 0:
                     break
