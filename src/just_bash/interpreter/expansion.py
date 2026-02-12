@@ -390,6 +390,7 @@ def _eval_array_subscript(ctx: "InterpreterContext", subscript: str) -> int:
     - Literal integers: arr[0], arr[42]
     - Variable references: arr[i], arr[idx], arr[$i]
     - Simple arithmetic: arr[i+1], arr[n-1]
+    - Assignments with side effects: arr[b=2] assigns 2 to b and uses 2 as index
     """
     subscript = subscript.strip()
 
@@ -410,7 +411,16 @@ def _eval_array_subscript(ctx: "InterpreterContext", subscript: str) -> int:
         except ValueError:
             return 0
 
-    # Try arithmetic expression - expand bare variables first
+    # Use proper arithmetic expression evaluator which handles assignments
+    try:
+        from ..parser.parser import Parser
+        parser = Parser()
+        arith_expr = parser._parse_arith_comma(expanded)
+        return evaluate_arithmetic_sync(ctx, arith_expr)
+    except Exception:
+        pass
+
+    # Fallback: Try arithmetic expression with variable expansion
     arith_expanded = _expand_arith_vars(ctx, expanded)
     try:
         # Use Python eval with restricted builtins for safety
