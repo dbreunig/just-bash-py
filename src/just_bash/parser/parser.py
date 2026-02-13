@@ -1936,13 +1936,8 @@ class Parser:
             # Handle simple $VAR expansion
             if c == "$" and i + 1 < len(value):
                 next_c = value[i + 1]
-                # Special parameters
-                if next_c in "?$#@*!_-0123456789":
-                    flush_literal()
-                    parts.append(ParameterExpansionPart(parameter=next_c))
-                    i += 2
-                    continue
-                # Variable name
+                # Variable name (including names starting with _)
+                # Check this first to handle $_var as the variable _var, not $_ + var
                 if next_c.isalpha() or next_c == "_":
                     flush_literal()
                     j = i + 1
@@ -1951,6 +1946,12 @@ class Parser:
                     var_name = value[i + 1 : j]
                     parts.append(ParameterExpansionPart(parameter=var_name))
                     i = j
+                    continue
+                # Special parameters (only if not followed by alnum/_)
+                if next_c in "?$#@*!-0123456789":
+                    flush_literal()
+                    parts.append(ParameterExpansionPart(parameter=next_c))
+                    i += 2
                     continue
 
             # Handle backtick command substitution
