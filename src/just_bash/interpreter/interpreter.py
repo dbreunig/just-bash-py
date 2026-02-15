@@ -237,6 +237,10 @@ class Interpreter:
         stderr = ""
         exit_code = 0
 
+        # Reset alias snapshot line tracking for new script.
+        # This ensures aliases from previous exec() calls are available.
+        self._state.alias_snapshot_line = None
+
         for statement in node.statements:
             try:
                 result = await self.execute_statement(statement)
@@ -327,6 +331,23 @@ class Interpreter:
                 "increase execution_limits.max_command_count",
                 "commands",
             )
+
+        # Snapshot aliases at line boundaries for bash-like expansion semantics.
+        # In bash, aliases defined on a line aren't available for expansion until
+        # the next line (since parsing happens before execution). We approximate
+        # this by snapshotting aliases when we start executing a new line.
+        from .builtins.alias import get_aliases
+        # Get line number from first command in first pipeline
+        stmt_line = None
+        if node.pipelines and node.pipelines[0].commands:
+            cmd = node.pipelines[0].commands[0]
+            if hasattr(cmd, 'line'):
+                stmt_line = cmd.line
+        # Update snapshot if this is a new line (or first statement)
+        current_snapshot_line = getattr(self._state, 'alias_snapshot_line', None)
+        if stmt_line is None or stmt_line != current_snapshot_line:
+            self._state.alias_snapshot = dict(get_aliases(self._ctx))
+            self._state.alias_snapshot_line = stmt_line
 
         stdout = ""
         stderr = ""
@@ -673,7 +694,8 @@ class Interpreter:
         self._state.expansion_exit_code = None
 
         # Temporary assignments for command environment
-        temp_assignments: dict[str, str | None] = {}
+        # Stores (old_value, was_exported) for restoration
+        temp_assignments: dict[str, tuple[str | None, bool]] = {}
 
         # Handle assignments
         for assignment in node.assignments:
@@ -900,9 +922,16 @@ class Interpreter:
                         self._state.env[name] = value
                     _maybe_export_variable(self._state, name)
             else:
-                # Temporary assignment for command
-                temp_assignments[name] = self._state.env.get(name)
+                # Temporary assignment for command - exported to command environment
+                old_value = self._state.env.get(name)
+                was_exported = False
+                if isinstance(self._state.env, VariableStore):
+                    was_exported = "x" in self._state.env.get_attributes(name)
+                temp_assignments[name] = (old_value, was_exported)
                 self._state.env[name] = value
+                # Mark as exported for the command
+                if isinstance(self._state.env, VariableStore):
+                    self._state.env.set_attribute(name, "x")
 
         # If no command name, it's an assignment-only statement
         if node.name is None:
@@ -1003,9 +1032,12 @@ class Interpreter:
                 return await self._process_output_redirections(node.redirections, result)
 
             # Alias expansion (before checking functions/builtins)
+            # Use the alias snapshot from statement start to match bash semantics
+            # where aliases defined on a line aren't available until the next line
             alias_args: list[str] = []
             if _is_shopt_set(self._state.env, "expand_aliases"):
-                aliases = get_aliases(self._ctx)
+                alias_snapshot = getattr(self._state, 'alias_snapshot', None)
+                aliases = alias_snapshot if alias_snapshot is not None else get_aliases(self._ctx)
                 # Don't expand if command name was quoted
                 name_is_quoted = _word_has_quoting(node.name) if node.name else False
                 if not name_is_quoted and cmd_name in aliases:
@@ -1037,6 +1069,22 @@ class Interpreter:
                                 arg_parts = arg_alias_value.split()
                             if arg_parts:
                                 alias_args.extend(arg_parts)
+
+            # Expand alias_args (they may contain $VAR references)
+            if alias_args:
+                from ..parser.parser import Parser
+                parser = Parser()
+                expanded_alias_args = []
+                for arg_str in alias_args:
+                    # Parse the string as a word to get proper expansion
+                    try:
+                        word = parser._parse_word_from_string(arg_str)
+                        expanded = await expand_word_async(self._ctx, word)
+                        expanded_alias_args.append(expanded)
+                    except Exception:
+                        # If parsing fails, use the literal string
+                        expanded_alias_args.append(arg_str)
+                alias_args = expanded_alias_args
 
             # Check for function call first (functions override builtins)
             if cmd_name in self._state.functions:
@@ -1099,12 +1147,19 @@ class Interpreter:
             result = await self._process_output_redirections(node.redirections, result)
             return result
         finally:
-            # Restore temporary assignments
-            for name, old_value in temp_assignments.items():
+            # Restore temporary assignments (both value and export status)
+            for name, (old_value, was_exported) in temp_assignments.items():
                 if old_value is None:
-                    del self._state.env[name]
+                    if name in self._state.env:
+                        del self._state.env[name]
                 else:
                     self._state.env[name] = old_value
+                # Restore export status
+                if isinstance(self._state.env, VariableStore):
+                    if was_exported:
+                        self._state.env.set_attribute(name, "x")
+                    else:
+                        self._state.env.remove_attribute(name, "x")
 
     async def _process_input_redirections(self, redirections: list, stdin: str) -> str:
         """Process input redirections (heredoc, herestring, <) to get stdin.

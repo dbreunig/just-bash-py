@@ -365,20 +365,39 @@ class TestAliasExpansion:
 
     @pytest.mark.asyncio
     async def test_basic_alias(self):
+        """Alias must be defined on a previous line to be expanded (bash semantics)."""
         bash = Bash()
-        result = await bash.exec("shopt -s expand_aliases; alias hi='echo hello'; hi")
+        # Define alias on one line, use on the next
+        result = await bash.exec("""shopt -s expand_aliases
+alias hi='echo hello'
+hi""")
         assert result.stdout == "hello\n"
 
     @pytest.mark.asyncio
     async def test_alias_with_args(self):
+        """Alias expansion with arguments."""
         bash = Bash()
-        result = await bash.exec("shopt -s expand_aliases; alias greet='echo hi'; greet world")
+        result = await bash.exec("""shopt -s expand_aliases
+alias greet='echo hi'
+greet world""")
         assert result.stdout == "hi world\n"
+
+    @pytest.mark.asyncio
+    async def test_alias_same_line_not_expanded(self):
+        """Alias defined on same line is NOT expanded (bash semantics)."""
+        bash = Bash()
+        result = await bash.exec("shopt -s expand_aliases; alias hi='echo hello'; hi")
+        # hi is not expanded because alias was defined on the same line
+        assert result.stdout == ""
+        assert result.exit_code == 127  # command not found
 
     @pytest.mark.asyncio
     async def test_unalias(self):
         bash = Bash()
-        result = await bash.exec("shopt -s expand_aliases; alias hi='echo hello'; unalias hi; hi 2>/dev/null; echo $?")
+        result = await bash.exec("""shopt -s expand_aliases
+alias hi='echo hello'
+unalias hi
+hi 2>/dev/null; echo $?""")
         # After unalias, hi should not be found
         assert result.exit_code == 0
 

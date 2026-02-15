@@ -41,7 +41,7 @@ class TestAliasBasic:
         bash = Bash()
         result = await bash.exec("alias nonexistent")
         assert result.exit_code == 1
-        assert "not found" in result.stdout
+        assert "not found" in result.stderr
 
     @pytest.mark.asyncio
     async def test_alias_multiple_define(self):
@@ -100,7 +100,7 @@ class TestUnalias:
         # Verify it's removed
         result = await bash.exec("alias ll")
         assert result.exit_code == 1
-        assert "not found" in result.stdout
+        assert "not found" in result.stderr
 
     @pytest.mark.asyncio
     async def test_unalias_not_found(self):

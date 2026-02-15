@@ -81,6 +81,7 @@ async def handle_alias(
 
     # Process arguments
     output = []
+    errors = []
     exit_code = 0
 
     for arg in names:
@@ -97,12 +98,12 @@ async def handle_alias(
                 value = aliases[name]
                 output.append(f"alias {name}='{value}'")
             else:
-                output.append(f"bash: alias: {name}: not found")
+                errors.append(f"bash: alias: {name}: not found")
                 exit_code = 1
 
-    if output:
-        return _result("\n".join(output) + "\n", "", exit_code)
-    return _result("", "", exit_code)
+    stdout = "\n".join(output) + "\n" if output else ""
+    stderr = "\n".join(errors) + "\n" if errors else ""
+    return _result(stdout, stderr, exit_code)
 
 
 async def handle_unalias(
