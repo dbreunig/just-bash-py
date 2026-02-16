@@ -408,6 +408,10 @@ class Lexer:
             return self._make_token(TokenType.LBRACE, "{", pos, start_line, start_column)
 
         if c0 == "}":
+            # } is only a reserved word (RBRACE) when it stands alone as a delimiter.
+            # When followed by word characters (like }_{a,b}), it's part of a word.
+            if c1 and c1 not in " \t\n;|&()<>":
+                return self._read_word(pos, start_line, start_column)
             self.pos = pos + 1
             self.column = start_column + 1
             return self._make_token(TokenType.RBRACE, "}", pos, start_line, start_column)
