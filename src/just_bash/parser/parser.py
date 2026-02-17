@@ -654,7 +654,9 @@ class Parser:
             if self._check(TokenType.ASSIGNMENT_WORD):
                 assign_tok = self._current()
                 # Check if next token is LPAREN for array assignment
-                if self._peek(1).type == TokenType.LPAREN:
+                # Must be immediately adjacent (no space between = and ()
+                next_tok = self._peek(1)
+                if next_tok.type == TokenType.LPAREN and assign_tok.end == next_tok.start:
                     assignments.append(self._parse_array_assignment())
                 else:
                     assignments.append(self._parse_assignment())

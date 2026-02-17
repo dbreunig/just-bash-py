@@ -121,10 +121,12 @@ async def handle_local(ctx: "InterpreterContext", args: list[str]) -> "ExecResul
             if inner:
                 _parse_array_assignment(ctx, name, inner, is_assoc)
         elif is_array or is_assoc:
-            # Declare as array without initialization
+            # Declare as array without initialization - creates empty local array
             _save_array_in_scope(ctx, name, current_scope)
             array_key = f"{name}__is_array"
             ctx.state.env[array_key] = "assoc" if is_assoc else "indexed"
+            # Clear existing elements to create a fresh empty local array
+            _clear_array_elements(ctx, name)
             if has_assignment:
                 # Simple value assignment - set element 0
                 ctx.state.env[f"{name}_0"] = value or ""

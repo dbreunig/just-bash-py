@@ -883,10 +883,19 @@ class Interpreter:
                                     )
                             subscript = str(idx)
                         else:
-                            # For associative arrays, strip surrounding quotes from the key
-                            if (subscript.startswith('"') and subscript.endswith('"')) or \
-                               (subscript.startswith("'") and subscript.endswith("'")):
+                            # For associative arrays, expand variables and strip surrounding quotes
+                            from .expansion import _expand_subscript_vars
+                            # Check if double-quoted (expand $VAR) vs single-quoted (literal)
+                            if subscript.startswith('"') and subscript.endswith('"'):
+                                # Double-quoted: expand variables, then strip quotes
+                                inner = subscript[1:-1]
+                                subscript = _expand_subscript_vars(self._ctx, inner)
+                            elif subscript.startswith("'") and subscript.endswith("'"):
+                                # Single-quoted: literal, just strip quotes
                                 subscript = subscript[1:-1]
+                            else:
+                                # Unquoted: expand variables
+                                subscript = _expand_subscript_vars(self._ctx, subscript)
                     # Resolve nameref for array base name
                     if isinstance(self._state.env, VariableStore) and self._state.env.is_nameref(arr_name):
                         try:
