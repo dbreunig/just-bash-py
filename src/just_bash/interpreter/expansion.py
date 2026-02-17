@@ -1031,6 +1031,22 @@ def _segments_to_string(segments: list[ExpandedSegment]) -> str:
     return "".join(seg.text for seg in segments)
 
 
+def _segments_to_glob_pattern(segments: list[ExpandedSegment]) -> str:
+    """Build a glob pattern from segments, escaping glob chars in quoted segments.
+
+    Quoted segments have their glob metacharacters escaped so they match literally.
+    Unquoted segments are passed through unchanged to allow glob matching.
+    """
+    parts = []
+    for seg in segments:
+        if seg.quoted:
+            # Escape glob chars in quoted segments
+            parts.append(_escape_glob_chars(seg.text))
+        else:
+            parts.append(seg.text)
+    return "".join(parts)
+
+
 def _segments_has_unquoted_glob(segments: list[ExpandedSegment]) -> bool:
     """Check if segments contain unquoted glob characters."""
     for seg in segments:
@@ -2524,7 +2540,9 @@ async def expand_word_with_glob(
         # Check for glob patterns in unquoted segments (unless noglob is set)
         noglob = getattr(ctx.state.options, 'noglob', False)
         if not noglob and _segments_has_unquoted_glob(segments):
-            matches = await glob_expand(ctx, value)
+            # Build glob pattern from segments, escaping quoted parts
+            glob_pattern = _segments_to_glob_pattern(segments)
+            matches = await glob_expand(ctx, glob_pattern)
             if matches:
                 return {"values": matches, "quoted": False}
             # No matches - check nullglob/failglob

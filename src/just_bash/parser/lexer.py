@@ -707,9 +707,9 @@ class Lexer:
                         continue
                 else:
                     # Outside quotes, backslash escapes next character
-                    if next_char in "\"'{}":
-                        # Preserve backslash for quotes and braces so parser
-                        # can create EscapedPart (prevents brace expansion)
+                    if next_char in "\"'{}*?[]":
+                        # Preserve backslash for quotes, braces, and glob chars so parser
+                        # can create EscapedPart (prevents brace/glob expansion)
                         value += char + next_char
                     else:
                         value += next_char
