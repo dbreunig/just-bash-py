@@ -946,7 +946,11 @@ class Interpreter:
                 if isinstance(self._state.env, VariableStore):
                     was_exported = "x" in self._state.env.get_attributes(name)
                 temp_assignments[name] = (old_value, was_exported)
-                self._state.env[name] = value
+                if assignment.append:
+                    existing = self._state.env.get(name, "")
+                    self._state.env[name] = existing + value
+                else:
+                    self._state.env[name] = value
                 # Mark as exported for the command
                 if isinstance(self._state.env, VariableStore):
                     self._state.env.set_attribute(name, "x")

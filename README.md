@@ -395,7 +395,7 @@ bash      sh
 
 ## Test Results
 
-Test suite history per commit (spec_tests excluded). Each `█` ≈ 55 tests.
+Test suite history per commit (spec_tests excluded). Each `█` ≈ 57 tests.
 
 ```
 Commit   Date         Passed  Failed  Skipped  Graph
@@ -408,6 +408,7 @@ aa16896  2026-02-05     2794       0        2  ███████████
 b6a96dd  2026-02-09     2814       0        2  ██████████████████████████████████████████████████░
 a7e64a4  2026-02-11     2825       0        2  ███████████████████████████████████████████████████░
 e736ca4  2026-02-17     2831       0        2  ███████████████████████████████████████████████████░
+4dddca8  2026-02-18     2849       0        2  █████████████████████████████████████████████████░
 ```
 
 `█` passed · `▒` failed · `░` skipped

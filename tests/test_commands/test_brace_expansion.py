@@ -327,3 +327,101 @@ class TestBraceExpansionSpecialChars:
         bash = Bash()
         result = await bash.exec('echo {a-x,b-y,c-z}')
         assert result.stdout.strip() == "a-x b-y c-z"
+
+
+class TestBraceExpansionCrossPart:
+    """Test brace expansion where braces span across quoted parts."""
+
+    @pytest.mark.asyncio
+    async def test_single_and_double_quotes_in_braces(self):
+        """Brace expansion with single and double quotes inside braces."""
+        bash = Bash()
+        result = await bash.exec("""echo {'a',b}_{c,"d"}""")
+        assert result.stdout.strip() == "a_c a_d b_c b_d"
+
+    @pytest.mark.asyncio
+    async def test_mixed_quotes_in_braces(self):
+        """Brace expansion with mixed escaped and quoted content."""
+        bash = Bash()
+        result = await bash.exec(r"""echo -{\X"b",'cd'}-""")
+        assert result.stdout.strip() == "-Xb- -cd-"
+
+    @pytest.mark.asyncio
+    async def test_escaped_special_chars_in_braces(self):
+        r"""Brace expansion with escaped special chars: -{$,[,]}-."""
+        bash = Bash()
+        result = await bash.exec(r"echo -{\$,\[,\]}-")
+        assert result.stdout.strip() == "-$- -[- -]-"
+
+    @pytest.mark.asyncio
+    async def test_double_quoted_content_in_braces(self):
+        """Double-quoted element in brace expansion."""
+        bash = Bash()
+        result = await bash.exec('echo {"hello",world}')
+        assert result.stdout.strip() == "hello world"
+
+    @pytest.mark.asyncio
+    async def test_braced_var_in_braces(self):
+        """Braced variable expansion inside brace expansion."""
+        bash = Bash()
+        result = await bash.exec('a=A; echo {${a},b}_{c,d}')
+        assert result.stdout.strip() == "A_c A_d b_c b_d"
+
+
+class TestBraceExpansionEmptyAlternatives:
+    """Test brace expansion with empty alternatives."""
+
+    @pytest.mark.asyncio
+    async def test_empty_alternatives_elided_without_quotes(self):
+        """Empty unquoted alternatives are elided (bash word elision)."""
+        bash = Bash()
+        result = await bash.exec("echo {X,,Y,}")
+        # Bash elides empty unquoted alternatives
+        assert result.stdout.strip() == "X Y"
+
+    @pytest.mark.asyncio
+    async def test_empty_alternatives_count(self):
+        """Empty alternatives produce correct number of words."""
+        bash = Bash()
+        # {X,,Y,} should produce 4 values: X, '', Y, ''
+        # With '' suffix, each gets '' appended (no change)
+        result = await bash.exec("argv.py {X,,Y,}''")
+        assert result.stdout.strip() == "['X', '', 'Y', '']"
+
+
+class TestBraceExpansionAssignment:
+    """Test brace expansion on assignment RHS."""
+
+    @pytest.mark.asyncio
+    async def test_no_expansion_on_rhs(self):
+        """Brace expansion should NOT happen on RHS of assignment."""
+        bash = Bash()
+        result = await bash.exec("v={X,Y}; echo $v")
+        assert result.stdout.strip() == "{X,Y}"
+
+
+class TestBraceExpansionSequenceValidation:
+    """Test that invalid sequences are treated as literal."""
+
+    @pytest.mark.asyncio
+    async def test_mixed_number_and_letter_is_literal(self):
+        """Mixing numbers and letters in sequence should be literal."""
+        bash = Bash()
+        result = await bash.exec("echo {1..a}")
+        assert result.stdout.strip() == "{1..a}"
+
+    @pytest.mark.asyncio
+    async def test_mixed_letter_and_number_is_literal(self):
+        """Mixing letters and numbers in sequence should be literal."""
+        bash = Bash()
+        result = await bash.exec("echo {z..3}")
+        assert result.stdout.strip() == "{z..3}"
+
+    @pytest.mark.asyncio
+    async def test_mixed_case_sequence_is_literal(self):
+        """Mixed case char expansion like {z..A} should not expand."""
+        bash = Bash()
+        result = await bash.exec("echo -{z..A}-")
+        # Mixed case sequences are treated as literal
+        assert result.stdout.strip() == "-{z..A}-"
+        assert result.exit_code == 0

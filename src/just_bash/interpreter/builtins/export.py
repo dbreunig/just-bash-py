@@ -76,11 +76,17 @@ async def handle_export(ctx: "InterpreterContext", args: list[str]) -> "ExecResu
     stderr_parts = []
     exit_code = 0
     for arg in names_to_process:
+        is_append = False
         if "=" in arg:
             name, value = arg.split("=", 1)
         else:
             name = arg
             value = None
+
+        # Handle append mode: name+=value
+        if name.endswith("+"):
+            is_append = True
+            name = name[:-1]
 
         # Validate identifier
         if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", name):
@@ -90,7 +96,11 @@ async def handle_export(ctx: "InterpreterContext", args: list[str]) -> "ExecResu
 
         # Set value if provided (regardless of -n)
         if value is not None:
-            ctx.state.env[name] = value
+            if is_append:
+                existing = ctx.state.env.get(name, "")
+                ctx.state.env[name] = existing + value
+            else:
+                ctx.state.env[name] = value
         elif not remove_export and name not in ctx.state.env:
             ctx.state.env[name] = ""
 

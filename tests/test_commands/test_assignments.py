@@ -148,3 +148,75 @@ class TestUnsetArrayElement:
         bash = Bash()
         result = await bash.exec('a=(x y z); unset a; echo "${a[@]}"')
         assert result.stdout == "\n"
+
+
+class TestTypesetAppendScalar:
+    """Test typeset/declare += for scalar variables."""
+
+    @pytest.mark.asyncio
+    async def test_typeset_append_creates_var(self):
+        """typeset s+=foo should create variable with value foo."""
+        bash = Bash()
+        result = await bash.exec('typeset s+=foo; echo "s=$s"')
+        assert result.stdout == "s=foo\n"
+
+    @pytest.mark.asyncio
+    async def test_typeset_append_twice(self):
+        """typeset s+=foo twice should concatenate."""
+        bash = Bash()
+        result = await bash.exec('typeset t+=foo; typeset t+=foo; echo "t=$t"')
+        assert result.stdout == "t=foofoo\n"
+
+    @pytest.mark.asyncio
+    async def test_typeset_append_array_elem0(self):
+        """typeset a+=s on an array should append to element 0."""
+        bash = Bash()
+        result = await bash.exec('typeset a=(x y); typeset a+=s; argv.py "${a[@]}"')
+        assert result.stdout == "['xs', 'y']\n"
+
+
+class TestExportAppend:
+    """Test export with += syntax."""
+
+    @pytest.mark.asyncio
+    async def test_export_append_creates_var(self):
+        """export e+=foo should create exported variable."""
+        bash = Bash()
+        result = await bash.exec('export e+=foo; echo "e=$e"')
+        assert result.stdout == "e=foo\n"
+
+    @pytest.mark.asyncio
+    async def test_export_append_twice(self):
+        """export e+=foo twice should concatenate."""
+        bash = Bash()
+        result = await bash.exec('export e+=foo; export e+=foo; echo "e=$e"')
+        assert result.stdout == "e=foofoo\n"
+
+
+class TestLocalAppend:
+    """Test local with += syntax."""
+
+    @pytest.mark.asyncio
+    async def test_local_append_twice(self):
+        """local s+=foo twice should concatenate."""
+        bash = Bash()
+        result = await bash.exec("""
+f() {
+    local s+=foo
+    local s+=foo
+    echo "s=$s"
+}
+f
+""")
+        assert result.stdout == "s=foofoo\n"
+
+
+class TestEnvPrefixAppend:
+    """Test += in env prefix assignments."""
+
+    @pytest.mark.asyncio
+    async def test_env_prefix_append(self):
+        """A+=a cmd should see concatenated value in env."""
+        bash = Bash()
+        result = await bash.exec('A=a; A+=a printenv.py A')
+        assert result.stdout == "aa\n"

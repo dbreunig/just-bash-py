@@ -228,8 +228,15 @@ async def handle_declare(ctx: "InterpreterContext", args: list[str]) -> "ExecRes
         # If only readonly/export with no array/integer/etc, handle value and continue
         if (options["readonly"] or options["export"]) and not options["array"] and not options["assoc"] and not options["integer"] and not options["lowercase"] and not options["uppercase"]:
             if value_str is not None:
-                ctx.state.env[name] = value_str
+                if is_append:
+                    existing = ctx.state.env.get(name, "")
+                    ctx.state.env[name] = existing + value_str
+                else:
+                    ctx.state.env[name] = value_str
             continue
+
+        # Check if variable is already an array (for append without -a flag)
+        is_existing_array = f"{name}__is_array" in ctx.state.env
 
         # Handle array declaration - detect (values...) syntax even without -a flag
         is_array_literal = value_str is not None and value_str.startswith("(") and value_str.endswith(")")
@@ -252,10 +259,22 @@ async def handle_declare(ctx: "InterpreterContext", args: list[str]) -> "ExecRes
                     _parse_array_assignment(ctx, name, inner, options["assoc"], is_append)
                 elif subscript is not None:
                     # arr[idx]=value
-                    ctx.state.env[f"{name}_{subscript}"] = value_str
+                    if is_append:
+                        existing = ctx.state.env.get(f"{name}_{subscript}", "")
+                        ctx.state.env[f"{name}_{subscript}"] = existing + value_str
+                    else:
+                        ctx.state.env[f"{name}_{subscript}"] = value_str
                 else:
                     # Simple value assignment to array[0]
-                    ctx.state.env[f"{name}_0"] = value_str
+                    if is_append:
+                        existing = ctx.state.env.get(f"{name}_0", "")
+                        ctx.state.env[f"{name}_0"] = existing + value_str
+                    else:
+                        ctx.state.env[f"{name}_0"] = value_str
+        elif is_existing_array and is_append and value_str is not None:
+            # typeset a+=s when a is already an array - append to element 0
+            existing = ctx.state.env.get(f"{name}_0", "")
+            ctx.state.env[f"{name}_0"] = existing + value_str
         else:
             # Regular variable
             # Set attributes via metadata
@@ -282,7 +301,15 @@ async def handle_declare(ctx: "InterpreterContext", args: list[str]) -> "ExecRes
                 elif options["uppercase"]:
                     value_str = value_str.upper()
 
-                if subscript is not None:
+                if is_append:
+                    # Append to existing value
+                    if subscript is not None:
+                        existing = ctx.state.env.get(f"{name}_{subscript}", "")
+                        ctx.state.env[f"{name}_{subscript}"] = existing + value_str
+                    else:
+                        existing = ctx.state.env.get(name, "")
+                        ctx.state.env[name] = existing + value_str
+                elif subscript is not None:
                     # Array element
                     ctx.state.env[f"{name}_{subscript}"] = value_str
                 else:

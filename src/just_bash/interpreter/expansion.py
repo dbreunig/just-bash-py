@@ -2043,6 +2043,14 @@ def _expand_sequence(content: str) -> list[str]:
     if len(start_str) == 1 and len(end_str) == 1:
         start_ord = ord(start_str)
         end_ord = ord(end_str)
+        # Both must be letters, and both must be the same case
+        # Bash treats mixed case (e.g., {z..A}) and mixed types (e.g., {a..3}) as invalid
+        start_is_alpha = start_str.isalpha()
+        end_is_alpha = end_str.isalpha()
+        if not start_is_alpha or not end_is_alpha:
+            return ['{' + content + '}']
+        if start_str.islower() != end_str.islower():
+            return ['{' + content + '}']
         results = []
         if start_ord <= end_ord:
             i = start_ord
@@ -2196,7 +2204,7 @@ def glob_to_regex(pattern: str, greedy: bool = True, from_end: bool = False, ext
 
 
 def _find_brace_in_literal_parts(parts: list) -> tuple[int, int, int, str] | None:
-    """Find a valid brace expansion pattern within LiteralPart nodes.
+    """Find a valid brace expansion pattern within a single LiteralPart node.
 
     Returns (part_index, brace_start, brace_end, content) or None.
     Only finds patterns entirely within a single LiteralPart.
@@ -2232,6 +2240,153 @@ def _find_brace_in_literal_parts(parts: list) -> tuple[int, int, int, str] | Non
                     return (idx, i, j, text[i+1:j-1])
             i += 1
     return None
+
+
+def _find_brace_across_parts(parts: tuple) -> dict | None:
+    """Find the leftmost brace expansion pattern, possibly spanning multiple word parts.
+
+    Only LiteralPart characters can be brace metacharacters ({, }, comma, ..).
+    Quoted parts (SingleQuotedPart, DoubleQuotedPart, EscapedPart) and expansion
+    parts (ParameterExpansionPart, etc.) are treated as opaque content - they
+    contribute to the brace expansion alternatives but cannot contain metacharacters.
+
+    Returns a dict with:
+      - open_part, open_char: position of '{'
+      - close_part, close_char: position of '}'
+      - comma_positions: list of (part_idx, char_idx) for top-level commas
+      - has_dotdot: whether '..' was found at depth 1
+      - single_part: True if pattern is entirely within one LiteralPart
+    Or None if no valid brace expansion found.
+    """
+    # Walk through parts looking for '{' in LiteralParts
+    for start_pidx, start_part in enumerate(parts):
+        if not isinstance(start_part, LiteralPart):
+            continue
+        text = start_part.value
+        ci = 0
+        while ci < len(text):
+            if text[ci] == '\\' and ci + 1 < len(text):
+                ci += 2
+                continue
+            if text[ci] != '{':
+                ci += 1
+                continue
+
+            # Found a '{'. Scan forward across parts to find matching '}'
+            depth = 1
+            commas = []
+            has_dotdot = False
+            found_close = False
+            close_pidx = -1
+            close_ci = -1
+
+            # Continue scanning from next char in current part
+            scan_pidx = start_pidx
+            scan_ci = ci + 1
+
+            while scan_pidx < len(parts) and depth > 0:
+                scan_part = parts[scan_pidx]
+                if isinstance(scan_part, LiteralPart):
+                    scan_text = scan_part.value
+                    while scan_ci < len(scan_text) and depth > 0:
+                        ch = scan_text[scan_ci]
+                        if ch == '\\' and scan_ci + 1 < len(scan_text):
+                            scan_ci += 2
+                            continue
+                        if ch == '{':
+                            depth += 1
+                        elif ch == '}':
+                            depth -= 1
+                            if depth == 0:
+                                found_close = True
+                                close_pidx = scan_pidx
+                                close_ci = scan_ci
+                                break
+                        elif depth == 1 and ch == ',':
+                            commas.append((scan_pidx, scan_ci))
+                        elif depth == 1 and ch == '.':
+                            if scan_ci + 1 < len(scan_text) and scan_text[scan_ci + 1] == '.':
+                                has_dotdot = True
+                        scan_ci += 1
+                else:
+                    # Non-literal part: skip (content at current depth, no metacharacters)
+                    pass
+
+                if found_close:
+                    break
+                scan_pidx += 1
+                scan_ci = 0
+
+            if found_close and (commas or has_dotdot):
+                single_part = (start_pidx == close_pidx) and not any(
+                    not isinstance(parts[p], LiteralPart)
+                    for p in range(start_pidx + 1, close_pidx + 1)
+                    if p < len(parts)
+                )
+                return {
+                    'open_part': start_pidx,
+                    'open_char': ci,
+                    'close_part': close_pidx,
+                    'close_char': close_ci,
+                    'comma_positions': commas,
+                    'has_dotdot': has_dotdot,
+                    'single_part': single_part,
+                }
+            ci += 1
+    return None
+
+
+def _extract_parts_between(parts: tuple, start_pidx: int, start_ci: int,
+                           end_pidx: int, end_ci: int) -> list:
+    """Extract word parts between two positions (exclusive of both endpoints).
+
+    Positions refer to characters in LiteralParts. Everything between (start_pidx,
+    start_ci) and (end_pidx, end_ci) is extracted, with LiteralParts sliced as needed.
+    """
+    result = []
+
+    if start_pidx == end_pidx:
+        # Same LiteralPart - extract substring
+        part = parts[start_pidx]
+        text = part.value[start_ci + 1:end_ci]
+        if text:
+            result.append(LiteralPart(value=text))
+        return result
+
+    # Remainder of start part (after start_ci)
+    start_text = parts[start_pidx].value[start_ci + 1:]
+    if start_text:
+        result.append(LiteralPart(value=start_text))
+
+    # All parts between start and end (exclusive)
+    for i in range(start_pidx + 1, end_pidx):
+        result.append(parts[i])
+
+    # Beginning of end part (before end_ci)
+    end_text = parts[end_pidx].value[:end_ci]
+    if end_text:
+        result.append(LiteralPart(value=end_text))
+
+    return result
+
+
+def _parts_before(parts: tuple, pidx: int, ci: int) -> list:
+    """Get all parts before position (pidx, ci)."""
+    result = list(parts[:pidx])
+    text = parts[pidx].value[:ci]
+    if text:
+        result.append(LiteralPart(value=text))
+    return result
+
+
+def _parts_after(parts: tuple, pidx: int, ci: int) -> list:
+    """Get all parts after position (pidx, ci)."""
+    result = []
+    text = parts[pidx].value[ci + 1:]
+    if text:
+        result.append(LiteralPart(value=text))
+    result.extend(parts[pidx + 1:])
+    return result
 
 
 def _apply_array_operation_list(
@@ -2378,36 +2533,82 @@ async def expand_word_with_glob(
         for p in word.parts
     )
 
-    # Parts-level brace expansion: only expand braces in LiteralPart nodes
-    brace_info = _find_brace_in_literal_parts(word.parts)
-    if brace_info is not None:
-        part_idx, brace_start, brace_end, content = brace_info
-        lit_part = word.parts[part_idx]
-        prefix_text = lit_part.value[:brace_start]
-        suffix_text = lit_part.value[brace_end:]
+    # Parts-level brace expansion: find leftmost brace pattern (may span parts)
+    if not getattr(ctx.state.options, 'nobraceexpand', False):
+        brace_info = _find_brace_across_parts(word.parts)
+        if brace_info is not None:
+            open_pidx = brace_info['open_part']
+            open_ci = brace_info['open_char']
+            close_pidx = brace_info['close_part']
+            close_ci = brace_info['close_char']
+            comma_positions = brace_info['comma_positions']
+            is_single_part = brace_info['single_part']
 
-        before_parts = list(word.parts[:part_idx])
-        after_parts = list(word.parts[part_idx + 1:])
-        if prefix_text:
-            before_parts.append(LiteralPart(value=prefix_text))
-        if suffix_text:
-            after_parts.insert(0, LiteralPart(value=suffix_text))
+            if is_single_part:
+                # Pattern is entirely within a single LiteralPart - use string-based expansion
+                # which handles both comma lists and sequences (like {1..10})
+                lit_part = word.parts[open_pidx]
+                content = lit_part.value[open_ci + 1:close_ci]
 
-        expansions = _expand_brace_content(content)
+                before_parts = list(word.parts[:open_pidx])
+                after_parts = list(word.parts[open_pidx + 1:])
+                prefix_text = lit_part.value[:open_ci]
+                suffix_text = lit_part.value[close_ci + 1:]
+                if prefix_text:
+                    before_parts.append(LiteralPart(value=prefix_text))
+                if suffix_text:
+                    after_parts.insert(0, LiteralPart(value=suffix_text))
 
-        # If the expansion returns the original {content} unchanged,
-        # it means this wasn't a valid expansion - skip brace expansion
-        original = '{' + content + '}'
-        if len(expansions) == 1 and expansions[0] == original:
-            pass  # Fall through to normal expansion
-        else:
-            all_results = []
-            for exp_text in expansions:
-                new_parts = before_parts + [LiteralPart(value=exp_text)] + after_parts
-                new_word = WordNode(parts=tuple(new_parts))
-                sub_result = await expand_word_with_glob(ctx, new_word)
-                all_results.extend(sub_result["values"])
-            return {"values": all_results, "quoted": False}
+                expansions = _expand_brace_content(content)
+
+                # If the expansion returns the original {content} unchanged,
+                # it means this wasn't a valid expansion - skip brace expansion
+                original = '{' + content + '}'
+                if len(expansions) == 1 and expansions[0] == original:
+                    pass  # Fall through to normal expansion
+                else:
+                    all_results = []
+                    # Check if suffix has quoted parts (preserves empty alternatives)
+                    has_quoted_suffix = any(
+                        isinstance(p, (SingleQuotedPart, DoubleQuotedPart, EscapedPart))
+                        for p in after_parts
+                    )
+                    for exp_text in expansions:
+                        new_parts = before_parts + [LiteralPart(value=exp_text)] + after_parts
+                        new_word = WordNode(parts=tuple(new_parts))
+                        sub_result = await expand_word_with_glob(ctx, new_word)
+                        if sub_result["values"]:
+                            all_results.extend(sub_result["values"])
+                        elif has_quoted_suffix or before_parts:
+                            # Preserve empty alternatives when there are quoted parts
+                            all_results.append("")
+                    return {"values": all_results, "quoted": False}
+            else:
+                # Cross-part brace expansion: braces span across quoted/expansion parts
+                prefix_parts = _parts_before(word.parts, open_pidx, open_ci)
+                suffix_parts = _parts_after(word.parts, close_pidx, close_ci)
+
+                # Split content at top-level commas into alternatives
+                split_points = [(open_pidx, open_ci)] + comma_positions + [(close_pidx, close_ci)]
+                alternatives = []
+                for k in range(len(split_points) - 1):
+                    s_pidx, s_ci = split_points[k]
+                    e_pidx, e_ci = split_points[k + 1]
+                    alt_parts = _extract_parts_between(word.parts, s_pidx, s_ci, e_pidx, e_ci)
+                    alternatives.append(alt_parts)
+
+                all_results = []
+                for alt_parts in alternatives:
+                    new_parts = prefix_parts + alt_parts + suffix_parts
+                    if not new_parts:
+                        new_parts = [LiteralPart(value="")]
+                    new_word = WordNode(parts=tuple(new_parts))
+                    sub_result = await expand_word_with_glob(ctx, new_word)
+                    if sub_result["values"]:
+                        all_results.extend(sub_result["values"])
+                    else:
+                        all_results.append("")
+                return {"values": all_results, "quoted": False}
 
     # Special handling for unquoted $@ and $* (and ${arr[@]} / ${arr[*]})
     # When unquoted, these produce individual elements, then each is IFS-split
@@ -2515,25 +2716,6 @@ async def expand_word_with_glob(
     #    This handles cases like "${unset_var+alt}" where unset_var is unset - the
     #    double quotes should still preserve an empty argument.
     all_quoted = (bool(segments) and all(seg.quoted for seg in segments)) or (has_quoted and not segments)
-
-    # String-level brace expansion fallback for unquoted words where braces
-    # span across multiple parts (e.g., {$x,other} where $x is a ParameterExpansionPart)
-    # Use has_quoted (AST-level check) to avoid expanding braces that came from escaped/quoted parts
-    noglob_opt = getattr(ctx.state.options, 'noglob', False)
-    if not has_quoted and not getattr(ctx.state.options, 'nobraceexpand', False):
-        if '{' in value and '}' in value:
-            brace_expanded = expand_braces(value)
-            if len(brace_expanded) > 1 or (len(brace_expanded) == 1 and brace_expanded[0] != value):
-                all_results = []
-                for exp_text in brace_expanded:
-                    if not noglob_opt and any(c in exp_text for c in "*?["):
-                        matches = await glob_expand(ctx, exp_text)
-                        if matches:
-                            all_results.extend(matches)
-                            continue
-                    if exp_text:
-                        all_results.append(exp_text)
-                return {"values": all_results, "quoted": False}
 
     # For words with unquoted parts, perform glob expansion and IFS word splitting
     if not all_quoted:

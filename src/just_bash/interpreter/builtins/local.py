@@ -146,7 +146,11 @@ async def handle_local(ctx: "InterpreterContext", args: list[str]) -> "ExecResul
                 ctx.state.env[f"{name}_0"] = value or ""
         elif has_assignment:
             # Simple variable with value
-            ctx.state.env[name] = value or ""
+            if is_append_local:
+                existing = ctx.state.env.get(name, "")
+                ctx.state.env[name] = existing + (value or "")
+            else:
+                ctx.state.env[name] = value or ""
         else:
             # local without assignment - just mark as local, don't change value
             # If variable doesn't exist yet, set to empty string
