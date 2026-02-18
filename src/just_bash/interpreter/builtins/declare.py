@@ -174,6 +174,7 @@ async def handle_declare(ctx: "InterpreterContext", args: list[str]) -> "ExecRes
 
     for name_arg in names:
         # Parse name and optional value
+        is_append = False
         if "=" in name_arg:
             eq_idx = name_arg.index("=")
             name = name_arg[:eq_idx]
@@ -181,6 +182,11 @@ async def handle_declare(ctx: "InterpreterContext", args: list[str]) -> "ExecRes
         else:
             name = name_arg
             value_str = None
+
+        # Handle append mode: name+= or name+=(array)
+        if name.endswith("+"):
+            is_append = True
+            name = name[:-1]
 
         # Handle array subscript in name: arr[idx]
         subscript = None
@@ -231,13 +237,19 @@ async def handle_declare(ctx: "InterpreterContext", args: list[str]) -> "ExecRes
             # Initialize array if not already set
             array_key = f"{name}__is_array"
             if array_key not in ctx.state.env:
+                # Converting scalar to array - save existing scalar value as element 0
+                existing_scalar = ctx.state.env.get(name)
                 ctx.state.env[array_key] = "assoc" if options["assoc"] else "indexed"
+                if existing_scalar is not None:
+                    ctx.state.env[f"{name}_0"] = existing_scalar
+                    # Clear the scalar variable
+                    del ctx.state.env[name]
 
             if value_str is not None:
                 # Parse array assignment: (a b c) or ([0]=a [1]=b)
                 if value_str.startswith("(") and value_str.endswith(")"):
                     inner = value_str[1:-1].strip()
-                    _parse_array_assignment(ctx, name, inner, options["assoc"])
+                    _parse_array_assignment(ctx, name, inner, options["assoc"], is_append)
                 elif subscript is not None:
                     # arr[idx]=value
                     ctx.state.env[f"{name}_{subscript}"] = value_str
@@ -287,15 +299,32 @@ async def handle_declare(ctx: "InterpreterContext", args: list[str]) -> "ExecRes
     return _result("", "".join(stderr_parts), exit_code)
 
 
-def _parse_array_assignment(ctx: "InterpreterContext", name: str, inner: str, is_assoc: bool) -> None:
+def _parse_array_assignment(ctx: "InterpreterContext", name: str, inner: str, is_assoc: bool, is_append: bool = False) -> None:
     """Parse and assign array values from (a b c) or ([key]=value ...) syntax."""
-    # Clear existing array elements
-    to_remove = [k for k in ctx.state.env if k.startswith(f"{name}_") and not k.startswith(f"{name}__")]
-    for k in to_remove:
-        del ctx.state.env[k]
+    # Clear existing array elements (unless appending)
+    if not is_append:
+        to_remove = [k for k in ctx.state.env if k.startswith(f"{name}_") and not k.startswith(f"{name}__")]
+        for k in to_remove:
+            del ctx.state.env[k]
+
+    # Find starting index for append mode
+    if is_append:
+        # Find the highest existing index
+        max_idx = -1
+        prefix = f"{name}_"
+        for k in ctx.state.env:
+            if k.startswith(prefix) and not k.startswith(f"{name}__"):
+                try:
+                    key = k[len(prefix):]
+                    idx_val = int(key)
+                    max_idx = max(max_idx, idx_val)
+                except ValueError:
+                    pass  # Non-numeric key (associative array)
+        idx = max_idx + 1
+    else:
+        idx = 0
 
     # Simple word splitting for now - doesn't handle all quoting cases
-    idx = 0
     i = 0
 
     while i < len(inner):

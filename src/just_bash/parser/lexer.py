@@ -472,10 +472,61 @@ class Lexer:
         pos = self.pos
 
         # Fast path: scan for simple word (no quotes, escapes, or expansions)
+        # Track bracket depth to handle array subscripts with spaces: a[0 + 1]=value
+        # Only track brackets AFTER we've read an identifier (not at start, to preserve [ test)
+        # AND only if the result would be a valid assignment (lookahead check)
         fast_start = pos
+
+        # Check if this could be an array assignment: identifier[...]=
+        # Look ahead to see if pattern matches identifier[balanced_brackets]=
+        use_bracket_tracking = False
+        if pos < input_len:
+            # Check for identifier start
+            c0 = input_text[pos]
+            if c0.isalpha() or c0 == "_":
+                # Look ahead for [...]= pattern
+                lookahead_pos = pos
+                # Skip identifier
+                while lookahead_pos < input_len:
+                    ch = input_text[lookahead_pos]
+                    if ch.isalnum() or ch == "_":
+                        lookahead_pos += 1
+                    else:
+                        break
+                # Check for [
+                if lookahead_pos < input_len and input_text[lookahead_pos] == "[":
+                    # Find balanced ]
+                    depth = 1
+                    lookahead_pos += 1
+                    while lookahead_pos < input_len and depth > 0:
+                        ch = input_text[lookahead_pos]
+                        if ch == "[":
+                            depth += 1
+                        elif ch == "]":
+                            depth -= 1
+                        lookahead_pos += 1
+                    # Check for = or += after ]
+                    if depth == 0 and lookahead_pos < input_len:
+                        ch = input_text[lookahead_pos]
+                        if ch == "=" or (ch == "+" and lookahead_pos + 1 < input_len and input_text[lookahead_pos + 1] == "="):
+                            use_bracket_tracking = True
+
+        bracket_depth = 0
+        in_assignment_value = False  # True after we've seen = following ]
         while pos < input_len:
             c = input_text[pos]
-            if c in WORD_BREAK_CHARS or c in SPECIAL_CHARS:
+            if use_bracket_tracking and c == "[" and pos > fast_start:
+                # Only enter bracket tracking if we've read something before
+                bracket_depth += 1
+            elif c == "]" and bracket_depth > 0:
+                bracket_depth -= 1
+            elif use_bracket_tracking and bracket_depth == 0 and c == "=" and not in_assignment_value:
+                # We've hit the = in an array assignment, continue to read value
+                in_assignment_value = True
+            elif bracket_depth == 0 and not in_assignment_value and (c in WORD_BREAK_CHARS or c in SPECIAL_CHARS):
+                break
+            elif in_assignment_value and c in WORD_BREAK_CHARS:
+                # Value ends at word break characters (but not special chars like ~)
                 break
             pos += 1
 
@@ -487,6 +538,9 @@ class Lexer:
                 # Don't use fast path if we're at an extglob pattern: @( ?( *( +( !(
                 if c == "(" and pos > fast_start and input_text[pos - 1] in "@?*+!":
                     _use_fast_path = False  # Fall through to slow path
+                # Don't use fast path if value contains quotes (need slow path for proper quote handling)
+                elif "'" in input_text[fast_start:pos] or '"' in input_text[fast_start:pos]:
+                    _use_fast_path = False  # Fall through to slow path for quotes
                 else:
                     _use_fast_path = True
 
@@ -565,6 +619,10 @@ class Lexer:
         in_double_quote = False
         starts_with_quote = input_text[pos] in "\"'" if pos < input_len else False
 
+        # Bracket tracking for slow path is disabled - let parser handle complex cases
+        # The fast path handles simple array assignments like a[0 + 1]=xyz
+        slow_bracket_depth = 0
+
         # Segment boundary tracking for mixed quoting (e.g., "pre"{a,b}"suf")
         # Records (value_offset, mode) at each quoting transition
         seg_boundaries: list[tuple[int, str]] = []
@@ -573,9 +631,16 @@ class Lexer:
         while pos < input_len:
             char = input_text[pos]
 
+            # Track bracket depth (only outside quotes) - disabled in slow path
+            # if not in_single_quote and not in_double_quote:
+            #     if char == "[" and value:
+            #         slow_bracket_depth += 1
+            #     elif char == "]" and slow_bracket_depth > 0:
+            #         slow_bracket_depth -= 1
+
             # Check for word boundaries
             if not in_single_quote and not in_double_quote:
-                if char in WORD_BREAK_CHARS:
+                if char in WORD_BREAK_CHARS and slow_bracket_depth == 0:
                     # Handle extglob patterns: @( ?( *( +( !(
                     if char == "(" and value and value[-1] in "@?*+!":
                         # Read balanced paren group as part of word
@@ -707,9 +772,9 @@ class Lexer:
                         continue
                 else:
                     # Outside quotes, backslash escapes next character
-                    if next_char in "\"'{}*?[]":
-                        # Preserve backslash for quotes, braces, and glob chars so parser
-                        # can create EscapedPart (prevents brace/glob expansion)
+                    if next_char in "\"'{}*?[]=":
+                        # Preserve backslash for quotes, braces, glob chars, and = so parser
+                        # can create EscapedPart (prevents brace/glob expansion and assignment)
                         value += char + next_char
                     else:
                         value += next_char
@@ -878,7 +943,12 @@ class Lexer:
 
         # Check for assignment (only if unquoted)
         if not quoted:
-            eq_idx = value.find("=")
+            # Find first unescaped = (not preceded by \)
+            eq_idx = -1
+            for i, c in enumerate(value):
+                if c == "=" and (i == 0 or value[i - 1] != "\\"):
+                    eq_idx = i
+                    break
             if eq_idx > 0 and is_valid_assignment_lhs(value[:eq_idx]):
                 return Token(
                     type=TokenType.ASSIGNMENT_WORD,

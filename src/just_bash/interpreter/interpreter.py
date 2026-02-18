@@ -755,7 +755,24 @@ class Interpreter:
                     _maybe_export_variable(self._state, name)
                 else:
                     # a=(1 2 3) - replace array
-                    # Clear existing array elements
+                    # IMPORTANT: Expand elements FIRST to handle self-reference like a=(0 "${a[@]}")
+                    # First pass: expand elements and check if any non-numeric keys exist
+                    # Use expand_word_with_glob to handle "${arr[@]}" expanding to multiple elements
+                    expanded_elements = []
+                    has_non_numeric_key = False
+                    for elem in assignment.array:
+                        result = await expand_word_with_glob(self._ctx, elem, no_split=True)
+                        for elem_value in result["values"]:
+                            bracket_match = _re.match(r'^\[([^\]]+)\]=(.*)$', elem_value)
+                            if bracket_match:
+                                key = bracket_match.group(1)
+                                try:
+                                    int(key)
+                                except ValueError:
+                                    has_non_numeric_key = True
+                            expanded_elements.append(elem_value)
+
+                    # Now clear existing array elements (after expansion)
                     prefix = f"{name}_"
                     to_remove = [k for k in self._state.env if k.startswith(prefix) and not k.startswith(f"{name}__")]
                     for k in to_remove:
@@ -766,20 +783,6 @@ class Interpreter:
                     existing_type = self._state.env.get(f"{name}__is_array")
                     if existing_type not in ("assoc", "associative"):
                         self._state.env[f"{name}__is_array"] = "indexed"
-
-                    # First pass: expand elements and check if any non-numeric keys exist
-                    expanded_elements = []
-                    has_non_numeric_key = False
-                    for elem in assignment.array:
-                        elem_value = await expand_word_async(self._ctx, elem)
-                        bracket_match = _re.match(r'^\[([^\]]+)\]=(.*)$', elem_value)
-                        if bracket_match:
-                            key = bracket_match.group(1)
-                            try:
-                                int(key)
-                            except ValueError:
-                                has_non_numeric_key = True
-                        expanded_elements.append(elem_value)
 
                     # Upgrade to associative if non-numeric keys found and not already associative
                     if has_non_numeric_key and self._state.env.get(f"{name}__is_array") == "indexed":
@@ -911,8 +914,14 @@ class Interpreter:
                     else:
                         self._state.env[f"{arr_name}_{subscript}"] = value
                 elif assignment.append:
-                    existing = self._state.env.get(name, "")
-                    self._state.env[name] = existing + value
+                    # Check if this is an array - if so, append to element 0
+                    is_array = self._state.env.get(f"{name}__is_array") is not None
+                    if is_array:
+                        existing = self._state.env.get(f"{name}_0", "")
+                        self._state.env[f"{name}_0"] = existing + value
+                    else:
+                        existing = self._state.env.get(name, "")
+                        self._state.env[name] = existing + value
                     _maybe_export_variable(self._state, name)
                 else:
                     # Special handling for SECONDS - reset timer

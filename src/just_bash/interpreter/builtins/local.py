@@ -75,11 +75,17 @@ async def handle_local(ctx: "InterpreterContext", args: list[str]) -> "ExecResul
 
     for arg in remaining_args:
         has_assignment = "=" in arg
+        is_append_local = False
         if has_assignment:
             name, value = arg.split("=", 1)
         else:
             name = arg
             value = None  # No assignment - don't reset existing value
+
+        # Handle append mode: name+=value or name+=(array)
+        if name.endswith("+"):
+            is_append_local = True
+            name = name[:-1]
 
         # Validate identifier
         if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", name):
@@ -113,13 +119,21 @@ async def handle_local(ctx: "InterpreterContext", args: list[str]) -> "ExecResul
 
             # Set array type marker
             array_key = f"{name}__is_array"
-            ctx.state.env[array_key] = "assoc" if is_assoc else "indexed"
+            if array_key not in ctx.state.env:
+                # Converting scalar to array - save existing scalar value as element 0
+                existing_scalar = ctx.state.env.get(name)
+                ctx.state.env[array_key] = "assoc" if is_assoc else "indexed"
+                if existing_scalar is not None:
+                    ctx.state.env[f"{name}_0"] = existing_scalar
+            else:
+                ctx.state.env[array_key] = "assoc" if is_assoc else "indexed"
 
-            # Clear existing elements and parse new ones
-            _clear_array_elements(ctx, name)
+            # Clear existing elements and parse new ones (unless appending)
+            if not is_append_local:
+                _clear_array_elements(ctx, name)
             inner = value[1:-1].strip()
             if inner:
-                _parse_array_assignment(ctx, name, inner, is_assoc)
+                _parse_array_assignment(ctx, name, inner, is_assoc, is_append_local)
         elif is_array or is_assoc:
             # Declare as array without initialization - creates empty local array
             _save_array_in_scope(ctx, name, current_scope)

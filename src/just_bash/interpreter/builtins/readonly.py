@@ -76,14 +76,56 @@ async def handle_readonly(
 
     # Mark variables as readonly
     for name_value in names:
+        is_append = False
         if "=" in name_value:
             name, value = name_value.split("=", 1)
-            # Check if already readonly
-            if _is_readonly(ctx, name):
-                return _result("", f"bash: readonly: {name}: readonly variable\n", 1)
-            env[name] = value
         else:
             name = name_value
+            value = None
+
+        # Handle append mode: name+=value or name+=(array)
+        if name.endswith("+"):
+            is_append = True
+            name = name[:-1]
+
+        # Check if already readonly
+        if _is_readonly(ctx, name):
+            return _result("", f"bash: readonly: {name}: readonly variable\n", 1)
+
+        if value is not None:
+            # Handle array assignment: (values)
+            if value.startswith("(") and value.endswith(")"):
+                from .declare import _parse_array_assignment
+                array_key = f"{name}__is_array"
+                if array_key not in env:
+                    # Converting scalar to array
+                    existing_scalar = env.get(name)
+                    env[array_key] = "indexed"
+                    if existing_scalar is not None:
+                        env[f"{name}_0"] = existing_scalar
+                else:
+                    env[array_key] = "indexed"
+
+                if not is_append:
+                    # Clear existing elements
+                    to_remove = [k for k in env if k.startswith(f"{name}_") and not k.startswith(f"{name}__")]
+                    for k in to_remove:
+                        del env[k]
+
+                inner = value[1:-1].strip()
+                if inner:
+                    _parse_array_assignment(ctx, name, inner, False, is_append)
+            elif is_append:
+                # Check if this is an array - if so, append to element 0
+                is_array = env.get(f"{name}__is_array") is not None
+                if is_array:
+                    existing = env.get(f"{name}_0", "")
+                    env[f"{name}_0"] = existing + value
+                else:
+                    existing = env.get(name, "")
+                    env[name] = existing + value
+            else:
+                env[name] = value
 
         # Set readonly via metadata
         if isinstance(env, VariableStore):
