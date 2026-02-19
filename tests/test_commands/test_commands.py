@@ -4882,6 +4882,47 @@ class TestBashCommand:
         assert "-c" in result.stdout
 
 
+    @pytest.mark.asyncio
+    async def test_bash_norc_flag(self):
+        """bash --norc -c should work, ignoring --norc."""
+        bash = Bash()
+        result = await bash.exec("bash --norc -c 'echo hello'")
+        assert result.exit_code == 0
+        assert result.stdout == "hello\n"
+
+    @pytest.mark.asyncio
+    async def test_bash_norc_rcfile_flags(self):
+        """bash --norc --rcfile /dev/null -c should work."""
+        bash = Bash()
+        result = await bash.exec("bash --norc --rcfile /dev/null -c 'echo hello'")
+        assert result.exit_code == 0
+        assert result.stdout == "hello\n"
+
+    @pytest.mark.asyncio
+    async def test_bash_interactive_flag(self):
+        """bash -i -c should work, ignoring -i."""
+        bash = Bash()
+        result = await bash.exec("bash -i -c 'echo hello'")
+        assert result.exit_code == 0
+        assert result.stdout == "hello\n"
+
+    @pytest.mark.asyncio
+    async def test_bash_nounset_flag(self):
+        """bash -u -c should work, enabling nounset."""
+        bash = Bash()
+        result = await bash.exec("bash -u -c 'echo hello'")
+        assert result.exit_code == 0
+        assert result.stdout == "hello\n"
+
+    @pytest.mark.asyncio
+    async def test_bash_combined_flags(self):
+        """bash with multiple flags before -c."""
+        bash = Bash()
+        result = await bash.exec("bash --norc --rcfile /dev/null -i -c 'echo ok'")
+        assert result.exit_code == 0
+        assert result.stdout == "ok\n"
+
+
 class TestShCommand:
     """Test sh command."""
 

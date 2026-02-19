@@ -298,6 +298,12 @@ def get_variable(ctx: "InterpreterContext", name: str, check_nounset: bool = Tru
         return env.get("HOSTNAME", "localhost")
     elif name == "BASHPID":
         return str(env.get("$", "1"))
+    elif name == "UID":
+        return env.get("UID", "1000")
+    elif name == "EUID":
+        return env.get("EUID", "1000")
+    elif name == "PPID":
+        return env.get("PPID", "1")
 
     # Regular variable
     value = env.get(name)
@@ -685,6 +691,74 @@ async def expand_word_async(ctx: "InterpreterContext", word: WordNode) -> str:
     for part in word.parts:
         parts.append(await expand_part(ctx, part))
     return "".join(parts)
+
+
+def expand_word_for_pattern(ctx: "InterpreterContext", word: WordNode) -> str:
+    """Expand a word for use as a glob pattern (sync).
+
+    Glob metacharacters from quoted sources are escaped with backslash so they
+    match literally, while unquoted glob chars remain active.
+    """
+    parts = []
+    for part in word.parts:
+        parts.append(_expand_part_for_pattern_sync(ctx, part))
+    return "".join(parts)
+
+
+def _expand_part_for_pattern_sync(
+    ctx: "InterpreterContext", part: "WordPart", in_double_quotes: bool = False
+) -> str:
+    """Expand a word part for pattern matching (sync).
+
+    Quoted parts have glob metacharacters escaped with backslash.
+    """
+    if isinstance(part, LiteralPart):
+        # Unquoted literal - glob chars remain active
+        return part.value
+    elif isinstance(part, SingleQuotedPart):
+        # Single-quoted - all glob chars escaped with backslash
+        return _escape_glob_for_pattern(part.value)
+    elif isinstance(part, EscapedPart):
+        # Escaped char - literal
+        return _escape_glob_for_pattern(part.value)
+    elif isinstance(part, DoubleQuotedPart):
+        # Double-quoted - glob chars escaped, but expansions still happen
+        result = []
+        for p in part.parts:
+            expanded = _expand_part_for_pattern_sync(ctx, p, in_double_quotes=True)
+            if isinstance(p, (LiteralPart, EscapedPart)):
+                # Literal text inside double quotes is protected
+                expanded = _escape_glob_for_pattern(expanded)
+            elif isinstance(p, ParameterExpansionPart):
+                # Parameter expansion result inside double quotes is protected
+                expanded = _escape_glob_for_pattern(expanded)
+            result.append(expanded)
+        return "".join(result)
+    elif isinstance(part, GlobPart):
+        # Unquoted glob - stays active
+        return part.pattern
+    elif isinstance(part, ParameterExpansionPart):
+        # Unquoted parameter expansion - glob chars stay active
+        return expand_part_sync(ctx, part, in_double_quotes)
+    else:
+        # All other parts: delegate to normal expansion
+        return expand_part_sync(ctx, part, in_double_quotes)
+
+
+def _escape_glob_for_pattern(s: str) -> str:
+    """Escape glob metacharacters with backslash for pattern matching.
+
+    Also escapes backslash itself to prevent glob_to_regex from treating
+    it as an escape character.
+    """
+    result = []
+    for c in s:
+        if c in '*?[\\':
+            result.append('\\')
+            result.append(c)
+        else:
+            result.append(c)
+    return ''.join(result)
 
 
 def _escape_glob_chars(s: str) -> str:
@@ -1329,7 +1403,7 @@ def expand_parameter(ctx: "InterpreterContext", part: ParameterExpansionPart, in
         return value[offset:]
 
     elif operation.type == "PatternRemoval":
-        pattern = expand_word(ctx, operation.pattern) if operation.pattern else ""
+        pattern = expand_word_for_pattern(ctx, operation.pattern) if operation.pattern else ""
         greedy = operation.greedy
         from_end = operation.side == "suffix"
         # Check if extglob is enabled
@@ -1348,41 +1422,44 @@ def expand_parameter(ctx: "InterpreterContext", part: ParameterExpansionPart, in
         # Convert glob pattern to regex
         regex_pattern = glob_to_regex(pattern, greedy=True, from_end=from_end, extglob=extglob_on)
 
-        if from_end:
-            # Remove from end: ${var%pattern} or ${var%%pattern}
-            if greedy:
-                # ${var%%pattern}: remove longest matching suffix
-                match = re.search(regex_pattern + "$", value)
-                if match:
-                    return value[:match.start()]
+        try:
+            if from_end:
+                # Remove from end: ${var%pattern} or ${var%%pattern}
+                if greedy:
+                    # ${var%%pattern}: remove longest matching suffix
+                    match = re.search(regex_pattern + "$", value)
+                    if match:
+                        return value[:match.start()]
+                else:
+                    # ${var%pattern}: remove shortest matching suffix
+                    # Check empty suffix first (pattern might match empty string)
+                    if re.fullmatch(regex_pattern, ""):
+                        return value
+                    # Try matching from the end, starting with the shortest suffix
+                    for start in range(len(value) - 1, -1, -1):
+                        suffix = value[start:]
+                        if re.fullmatch(regex_pattern, suffix):
+                            return value[:start]
             else:
-                # ${var%pattern}: remove shortest matching suffix
-                # Check empty suffix first (pattern might match empty string)
-                if re.fullmatch(regex_pattern, ""):
-                    return value
-                # Try matching from the end, starting with the shortest suffix
-                for start in range(len(value) - 1, -1, -1):
-                    suffix = value[start:]
-                    if re.fullmatch(regex_pattern, suffix):
-                        return value[:start]
-        else:
-            # Remove from start: ${var#pattern} or ${var##pattern}
-            if greedy:
-                # ${var##pattern}: remove longest matching prefix
-                regex_greedy = glob_to_regex(pattern, greedy=True, from_end=False, extglob=extglob_on)
-                match = re.match(regex_greedy, value)
-                if match:
-                    return value[match.end():]
-            else:
-                # ${var#pattern}: remove shortest matching prefix
-                regex_nongreedy = glob_to_regex(pattern, greedy=False, from_end=False, extglob=extglob_on)
-                match = re.match(regex_nongreedy, value)
-                if match:
-                    return value[match.end():]
+                # Remove from start: ${var#pattern} or ${var##pattern}
+                if greedy:
+                    # ${var##pattern}: remove longest matching prefix
+                    regex_greedy = glob_to_regex(pattern, greedy=True, from_end=False, extglob=extglob_on)
+                    match = re.match(regex_greedy, value)
+                    if match:
+                        return value[match.end():]
+                else:
+                    # ${var#pattern}: remove shortest matching prefix
+                    regex_nongreedy = glob_to_regex(pattern, greedy=False, from_end=False, extglob=extglob_on)
+                    match = re.match(regex_nongreedy, value)
+                    if match:
+                        return value[match.end():]
+        except re.error:
+            pass
         return value
 
     elif operation.type == "PatternReplacement":
-        pattern = expand_word(ctx, operation.pattern) if operation.pattern else ""
+        pattern = expand_word_for_pattern(ctx, operation.pattern) if operation.pattern else ""
         replacement = expand_word(ctx, operation.replacement) if operation.replacement else ""
         replace_all = operation.all
         anchor = getattr(operation, 'anchor', None)
@@ -1408,16 +1485,19 @@ def expand_parameter(ctx: "InterpreterContext", part: ParameterExpansionPart, in
                 results.append(_apply_pattern_replacement(elem_val, regex_pattern, pattern, replacement, replace_all, anchor))
             return " ".join(results)
 
-        if anchor == "start":
-            anchored_pattern = "^" + regex_pattern
-            return re.sub(anchored_pattern, replacement, value, count=1)
-        elif anchor == "end":
-            anchored_pattern = regex_pattern + "$"
-            return re.sub(anchored_pattern, replacement, value, count=1)
-        elif replace_all:
-            return re.sub(regex_pattern, replacement, value)
-        else:
-            return re.sub(regex_pattern, replacement, value, count=1)
+        try:
+            if anchor == "start":
+                anchored_pattern = "^" + regex_pattern
+                return re.sub(anchored_pattern, replacement, value, count=1)
+            elif anchor == "end":
+                anchored_pattern = regex_pattern + "$"
+                return re.sub(anchored_pattern, replacement, value, count=1)
+            elif replace_all:
+                return _bash_replace_all(regex_pattern, replacement, value)
+            else:
+                return re.sub(regex_pattern, replacement, value, count=1)
+        except re.error:
+            return value
 
     elif operation.type == "CaseModification":
         # ${var^^} or ${var,,} for case conversion
@@ -1622,31 +1702,60 @@ def expand_parameter(ctx: "InterpreterContext", part: ParameterExpansionPart, in
     return value
 
 
+def _bash_replace_all(regex_pattern: str, replacement: str, value: str) -> str:
+    """Replace all non-overlapping matches, skipping zero-length matches after non-empty ones.
+
+    Bash's replace-all doesn't match empty strings at boundaries after already
+    matching the full content (unlike Python's re.sub which matches '' at end).
+    """
+    result = []
+    pos = 0
+    last_end = 0
+    for m in re.finditer(regex_pattern, value):
+        if m.start() == m.end() and m.start() == last_end and pos > 0:
+            # Skip zero-length match at the same position as end of previous match
+            continue
+        result.append(value[pos:m.start()])
+        result.append(replacement)
+        pos = m.end()
+        last_end = m.end()
+        if m.start() == m.end():
+            # Zero-length match: advance by one to avoid infinite loop
+            if pos < len(value):
+                result.append(value[pos])
+                pos += 1
+    result.append(value[pos:])
+    return "".join(result)
+
+
 def _apply_pattern_removal(value: str, regex_pattern: str, pattern: str, greedy: bool, from_end: bool) -> str:
     """Apply pattern removal to a single string value."""
-    if from_end:
-        if greedy:
-            match = re.search(regex_pattern + "$", value)
-            if match:
-                return value[:match.start()]
+    try:
+        if from_end:
+            if greedy:
+                match = re.search(regex_pattern + "$", value)
+                if match:
+                    return value[:match.start()]
+            else:
+                for start in range(len(value) - 1, -1, -1):
+                    suffix = value[start:]
+                    if re.fullmatch(regex_pattern, suffix):
+                        return value[:start]
+                if re.fullmatch(regex_pattern, ""):
+                    return value
         else:
-            for start in range(len(value) - 1, -1, -1):
-                suffix = value[start:]
-                if re.fullmatch(regex_pattern, suffix):
-                    return value[:start]
-            if re.fullmatch(regex_pattern, ""):
-                return value
-    else:
-        if greedy:
-            regex_greedy = glob_to_regex(pattern, greedy=True, from_end=False)
-            match = re.match(regex_greedy, value)
-            if match:
-                return value[match.end():]
-        else:
-            regex_nongreedy = glob_to_regex(pattern, greedy=False, from_end=False)
-            match = re.match(regex_nongreedy, value)
-            if match:
-                return value[match.end():]
+            if greedy:
+                regex_greedy = glob_to_regex(pattern, greedy=True, from_end=False)
+                match = re.match(regex_greedy, value)
+                if match:
+                    return value[match.end():]
+            else:
+                regex_nongreedy = glob_to_regex(pattern, greedy=False, from_end=False)
+                match = re.match(regex_nongreedy, value)
+                if match:
+                    return value[match.end():]
+    except re.error:
+        pass
     return value
 
 
@@ -1654,16 +1763,19 @@ def _apply_pattern_replacement(value: str, regex_pattern: str, pattern: str, rep
     """Apply pattern replacement to a single string value."""
     if not pattern:
         return value
-    if anchor == "start":
-        anchored = "^" + regex_pattern
-        return re.sub(anchored, replacement, value, count=1)
-    elif anchor == "end":
-        anchored = regex_pattern + "$"
-        return re.sub(anchored, replacement, value, count=1)
-    elif replace_all:
-        return re.sub(regex_pattern, replacement, value)
-    else:
-        return re.sub(regex_pattern, replacement, value, count=1)
+    try:
+        if anchor == "start":
+            anchored = "^" + regex_pattern
+            return re.sub(anchored, replacement, value, count=1)
+        elif anchor == "end":
+            anchored = regex_pattern + "$"
+            return re.sub(anchored, replacement, value, count=1)
+        elif replace_all:
+            return _bash_replace_all(regex_pattern, replacement, value)
+        else:
+            return re.sub(regex_pattern, replacement, value, count=1)
+    except re.error:
+        return value
 
 
 def _case_first_matching(value: str, pattern: str, transform) -> str:
@@ -2455,7 +2567,7 @@ def _apply_array_operation_list(
         return sliced
 
     elif operation.type == "PatternRemoval":
-        pattern = expand_word(ctx, operation.pattern) if operation.pattern else ""
+        pattern = expand_word_for_pattern(ctx, operation.pattern) if operation.pattern else ""
         greedy = operation.greedy
         from_end = operation.side == "suffix"
         extglob_on = ctx.state.env.get("__shopt_extglob__", "0") == "1"
@@ -2470,7 +2582,7 @@ def _apply_array_operation_list(
         return results
 
     elif operation.type == "PatternReplacement":
-        pattern = expand_word(ctx, operation.pattern) if operation.pattern else ""
+        pattern = expand_word_for_pattern(ctx, operation.pattern) if operation.pattern else ""
         replacement = expand_word(ctx, operation.replacement) if operation.replacement else ""
         replace_all = operation.all
         anchor = getattr(operation, 'anchor', None)

@@ -249,6 +249,53 @@ def _decode_ansi_c_escapes(s: str) -> str:
     return "".join(result)
 
 
+def _find_patsub_separator(text: str, pat_start: int, allow_empty: bool = False) -> int:
+    """Find the unquoted, unescaped '/' separator between pattern and replacement.
+
+    `pat_start` is the index where the pattern begins (after the operator).
+    Scans the pattern handling backslash escapes and single/double quotes,
+    looking for the first unquoted '/' that is past the first pattern character.
+    If `allow_empty` is True, a '/' at pat_start is treated as a separator (empty pattern).
+    Returns the index of the separator or -1 if not found.
+    """
+    i = pat_start
+    # The first character of the pattern (which may be /) is never the separator
+    # unless allow_empty is True (for /#, /% anchored patterns)
+    found_pattern_char = allow_empty
+    while i < len(text):
+        c = text[i]
+        if c == '\\' and i + 1 < len(text):
+            i += 2  # Skip escaped char
+            found_pattern_char = True
+            continue
+        if c == "'":
+            # Find closing single quote
+            j = text.find("'", i + 1)
+            if j == -1:
+                return -1  # Unterminated
+            i = j + 1
+            found_pattern_char = True
+            continue
+        if c == '"':
+            # Find closing double quote (handling escapes)
+            j = i + 1
+            while j < len(text):
+                if text[j] == '\\' and j + 1 < len(text):
+                    j += 2
+                elif text[j] == '"':
+                    break
+                else:
+                    j += 1
+            i = j + 1
+            found_pattern_char = True
+            continue
+        if c == '/' and found_pattern_char:
+            return i
+        found_pattern_char = True
+        i += 1
+    return -1
+
+
 class Parser:
     """Parser class - transforms tokens into AST."""
 
@@ -2332,7 +2379,7 @@ class Parser:
         # Handle pattern replacement ${VAR/pattern/replacement} ${VAR//pattern/replacement}
         # Also handle anchored patterns: ${VAR/#pattern/repl} (start) ${VAR/%pattern/repl} (end)
         if rest.startswith("//"):
-            slash_pos = rest.find("/", 2)
+            slash_pos = _find_patsub_separator(rest, 2)
             if slash_pos >= 0:
                 pattern = self._parse_word_from_string(rest[2:slash_pos])
                 replacement = self._parse_word_from_string(rest[slash_pos + 1:])
@@ -2346,8 +2393,7 @@ class Parser:
                 ),
             )
         if rest.startswith("/#"):
-            # Anchored at start (prefix)
-            slash_pos = rest.find("/", 2)
+            slash_pos = _find_patsub_separator(rest, 2, allow_empty=True)
             if slash_pos >= 0:
                 pattern = self._parse_word_from_string(rest[2:slash_pos])
                 replacement = self._parse_word_from_string(rest[slash_pos + 1:])
@@ -2362,7 +2408,7 @@ class Parser:
             )
         if rest.startswith("/%"):
             # Anchored at end (suffix)
-            slash_pos = rest.find("/", 2)
+            slash_pos = _find_patsub_separator(rest, 2, allow_empty=True)
             if slash_pos >= 0:
                 pattern = self._parse_word_from_string(rest[2:slash_pos])
                 replacement = self._parse_word_from_string(rest[slash_pos + 1:])
@@ -2376,7 +2422,7 @@ class Parser:
                 ),
             )
         if rest.startswith("/"):
-            slash_pos = rest.find("/", 1)
+            slash_pos = _find_patsub_separator(rest, 1, allow_empty=True)
             if slash_pos >= 0:
                 pattern = self._parse_word_from_string(rest[1:slash_pos])
                 replacement = self._parse_word_from_string(rest[slash_pos + 1:])

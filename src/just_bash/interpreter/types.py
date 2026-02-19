@@ -362,7 +362,7 @@ class InterpreterState:
     dir_stack: list[str] = field(default_factory=list)
     """Directory stack for pushd/popd/dirs."""
 
-    readonly_vars: set[str] = field(default_factory=lambda: {"SHELLOPTS", "BASHOPTS"})
+    readonly_vars: set[str] = field(default_factory=lambda: {"SHELLOPTS", "BASHOPTS", "UID", "EUID", "PPID"})
     """Set of readonly variable names."""
 
     expansion_exit_code: Optional[int] = None

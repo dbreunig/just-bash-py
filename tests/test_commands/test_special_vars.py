@@ -306,6 +306,73 @@ f a b c
         assert "at: a b c" in result.stdout
 
 
+class TestUIDEUID:
+    """Test $UID and $EUID - user ID variables."""
+
+    @pytest.mark.asyncio
+    async def test_uid_is_numeric(self):
+        """$UID should expand to a numeric value."""
+        bash = Bash()
+        result = await bash.exec('echo $UID')
+        val = result.stdout.strip()
+        assert val.isdigit()
+
+    @pytest.mark.asyncio
+    async def test_euid_is_numeric(self):
+        """$EUID should expand to a numeric value."""
+        bash = Bash()
+        result = await bash.exec('echo $EUID')
+        val = result.stdout.strip()
+        assert val.isdigit()
+
+    @pytest.mark.asyncio
+    async def test_uid_euid_match_egrep(self):
+        """$UID and $EUID should match numeric regex (spec test L371)."""
+        bash = Bash()
+        result = await bash.exec('''
+echo $UID | egrep -o '[0-9]+' >/dev/null && echo uid_ok
+echo $EUID | egrep -o '[0-9]+' >/dev/null && echo euid_ok
+''')
+        assert "uid_ok" in result.stdout
+        assert "euid_ok" in result.stdout
+
+    @pytest.mark.asyncio
+    async def test_uid_readonly(self):
+        """$UID should be readonly - assignment is rejected."""
+        bash = Bash()
+        result = await bash.exec('UID=999; echo $UID')
+        # UID should not be 999 (either readonly error or unchanged value)
+        val = result.stdout.strip()
+        assert val != "999"
+
+
+class TestPPID:
+    """Test $PPID - parent process ID."""
+
+    @pytest.mark.asyncio
+    async def test_ppid_is_numeric(self):
+        """$PPID should expand to a numeric value."""
+        bash = Bash()
+        result = await bash.exec('echo $PPID')
+        val = result.stdout.strip()
+        assert val.isdigit()
+
+    @pytest.mark.asyncio
+    async def test_ppid_match_egrep(self):
+        """$PPID should match numeric regex (spec test L346)."""
+        bash = Bash()
+        result = await bash.exec('echo $PPID | egrep "[0-9]+"')
+        assert result.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_ppid_readonly(self):
+        """$PPID should be readonly."""
+        bash = Bash()
+        result = await bash.exec('PPID=999; echo $PPID')
+        val = result.stdout.strip()
+        assert val != "999"
+
+
 class TestShellOptions:
     """Test shell option variables."""
 

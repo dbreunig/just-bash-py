@@ -187,8 +187,8 @@ def parse_spec_content(content: str, file_path: str) -> ParsedSpecFile:
                 multi_line_content = []
                 continue
 
-            # Check for SKIP directive
-            skip_match = re.match(r"^SKIP(?::\s*(.*))?$", assertion_line, re.IGNORECASE)
+            # Check for SKIP directive (matches "SKIP", "SKIP: reason", "SKIP (reason): detail")
+            skip_match = re.match(r"^SKIP(?:[\s:(]\s*(.*))?$", assertion_line, re.IGNORECASE)
             if skip_match:
                 current_test.skip = skip_match.group(1) or "skipped"
                 continue

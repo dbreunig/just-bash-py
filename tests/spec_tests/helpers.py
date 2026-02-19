@@ -17,22 +17,27 @@ class ArgvCommand:
     async def execute(self, args: list[str], ctx: CommandContext) -> ExecResult:
         formatted = []
         for arg in args:
-            has_single_quote = "'" in arg
-            has_double_quote = '"' in arg
-
-            # Escape special characters first
-            escaped = arg.replace("\\", "\\\\")
-            escaped = escaped.replace("\n", "\\n")
-            escaped = escaped.replace("\t", "\\t")
-            escaped = escaped.replace("\r", "\\r")
-
-            if has_single_quote and not has_double_quote:
-                # Use double quotes when string contains single quotes but no double quotes
-                formatted.append(f'"{escaped}"')
-            else:
-                # Default: use single quotes (escape single quotes)
-                escaped = escaped.replace("'", "\\'")
-                formatted.append(f"'{escaped}'")
+            # Encode to UTF-8 bytes and escape non-ASCII, matching Oils argv.py
+            encoded = arg.encode("utf-8")
+            parts = []
+            for byte in encoded:
+                if byte >= 0x80:
+                    parts.append(f"\\x{byte:02x}")
+                elif byte == ord("'"):
+                    parts.append("\\'")
+                elif byte == ord("\\"):
+                    parts.append("\\\\")
+                elif 0x20 <= byte < 0x7F:
+                    parts.append(chr(byte))
+                elif byte == ord("\n"):
+                    parts.append("\\n")
+                elif byte == ord("\t"):
+                    parts.append("\\t")
+                elif byte == ord("\r"):
+                    parts.append("\\r")
+                else:
+                    parts.append(f"\\x{byte:02x}")
+            formatted.append("'" + "".join(parts) + "'")
 
         return ExecResult(
             stdout=f"[{', '.join(formatted)}]\n",

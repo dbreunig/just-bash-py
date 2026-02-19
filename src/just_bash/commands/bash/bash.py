@@ -24,23 +24,57 @@ class BashCommand:
                 exit_code=0,
             )
 
-        # Handle -c flag
-        # With -c: bash -c 'command' arg0 arg1 arg2
-        # arg0 becomes $0, arg1 becomes $1, arg2 becomes $2
-        if len(args) >= 2 and args[0] == "-c":
-            command = args[1]
-            script_name = args[2] if len(args) > 2 else "bash"
-            script_args = args[3:] if len(args) > 3 else []
-            return await self._execute_script(command, script_name, script_args, ctx)
+        # Parse flags before -c or script file
+        # Flags that take an argument
+        flags_with_arg = {"--rcfile", "--init-file", "-O", "+O", "-o", "+o"}
+        # Flags that don't take an argument
+        flags_no_arg = {
+            "--norc", "--noprofile", "--noediting", "--posix", "--verbose",
+            "--login", "-i", "-l", "-r", "-s", "-D", "--dump-strings",
+            "--debugger", "--dump-po-strings",
+        }
+        # Single-letter flags that can appear as -x, -e, -u, etc.
+        single_letter_flags = set("abefhkmnprtuvxBCEHPT")
+
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg == "-c":
+                # Found -c flag
+                if i + 1 < len(args):
+                    command = args[i + 1]
+                    rest = args[i + 2:]
+                    script_name = rest[0] if rest else "bash"
+                    script_args = rest[1:] if len(rest) > 1 else []
+                    return await self._execute_script(command, script_name, script_args, ctx)
+                else:
+                    return ExecResult(
+                        stdout="", stderr="bash: -c: option requires an argument\n",
+                        exit_code=2,
+                    )
+            elif arg in flags_with_arg:
+                i += 2  # skip flag and its argument
+            elif arg in flags_no_arg:
+                i += 1
+            elif arg.startswith("-") and len(arg) == 2 and arg[1] in single_letter_flags:
+                i += 1
+            elif arg.startswith("+") and len(arg) == 2 and arg[1] in single_letter_flags:
+                i += 1
+            elif arg == "--":
+                i += 1
+                break  # end of options
+            else:
+                break  # not a recognized flag, treat as script file
+
+        remaining = args[i:]
 
         # No arguments - in real bash this would be interactive mode
-        # In our implementation, we just return success
-        if not args:
+        if not remaining:
             return ExecResult(stdout="", stderr="", exit_code=0)
 
         # Read and execute script file
-        script_path = args[0]
-        script_args = args[1:]
+        script_path = remaining[0]
+        script_args = remaining[1:]
 
         try:
             full_path = ctx.fs.resolve_path(ctx.cwd, script_path)
@@ -121,19 +155,50 @@ class ShCommand:
                 exit_code=0,
             )
 
-        # Same implementation as bash
-        # Handle -c flag
-        if len(args) >= 2 and args[0] == "-c":
-            command = args[1]
-            script_name = args[2] if len(args) > 2 else "sh"
-            script_args = args[3:] if len(args) > 3 else []
-            return await self._execute_script(command, script_name, script_args, ctx)
+        # Same flag parsing as bash
+        flags_with_arg = {"--rcfile", "--init-file", "-O", "+O", "-o", "+o"}
+        flags_no_arg = {
+            "--norc", "--noprofile", "--noediting", "--posix", "--verbose",
+            "--login", "-i", "-l", "-r", "-s", "-D",
+        }
+        single_letter_flags = set("abefhkmnprtuvxBCEHPT")
 
-        if not args:
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg == "-c":
+                if i + 1 < len(args):
+                    command = args[i + 1]
+                    rest = args[i + 2:]
+                    script_name = rest[0] if rest else "sh"
+                    script_args = rest[1:] if len(rest) > 1 else []
+                    return await self._execute_script(command, script_name, script_args, ctx)
+                else:
+                    return ExecResult(
+                        stdout="", stderr="sh: -c: option requires an argument\n",
+                        exit_code=2,
+                    )
+            elif arg in flags_with_arg:
+                i += 2
+            elif arg in flags_no_arg:
+                i += 1
+            elif arg.startswith("-") and len(arg) == 2 and arg[1] in single_letter_flags:
+                i += 1
+            elif arg.startswith("+") and len(arg) == 2 and arg[1] in single_letter_flags:
+                i += 1
+            elif arg == "--":
+                i += 1
+                break
+            else:
+                break
+
+        remaining = args[i:]
+
+        if not remaining:
             return ExecResult(stdout="", stderr="", exit_code=0)
 
-        script_path = args[0]
-        script_args = args[1:]
+        script_path = remaining[0]
+        script_args = remaining[1:]
 
         try:
             full_path = ctx.fs.resolve_path(ctx.cwd, script_path)

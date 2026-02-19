@@ -333,3 +333,88 @@ arr=(aaa bbb aaa)
 echo "${arr[@]//a/x}"
 ''')
         assert "xxx" in result.stdout
+
+
+class TestSlashInPattern:
+    """Test slash as the pattern character in substitution."""
+
+    @pytest.mark.asyncio
+    async def test_replace_all_slash_with_char(self):
+        """${x////c} should replace all / with c."""
+        bash = Bash()
+        result = await bash.exec("x='/_/'; echo ${x////c}")
+        assert result.stdout == "c_c\n"
+
+    @pytest.mark.asyncio
+    async def test_delete_all_slashes(self):
+        """${x///} should delete all slashes."""
+        bash = Bash()
+        result = await bash.exec('x="a/b/c"; echo "${x///}"')
+        assert result.stdout == "abc\n"
+
+    @pytest.mark.asyncio
+    async def test_quoted_slash_pattern(self):
+        r"""${x//'/'/c} should replace quoted / with c."""
+        bash = Bash()
+        result = await bash.exec("x='/_/'; echo ${x//'/'/c}")
+        assert result.stdout == "c_c\n"
+
+    @pytest.mark.asyncio
+    async def test_replace_slash_with_backslash_slash(self):
+        r"""${x////\\/} should replace / with \/."""
+        bash = Bash()
+        result = await bash.exec(r"x=/foo/bar/baz; echo ${x////\\/}")
+        assert result.stdout == "\\/foo\\/bar\\/baz\n"
+
+
+class TestQuotedGlobInPattern:
+    """Test that quoted glob chars in patterns are literal."""
+
+    @pytest.mark.asyncio
+    async def test_quoted_star_is_literal(self):
+        """Quoted * in pattern should match literal *."""
+        bash = Bash()
+        result = await bash.exec('''g='*'; v='a*b'; echo ${v//"$g"/-}''')
+        assert result.stdout == "a-b\n"
+
+    @pytest.mark.asyncio
+    async def test_unquoted_star_is_glob(self):
+        """Unquoted * from variable is glob."""
+        bash = Bash()
+        result = await bash.exec('''g='*'; v='a*b'; echo ${v//$g/-}''')
+        assert result.stdout == "-\n"
+
+    @pytest.mark.asyncio
+    async def test_quoted_backslash_pattern(self):
+        r"""${v/"$x"/_} where x='\f' matches literal \f."""
+        bash = Bash()
+        result = await bash.exec(r'''v='[\f]'; x='\f'; echo "${v/"$x"/_}"''')
+        assert result.stdout == "[_]\n"
+
+
+class TestCharacterClassInPattern:
+    """Test character class handling in pattern substitution."""
+
+    @pytest.mark.asyncio
+    async def test_invalid_range_no_crash(self):
+        """[z-a] invalid range should not crash."""
+        bash = Bash()
+        result = await bash.exec("x=fooz; pat='[z-a]'; echo ${x//$pat}")
+        assert result.exit_code == 0
+        # bash treats it as matching nothing
+        assert result.stdout.strip() == "fooz"
+
+    @pytest.mark.asyncio
+    @pytest.mark.skip(reason="[^]] bracket parsing diverges between bash and POSIX - complex edge case")
+    async def test_caret_close_bracket(self):
+        """[^]] pattern: bash treats [^] as failed bracket, becomes literal [^] + ]."""
+        bash = Bash()
+        result = await bash.exec("pat='[^]]'; s='ab^cd^'; echo ${s//$pat/z}")
+        assert result.stdout.strip() == "ab^cd^"
+
+    @pytest.mark.asyncio
+    async def test_hard_glob_pattern(self):
+        r"""Escaped * followed by glob * in pattern."""
+        bash = Bash()
+        result = await bash.exec(r"s='aa*bb+cc'; echo ${s//\**+/__}")
+        assert result.stdout == "aa__cc\n"
