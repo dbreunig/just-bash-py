@@ -113,8 +113,20 @@ class IFileSystem(Protocol):
         """Remove file or directory."""
         ...
 
+    async def cp(self, src: str, dest: str, recursive: bool = False) -> None:
+        """Copy file or directory."""
+        ...
+
+    async def mv(self, src: str, dest: str) -> None:
+        """Move file or directory."""
+        ...
+
     async def stat(self, path: str) -> "FsStat":
         """Get file/directory stats."""
+        ...
+
+    async def lstat(self, path: str) -> "FsStat":
+        """Get file/directory stats (does not follow the final symlink)."""
         ...
 
     async def chmod(self, path: str, mode: int) -> None:
@@ -123,6 +135,10 @@ class IFileSystem(Protocol):
 
     async def symlink(self, target: str, link_path: str) -> None:
         """Create symbolic link."""
+        ...
+
+    async def link(self, existing_path: str, new_path: str) -> None:
+        """Create hard link."""
         ...
 
     async def readlink(self, path: str) -> str:
