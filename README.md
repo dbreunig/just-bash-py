@@ -208,6 +208,18 @@ await bash.exec("ls /reference")    # Overlay filesystem
 await bash.exec("ls /tmp")          # In-memory (base)
 ```
 
+#### Custom Filesystems
+
+You can supply your own backend by implementing the `IFileSystem` protocol (`just_bash.types`). **Signal failures with `OSError` subclasses.** `FileNotFoundError`, `IsADirectoryError` and `PermissionError` are recognized by the commands, which phrase them the way the real coreutils do (`cat: /x: No such file or directory`). Any other `OSError` — including `TimeoutError` and `ConnectionError`, useful for network-backed filesystems — is caught at the command-execution boundary and reported generically as `<command>: <filename>: <strerror>` with exit code 1, so a backend failure ends the command instead of escaping `bash.exec()`. Exceptions that are not `OSError` are treated as bugs and propagate, so raise those only when something is genuinely broken.
+
+```python
+class MyFs:
+    async def read_file(self, path: str, encoding: str = "utf-8") -> str:
+        if not self._reachable():
+            raise TimeoutError("backend unreachable")  # -> "cat: backend unreachable", exit 1
+        ...
+```
+
 #### Direct Filesystem Access
 
 You can also access the filesystem directly through the `bash.fs` property:
