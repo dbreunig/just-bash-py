@@ -1066,6 +1066,7 @@ class Interpreter:
                             else:
                                 self._state.fd_table.dup(target_fd, fd)
 
+        cmd_name = ""
         try:
             # Expand command name
             cmd_name = await expand_word_async(self._ctx, node.name)
@@ -1201,6 +1202,24 @@ class Interpreter:
             # Process output redirections
             result = await self._process_output_redirections(node.redirections, result)
             return result
+        except OSError as e:
+            # Backstop for filesystem backends. Commands catch the errors they
+            # know how to phrase (ENOENT, EISDIR, EACCES) and those never reach
+            # here; anything else a backend raises becomes a failed command
+            # instead of an exception escaping bash.exec().
+            #
+            # OSError only, deliberately. An OSError is the environment failing,
+            # which a shell contains and reports as a nonzero exit -- and since
+            # TimeoutError and ConnectionError are OSError subclasses, a remote
+            # or network-backed filesystem arrives here too. The interpreter's
+            # own control flow (ExitError, BreakError, ReturnError, ...) derives
+            # from InterpreterError, not OSError, so it cannot be swallowed
+            # here. Anything else reaching this point is a bug in the backend
+            # rather than a condition the shell can report, and a bug should
+            # crash loudly -- which is why this is not `except Exception`.
+            detail = e.strerror or str(e)
+            location = f"{e.filename}: " if e.filename else ""
+            return _result("", f"{cmd_name or 'bash'}: {location}{detail}\n", 1)
         finally:
             # Restore temporary assignments (both value and export status)
             for name, (old_value, was_exported) in temp_assignments.items():
