@@ -1,7 +1,9 @@
 """Tests for minor command improvements (ls, stat, uniq, cut, head, tail, wc)."""
 
 import pytest
+
 from just_bash import Bash
+from just_bash.fs import InMemoryFs
 
 
 class TestLsExtended:
@@ -32,6 +34,75 @@ class TestLsExtended:
         assert result.exit_code == 0
         assert ".hidden" in result.stdout
         assert "visible" in result.stdout
+
+
+class DenyingFs(InMemoryFs):
+    """InMemoryFs with chosen paths rigged to refuse stat and readdir."""
+
+    def __init__(self, initial_files=None, deny_stat=(), deny_readdir=()):
+        super().__init__(initial_files=initial_files or {})
+        self._deny_stat = set(deny_stat)
+        self._deny_readdir = set(deny_readdir)
+
+    async def stat(self, path):
+        if path in self._deny_stat:
+            raise PermissionError(13, "Permission denied", path)
+        return await super().stat(path)
+
+    async def readdir(self, path):
+        if path in self._deny_readdir:
+            raise PermissionError(13, "Permission denied", path)
+        return await super().readdir(path)
+
+
+class TestLsPermissionDenied:
+    """A backend refusal fails the command, the way cat and stat do."""
+
+    @pytest.mark.asyncio
+    async def test_ls_denied_operand(self):
+        """stat raising PermissionError is `cannot access`, exit 2."""
+        bash = Bash(fs=DenyingFs(
+            initial_files={"/denied/x": "hello\n"},
+            deny_stat={"/denied"},
+        ), cwd="/")
+        result = await bash.exec("ls /denied")
+        assert result.exit_code == 2
+        assert result.stderr == "ls: cannot access '/denied': Permission denied\n"
+        assert result.stdout == ""
+
+    @pytest.mark.asyncio
+    async def test_ls_l_denied_operand(self):
+        """The long listing takes the same operand path."""
+        bash = Bash(fs=DenyingFs(
+            initial_files={"/denied/x": "hello\n"},
+            deny_stat={"/denied"},
+        ), cwd="/")
+        result = await bash.exec("ls -l /denied")
+        assert result.exit_code == 2
+        assert result.stderr == "ls: cannot access '/denied': Permission denied\n"
+
+    @pytest.mark.asyncio
+    async def test_ls_denied_readdir(self):
+        """readdir raising PermissionError stays in-band."""
+        bash = Bash(fs=DenyingFs(
+            initial_files={"/dir/ok.txt": "x\n"},
+            deny_readdir={"/dir"},
+        ), cwd="/")
+        result = await bash.exec("ls /dir")
+        assert result.exit_code == 2
+        assert result.stderr == "ls: cannot open directory '/dir': Permission denied\n"
+
+    @pytest.mark.asyncio
+    async def test_ls_l_denied_child_is_a_placeholder_row(self):
+        """A child whose stat refuses becomes ?????????, not an exception."""
+        bash = Bash(fs=DenyingFs(
+            initial_files={"/dir/ok.txt": "x\n", "/dir/secret.txt": "y\n"},
+            deny_stat={"/dir/secret.txt"},
+        ), cwd="/")
+        result = await bash.exec("ls -l /dir")
+        assert result.exit_code == 0
+        assert "ok.txt" in result.stdout
+        assert "?????????" in result.stdout
 
 
 class TestStatExtended:
