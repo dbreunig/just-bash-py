@@ -163,6 +163,10 @@ class LsCommand:
                 stderr += f"ls: cannot access '{path}': No such file or directory\n"
                 exit_code = 2
                 continue
+            except PermissionError:
+                stderr += f"ls: cannot access '{path}': Permission denied\n"
+                exit_code = 2
+                continue
 
             if st.is_directory and not dir_only:
                 # List directory contents
@@ -227,7 +231,7 @@ class LsCommand:
                                 elif entry_stat.mode & stat.S_IXUSR:
                                     name += "*"
                             stdout += f"{mode_str}  {entry_stat.nlink:2d} user user {size_str:>8s} Jan  1 00:00 {name}\n"
-                        except FileNotFoundError:
+                        except (FileNotFoundError, PermissionError):
                             stdout += f"?????????  ? ? ? ? ? {entry}\n"
                 elif one_per_line:
                     for entry in entries:
@@ -240,7 +244,7 @@ class LsCommand:
                                     name += "/"
                                 elif entry_stat.is_symbolic_link:
                                     name += "@"
-                            except FileNotFoundError:
+                            except (FileNotFoundError, PermissionError):
                                 pass
                         stdout += f"{name}\n"
                 else:
@@ -256,7 +260,7 @@ class LsCommand:
                                     name += "/"
                                 elif entry_stat.is_symbolic_link:
                                     name += "@"
-                            except FileNotFoundError:
+                            except (FileNotFoundError, PermissionError):
                                 pass
                         output_entries.append(name)
                     stdout += "\n".join(output_entries) + "\n"
